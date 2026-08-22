@@ -1,2 +1,6 @@
 /target
 *.snap.new
+
+# внутренние проектные документы
+/keiko-concept.md
+/keiko-ux-spec.md

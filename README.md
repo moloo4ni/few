@@ -1,108 +1,107 @@
 # Keiko
 
-Автономный агент для терминала: анализирует задачу, исследует проект, выполняет инструменты,
-меняет файлы, запускает команды, проверяет результат и доводит дело до конца — без построчного
-ручного руководства.
+An autonomous terminal agent: analyzes the task, explores the project, runs tools,
+edits files, executes commands, verifies results, and carries the work to completion -
+without step-by-step hand-holding.
 
-Не оболочка и не кастомизация существующего инструмента — самостоятельный агент с собственной
-архитектурой и интерфейсом. Философия, мотивация и полный UX-контракт описаны в двух документах:
+Not a shell or a customization of an existing tool - a standalone agent with its own
+architecture and interface.
 
-- [`keiko-concept.md`](keiko-concept.md) — зачем, рамка проекта, принципы;
-- [`keiko-ux-spec.md`](keiko-ux-spec.md) — поведение интерфейса, механика агента, стек.
+## Status
 
-## Статус
+Early development. The core works (agent loop, tools, permissions, TUI, provider),
+but the contract is not frozen yet and details will change.
 
-Ранняя разработка. Ядро (агентный цикл, инструменты, permissions, TUI, провайдер) работает,
-но контракт ещё не заморожен и детали меняются.
+## Design in brief
 
-## Принципы в двух словах
+- **Rust**, single binary; the target environment is Unix-like systems
+  (Linux/macOS/BSD as one class). Windows is not excluded, but does not drive
+  the architecture of the first version.
+- **Four tools, no more**: `read`, `write`, `edit`, `shell`. Search and git are plain
+  `rg`/`find`/`git` invoked through `shell`; no abstraction where Unix already solves
+  the problem.
+- **Capability-based permissions**: reads inside the project are silent, writes and shell
+  default to `ask`, network defaults to `deny`; a built-in non-removable sensitive-file list;
+  `always allow` decisions persist to that project's config.
+- **Modes** - `plan` / `build` / `auto-approve` - presets of one permission matrix.
+- **Verify before done**: after file changes a verification command runs automatically
+  (ecosystem auto-detect or `[verify] command`); three identical failures in a row and the
+  agent gives up honestly instead of hammering.
+- **Native structured tool-calling only**: a model without it gets an explicit refusal at
+  startup; prompt-based fallback is rejected on principle.
+- **Memory** - human-readable markdown files outside the working directory (XDG layout);
+  project memory lives in `.keiko/memory/project.md`.
+- **TUI** (`ratatui` + `crossterm`): no panels or fills - text, indentation and two contrast
+  levels only; signal colors are standard ANSI; collapsible step summaries, click-to-expand
+  diffs, permission prompts inline in the log, an escalating Ctrl+C ladder.
 
-- **Rust**, single binary; целевая среда — Unix-like (Linux/macOS/BSD как один класс), Windows
-  не исключается, но первую версию не определяет.
-- **Четыре инструмента, не больше**: `read`, `write`, `edit`, `shell`. Поиск и git — обычные
-  `rg`/`find`/`git` через `shell`; абстракции не заводятся там, где Unix уже решает задачу.
-- **Capability-based permissions**: чтение внутри проекта бесшумно, запись и shell — `ask`,
-  сеть — `deny`; встроенный неизбираемый список чувствительных файлов; `always allow`
-  сохраняется в конфиг конкретного проекта.
-- **Режимы** — `plan` / `build` / `auto-approve`, пресеты одной permissions-матрицы.
-- **Verify перед done**: после изменений файлов автоматически прогоняется верификация
-  (авто-детект по экосистеме или `[verify] command`); три одинаковые ошибки подряд — агент
-  честно сдаётся, а не долбит дальше.
-- **Только нативный structured tool-calling**: модель без него получает явный отказ при старте,
-  prompt-based fallback не поддерживается принципиально.
-- **Память** — человекочитаемые markdown-файлы вне рабочей директории (XDG), project-memory —
-  в `.keiko/memory/project.md`.
-- **TUI** (`ratatui` + `crossterm`): никаких панелей и заливок, только текст, отступы и два
-  уровня контраста; сигнальные цвета — стандартные ANSI; свёрнутые сводки шагов, diff по клику,
-  permission-запросы прямо в логе, лестница Ctrl+C с мягким прерыванием.
+## Build & run
 
-## Сборка и запуск
-
-Требуется Rust stable (версия фиксируется `rust-toolchain.toml`):
+Requires stable Rust (pinned via `rust-toolchain.toml`):
 
 ```sh
 cargo build --release
-./target/release/keiko          # внутри директории проекта
+./target/release/keiko          # inside a project directory
 ```
 
-TLS включён default-фичей `tls` (`reqwest` + `rustls`). Для окружения без C-тулчейна возможна
-сборка только под HTTP:
+TLS ships as the default `tls` feature (`reqwest` + `rustls`). On toolchains without a C
+compiler an HTTP-only build is possible:
 
 ```sh
 cargo build --no-default-features
 ```
 
-При старте Keiko проверяет, что выбранная модель отвечает нативным tool-calling; иначе
-завершается с явной ошибкой — смените модель, а не надейтесь на текстовый парсинг.
+At startup Keiko checks that the selected model answers with native tool calls; otherwise it
+exits with an explicit error - switch models rather than hoping text parsing will work.
 
-## Конфигурация
+## Configuration
 
-Глобальный конфиг: `~/.config/keiko/config.toml`; проектный: `<project>/.keiko/config.toml`
-(переопределяет глобальный). Минимум для запуска:
+Global config: `~/.config/keiko/config.toml`; per-project: `<project>/.keiko/config.toml`
+(overrides global). Minimum to start:
 
 ```toml
 [provider]
-base_url = "http://127.0.0.1:11434/v1"   # ollama или любой OpenAI-совместимый сервер
+base_url = "http://127.0.0.1:11434/v1"   # ollama or any OpenAI-compatible server
 model = "qwen3:8b"
-api_key_env = "OPENAI_API_KEY"           # опционально; также читаются KEIKO_API_KEY / OPENAI_API_KEY
+api_key_env = "OPENAI_API_KEY"           # optional; KEIKO_API_KEY / OPENAI_API_KEY also read
 ```
 
-Полезные секции:
+Useful sections:
 
 ```toml
 [shell]
-# program = "/usr/bin/fish"              # по умолчанию $SHELL пользователя
+# program = "/usr/bin/fish"              # defaults to the user's $SHELL
 
 [verify]
-# command = "cargo test"                 # override авто-детекта
+# command = "cargo test"                 # overrides auto-detection
 
 [loop]
-retry_threshold = 3                      # повторов одной сигнатуры ошибки до «gave up»
-max_steps = 0                            # потолок шагов; 0 = осознанный unlimited
+retry_threshold = 3                      # repeats of one error signature before giving up
+max_steps = 0                            # step ceiling; 0 = deliberate unlimited
 
 [permissions.sensitive]
-extra = ["*.secret"]                     # дополнение к встроенному списку
+extra = ["*.secret"]                     # appended to the built-in list
 ```
 
-Состояние живёт в стандартных пользовательских директориях (`~/.config`, `~/.local/share`,
-`~/.cache`, где доступен `~/.local/state`) и никогда — в директории проекта, кроме явно
-проектных вещей (`.keiko/`).
+State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
+`~/.local/state` where available) and never inside a project directory - except explicitly
+project-local things (`.keiko/`).
 
-## Внутри репозитория
+## Repository layout
 
 ```
 src/
-  agent/        агентный цикл, verify, retry-порог
-  providers/    канонические типы сообщений + OpenAI-совместимый адаптер
-  tools.rs      read/write/edit/shell, захват вывода, обрезка для модели
-  perms.rs      движок permissions, sensitive-matcher
-  app.rs        цикл событий TUI, команды, Ctrl+C
-  uirender.rs   отрисовка транскрипта, статус-бар, ввода
-prompts/base.md базовый слой системного промпта (вкомпилирован)
+  agent/        agent loop, verify gate, retry threshold
+  providers/    canonical message types + OpenAI-compatible adapter
+  tools.rs      read/write/edit/shell, output capture, model-side truncation
+  perms.rs      permissions engine, sensitive matcher
+  app.rs        TUI event loop, commands, Ctrl+C ladder
+  uirender.rs   transcript, status bar, input rendering
+prompts/base.md base layer of the system prompt (compiled into the binary)
 ```
 
-Разработка: `cargo test`, `cargo clippy --all-targets`, `cargo fmt`.
+Development: `cargo test`, `cargo clippy --all-targets`, `cargo fmt`.
 
-## Лицензия
+## License
 
 [MPL-2.0](LICENSE).
