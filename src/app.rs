@@ -1,0 +1,762 @@
+use crate::agent::{Agent, AgentEvent, TaskOutcome};
+use crate::commands::{find_command, ArgKind};
+use crate::config::Config;
+use crate::inputline::InputState;
+use crate::memory::{MemLevel, Memory};
+use crate::perms::{Grant, Mode};
+use crate::providers::openai::OpenAiProvider;
+use crate::sysprompt;
+use crate::tools::Ctl;
+use crate::transcript::{
+    classify_notice, Block, Expand, Hit, Level, PermAskBlock, StepBlock, StepsGroup, PERM_OPTIONS,
+};
+use crate::uirender;
+use anyhow::Context as _;
+use crossterm::event::{EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use futures_util::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
+
+const ESCALATION_WINDOW: Duration = Duration::from_millis(1200);
+
+pub struct App {
+    pub blocks: Vec<Block>,
+    pub steps_group_idx: Option<usize>,
+    pub active_ask: Option<usize>,
+    pub input: InputState,
+    pub scroll_from_end: usize,
+    pub running: bool,
+    pub started_at: Option<Instant>,
+    pub spinner_tick: usize,
+    pub mode: Mode,
+    pub model_name: String,
+    pub ctx_used: u64,
+    pub ctx_window: u64,
+    pub escalation: Option<Instant>,
+    pub quit: bool,
+    pub hitmap: Vec<Hit>,
+    pub transcript_area: ratatui::layout::Rect,
+    pub palette_sel: usize,
+    pub models_cache: Vec<String>,
+    pub cfg: Arc<Config>,
+    pub agent: Arc<Agent<OpenAiProvider>>,
+    pub memory: Memory,
+    history_path: PathBuf,
+    file_index: Arc<Mutex<Vec<String>>>,
+    ctl_tx: Option<mpsc::UnboundedSender<Ctl>>,
+    ev_tx: mpsc::UnboundedSender<AgentEvent>,
+    ev_rx: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
+impl App {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cfg: Arc<Config>,
+        agent: Arc<Agent<OpenAiProvider>>,
+        memory: Memory,
+        history_path: PathBuf,
+    ) -> Self {
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let mut input = InputState::new();
+        for entry in load_history(&history_path) {
+            input.push_history(&entry);
+        }
+        Self {
+            blocks: Vec::new(),
+            steps_group_idx: None,
+            active_ask: None,
+            input,
+            scroll_from_end: 0,
+            running: false,
+            started_at: None,
+            spinner_tick: 0,
+            mode: Mode::Build,
+            model_name: cfg.model.clone(),
+            ctx_used: 0,
+            ctx_window: cfg.context_window,
+            escalation: None,
+            quit: false,
+            hitmap: Vec::new(),
+            transcript_area: Default::default(),
+            palette_sel: 0,
+            models_cache: cfg.models.clone(),
+            cfg,
+            agent,
+            memory,
+            history_path,
+            file_index: Arc::new(Mutex::new(Vec::new())),
+            ctl_tx: None,
+            ev_tx,
+            ev_rx,
+        }
+    }
+
+    pub async fn run_app(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> anyhow::Result<()> {
+        self.spawn_index_rebuild();
+        self.agent.refresh_memory_layer();
+        let mut events = EventStream::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(120));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            if self.quit {
+                break;
+            }
+            terminal.draw(|f| uirender::draw(f, self))?;
+            tokio::select! {
+                maybe_ev = events.next() => {
+                    match maybe_ev {
+                        Some(Ok(ev)) => self.on_term_event(ev).await,
+                        Some(Err(e)) => {
+                            self.push_notice(format!("input error: {e}"));
+                        }
+                        None => break,
+                    }
+                }
+                Some(ae) = self.ev_rx.recv() => self.on_agent_event(ae),
+                _ = tick.tick() => {
+                    self.spinner_tick = self.spinner_tick.wrapping_add(1);
+                    if let Some(t) = self.escalation {
+                        if t.elapsed() > ESCALATION_WINDOW {
+                            self.escalation = None;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn absorb_models(&mut self, list: Vec<String>) {
+        let mut merged: Vec<String> = Vec::new();
+        if !self.model_name.is_empty() {
+            merged.push(self.model_name.clone());
+        }
+        let rest = list.into_iter().chain(self.models_cache.iter().cloned());
+        for m in rest {
+            if !merged.contains(&m) {
+                merged.push(m);
+            }
+        }
+        self.models_cache = merged;
+    }
+
+    async fn on_term_event(&mut self, ev: crossterm::event::Event) {
+        match ev {
+            crossterm::event::Event::Key(k) => {
+                if k.kind == KeyEventKind::Press {
+                    self.on_key(k).await;
+                }
+            }
+            crossterm::event::Event::Mouse(m) => self.on_mouse(m),
+            crossterm::event::Event::Paste(text) => {
+                self.input.insert_str(&text);
+                self.after_edit();
+            }
+            _ => {}
+        }
+    }
+
+    fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_from_end = self.scroll_from_end.saturating_add(3)
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_from_end = self.scroll_from_end.saturating_sub(3)
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.on_click(m.row),
+            _ => {}
+        }
+    }
+
+    fn on_click(&mut self, row: u16) {
+        let rel = row.saturating_sub(self.transcript_area.y) as usize;
+        let Some(hit) = self.hitmap.get(rel).copied() else {
+            return;
+        };
+        match hit {
+            Hit::Nothing | Hit::Block(_) => {}
+            Hit::Step(bi, usize::MAX) => {
+                if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
+                    g.expanded = !g.expanded;
+                }
+            }
+            Hit::Step(bi, si) => {
+                if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
+                    if let Some(s) = g.steps.get_mut(si) {
+                        s.expand = s.expand.next();
+                    }
+                }
+            }
+            Hit::PermOption(bi, opt) => {
+                if self.active_ask == Some(bi) {
+                    self.resolve_ask(opt);
+                }
+            }
+        }
+        self.scroll_from_end = 0;
+    }
+
+    async fn on_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            self.ctrl_c_ladder();
+            return;
+        }
+
+        if self.active_ask.is_some() {
+            self.on_ask_key(k.code);
+            return;
+        }
+
+        let text = self.input.text();
+        if text.starts_with('/') && !text.contains('\n') {
+            match k.code {
+                KeyCode::Esc => self.input.clear(),
+                KeyCode::Up => self.palette_sel = self.palette_sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => self.palette_sel += 1,
+                KeyCode::Enter => {
+                    self.pick_palette().await;
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.input.backspace();
+                    self.palette_sel = 0;
+                }
+                KeyCode::Char(ch) => {
+                    self.input.insert_str(&ch.to_string());
+                    self.palette_sel = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.input.menu_items().is_some() {
+            match k.code {
+                KeyCode::Esc => self.input.completion = None,
+                KeyCode::Tab | KeyCode::Down => self.input.cycle_menu(true),
+                KeyCode::Up => self.input.cycle_menu(false),
+                KeyCode::Right | KeyCode::Enter => self.input.accept_selected(),
+                KeyCode::Char(ch) => {
+                    self.input.insert_str(&ch.to_string());
+                    self.after_edit();
+                }
+                KeyCode::Backspace => {
+                    self.input.backspace();
+                    self.after_edit();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match k.code {
+            KeyCode::PageUp => {
+                self.scroll_from_end += self.transcript_area.height as usize;
+                return;
+            }
+            KeyCode::PageDown => {
+                self.scroll_from_end = self
+                    .scroll_from_end
+                    .saturating_sub(self.transcript_area.height as usize);
+                return;
+            }
+            KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.newline()
+            }
+            KeyCode::Enter => {
+                if k.modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                {
+                    self.input.newline();
+                } else {
+                    self.submit().await;
+                }
+            }
+            KeyCode::Tab => {
+                let index = self.file_index.lock().unwrap();
+                self.input.update_completion(&index);
+                drop(index);
+                if self.input.completion.is_some() {
+                    self.input.accept_selected();
+                }
+            }
+            KeyCode::Esc => self.input.completion = None,
+            KeyCode::Char(ch) => {
+                self.input.insert_str(&ch.to_string());
+                self.after_edit();
+            }
+            KeyCode::Backspace => {
+                self.input.backspace();
+                self.after_edit();
+            }
+            KeyCode::Delete => self.input.delete_forward(),
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
+            KeyCode::Up => self.input.history_prev(),
+            KeyCode::Down => self.input.history_next(),
+            _ => {}
+        }
+        self.scroll_from_end = 0;
+    }
+
+    fn after_edit(&mut self) {
+        let text = self.input.text();
+        if text.starts_with('/') && !text.contains('\n') {
+            self.palette_sel = 0;
+            return;
+        }
+        let index = self.file_index.lock().unwrap();
+        self.input.update_completion(&index);
+    }
+
+    fn ctrl_c_ladder(&mut self) {
+        let now = Instant::now();
+        let quick = self
+            .escalation
+            .map(|t| now.duration_since(t) <= ESCALATION_WINDOW)
+            .unwrap_or(false);
+        self.escalation = Some(now);
+
+        if self.running {
+            if quick {
+                if let Some(tx) = &self.ctl_tx {
+                    let _ = tx.send(Ctl::HardAbort);
+                }
+            } else {
+                let (ack, _rx) = oneshot::channel();
+                if let Some(tx) = &self.ctl_tx {
+                    let _ = tx.send(Ctl::SoftInterrupt { ack });
+                }
+                self.push_notice("^C interrupt requested".into());
+            }
+        } else if quick {
+            self.quit = true;
+        } else {
+            self.push_notice("^C press again to exit".into());
+        }
+        self.scroll_from_end = 0;
+    }
+
+    fn on_ask_key(&mut self, code: KeyCode) {
+        let Some(bi) = self.active_ask else { return };
+        let selected = match self.blocks.get(bi) {
+            Some(Block::PermAsk(a)) if a.resolved.is_none() => a.selected,
+            _ => {
+                self.active_ask = None;
+                return;
+            }
+        };
+        match code {
+            KeyCode::Up => {
+                if let Some(Block::PermAsk(a)) = self.blocks.get_mut(bi) {
+                    a.selected = a.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(Block::PermAsk(a)) = self.blocks.get_mut(bi) {
+                    a.selected = (a.selected + 1).min(PERM_OPTIONS.len() - 1);
+                }
+            }
+            KeyCode::Char(c @ '1'..='4') => {
+                let opt = (c as u8 - b'1') as usize;
+                self.resolve_ask(opt);
+            }
+            KeyCode::Enter => self.resolve_ask(selected),
+            KeyCode::Esc => self.resolve_ask(3),
+            _ => {}
+        }
+    }
+
+    fn resolve_ask(&mut self, opt: usize) {
+        let Some(bi) = self.active_ask else { return };
+        let grant = match opt {
+            3 => None,
+            2 => Some(Grant::Always),
+            1 => Some(Grant::Session),
+            _ => Some(Grant::Once),
+        };
+        if let Some(Block::PermAsk(a)) = self.blocks.get_mut(bi) {
+            a.resolved = Some(PERM_OPTIONS[opt.min(PERM_OPTIONS.len() - 1)]);
+            let id = a.id;
+            if let Some(tx) = &self.ctl_tx {
+                let _ = tx.send(Ctl::PermChoice { id, grant });
+            }
+        }
+        self.active_ask = None;
+        self.scroll_from_end = 0;
+    }
+
+    async fn pick_palette(&mut self) {
+        let items = match uirender::current_palette(self) {
+            Some(items) => items,
+            None => return,
+        };
+        if items.is_empty() {
+            return;
+        }
+        self.palette_sel = self.palette_sel.min(items.len() - 1);
+        let item = items[self.palette_sel].clone();
+
+        let text = self.input.text();
+        if item.starts_with('/') && !text.contains(' ') {
+            match find_command(&item) {
+                Some(cmd) if cmd.arg_kind == ArgKind::None => {
+                    self.execute_command(&item).await;
+                    return;
+                }
+                Some(_) => {
+                    self.input.set_text(&format!("{item} "));
+                    self.palette_sel = 0;
+                    return;
+                }
+                None => {}
+            }
+        }
+        let base = text.split(' ').next().unwrap_or("").to_owned();
+        let full = if base.is_empty() {
+            item.clone()
+        } else {
+            format!("{base} {item}")
+        };
+        self.input.clear();
+        self.execute_command(&full).await;
+    }
+
+    async fn execute_command(&mut self, cmd: &str) {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let Some(name) = parts.first() else { return };
+        let rest = parts[1..].join(" ");
+        match *name {
+            "/exit" => self.quit = true,
+            "/mode" => match parse_mode(&rest) {
+                Some(m) => {
+                    self.apply_mode(m);
+                    self.push_notice(format!("mode · {}", label_mode(m)));
+                }
+                None => self.input.set_text("/mode "),
+            },
+            "/model" => {
+                if rest.is_empty() || rest == "list" {
+                    self.push_notice("fetching models…".into());
+                    let mut list = self.agent.provider.list_models().await.unwrap_or_default();
+                    for m in &self.cfg.models {
+                        if !list.contains(m) {
+                            list.insert(0, m.clone());
+                        }
+                    }
+                    self.absorb_models(list);
+                    self.input.set_text("/model ");
+                } else {
+                    self.agent.provider.set_model(&rest);
+                    self.model_name = rest.clone();
+                    self.push_notice(format!("model · {rest}"));
+                }
+            }
+            "/memory" => match rest.as_str() {
+                "view project" | "" => self.memory_view(MemLevel::Project),
+                "view persistent" | "persistent" => self.memory_view(MemLevel::Persistent),
+                "edit project" => self.memory_edit(MemLevel::Project),
+                "edit persistent" => self.memory_edit(MemLevel::Persistent),
+                _ => self.input.set_text("/memory "),
+            },
+            other => {
+                self.push_notice_level(format!("unknown command: {other}"), Level::Error);
+            }
+        }
+        self.scroll_from_end = 0;
+    }
+
+    fn apply_mode(&mut self, m: Mode) {
+        self.mode = m;
+        self.agent.perms.lock().unwrap().set_mode(m);
+        self.agent.set_mode_directive(sysprompt::mode_directive(m));
+    }
+
+    fn memory_view(&mut self, level: MemLevel) {
+        let path = self.memory.level_path(level).to_path_buf();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let entries = Memory::entries(&text);
+        let display = match level {
+            MemLevel::Project => self.memory.display_project_path(),
+            MemLevel::Persistent => self.memory.display_persistent_path(),
+        };
+        let mut out = format!("{} · {}\n", level.label(), display);
+        if entries.is_empty() {
+            out += "  (empty)\n";
+        } else {
+            for e in entries {
+                out += &format!("  - {e}\n");
+            }
+        }
+        self.blocks.push(Block::MemoryView {
+            text: out.trim_end().to_owned(),
+        });
+        self.scroll_from_end = 0;
+    }
+
+    fn memory_edit(&mut self, level: MemLevel) {
+        let path = self.memory.level_path(level).to_path_buf();
+        let _ = self.memory.ensure_files();
+        let agent = Arc::clone(&self.agent);
+        let tx = self.ev_tx.clone();
+        tokio::spawn(async move {
+            let res = tokio::task::spawn_blocking(move || run_editor_blocking(&path)).await;
+            agent.refresh_memory_layer();
+            let msg = match res {
+                Ok(Ok(())) => "memory updated".to_owned(),
+                Ok(Err(e)) => format!("editor failed: {e:#}"),
+                Err(e) => format!("editor join failed: {e}"),
+            };
+            let _ = tx.send(AgentEvent::Notice(msg));
+        });
+    }
+
+    fn create_steps_group(&mut self) -> usize {
+        self.blocks.push(Block::Steps(StepsGroup {
+            steps: Vec::new(),
+            expanded: true,
+            outcome: None,
+        }));
+        self.blocks.len() - 1
+    }
+
+    fn push_notice(&mut self, text: String) {
+        self.push_notice_level(text, Level::Info);
+    }
+
+    fn push_notice_level(&mut self, text: String, level: Level) {
+        self.blocks.push(Block::Notice { text, level });
+        self.scroll_from_end = 0;
+    }
+
+    fn on_agent_event(&mut self, ae: AgentEvent) {
+        match ae {
+            AgentEvent::Step(view) => {
+                let gi = match self.steps_group_idx {
+                    Some(gi) => gi,
+                    None => self.create_steps_group_and_set(),
+                };
+                if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
+                    g.steps.push(StepBlock {
+                        view,
+                        expand: Expand::Collapsed,
+                    });
+                }
+                self.scroll_from_end = 0;
+            }
+            AgentEvent::Thought { text, dur_ms } => {
+                self.blocks.push(Block::Thought {
+                    dur_ms,
+                    text,
+                    expand: Expand::Collapsed,
+                });
+                self.scroll_from_end = 0;
+            }
+            AgentEvent::Remembered { line } => {
+                self.blocks.push(Block::Remembered(line));
+                self.scroll_from_end = 0;
+            }
+            AgentEvent::Notice(text) => {
+                let level = classify_notice(&text);
+                self.blocks.push(Block::Notice { text, level });
+                self.scroll_from_end = 0;
+            }
+            AgentEvent::AssistantText(text) => {
+                self.blocks.push(Block::Assistant(text));
+                self.scroll_from_end = 0;
+            }
+            AgentEvent::Usage { prompt_tokens, .. } => {
+                self.ctx_used = prompt_tokens;
+            }
+            AgentEvent::PermAsk(view) => {
+                self.blocks.push(Block::PermAsk(PermAskBlock {
+                    id: view.id,
+                    verb: view.verb,
+                    target: view.target,
+                    cap_label: view.cap_label.to_owned(),
+                    sensitive: view.sensitive,
+                    selected: 0,
+                    resolved: None,
+                }));
+                self.active_ask = Some(self.blocks.len() - 1);
+                self.scroll_from_end = 0;
+            }
+            AgentEvent::Finished(outcome) => {
+                if let Some(gi) = self.steps_group_idx {
+                    let mut drop_group = false;
+                    if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
+                        g.outcome = Some(outcome.clone());
+                        g.expanded = false;
+                        drop_group = g.steps.is_empty() && outcome == TaskOutcome::Done;
+                    }
+                    if drop_group && self.blocks.len() == gi + 1 {
+                        self.blocks.remove(gi);
+                    }
+                }
+                self.steps_group_idx = None;
+                self.running = false;
+                self.started_at = None;
+                self.escalation = None;
+                self.ctl_tx = None;
+                self.active_ask = None;
+                self.spawn_index_rebuild();
+            }
+        }
+    }
+
+    fn create_steps_group_and_set(&mut self) -> usize {
+        let gi = self.create_steps_group();
+        self.steps_group_idx = Some(gi);
+        gi
+    }
+
+    async fn submit(&mut self) {
+        let text = self.input.text();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.input.clear();
+
+        if text.starts_with('/') && !text.contains('\n') {
+            self.execute_command(&text).await;
+            return;
+        }
+
+        if self.running {
+            if let Some(tx) = &self.ctl_tx {
+                let _ = tx.send(Ctl::QueuedUser(text));
+                self.push_notice("queued · applied at the next safe point".into());
+            }
+            return;
+        }
+
+        append_history_line(&self.history_path, &text);
+        self.start_task(text);
+    }
+
+    fn start_task(&mut self, text: String) {
+        self.input.push_history(&text);
+        self.blocks.push(Block::User(text.clone()));
+        let gi = self.create_steps_group();
+        self.steps_group_idx = Some(gi);
+        self.running = true;
+        self.started_at = Some(Instant::now());
+        self.scroll_from_end = 0;
+
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        self.ctl_tx = Some(ctl_tx);
+        let agent = Arc::clone(&self.agent);
+        let ev = self.ev_tx.clone();
+        tokio::spawn(async move {
+            let outcome: TaskOutcome = agent.run(text, ev, ctl_rx).await;
+            let _ = outcome;
+        });
+    }
+
+    fn spawn_index_rebuild(&mut self) {
+        let root = self.cfg.project_root.clone();
+        let idx = Arc::clone(&self.file_index);
+        tokio::spawn(async move {
+            let files = build_file_index(root).await;
+            *idx.lock().unwrap() = files;
+        });
+    }
+}
+
+fn parse_mode(s: &str) -> Option<Mode> {
+    match s.trim() {
+        "plan" => Some(Mode::Plan),
+        "build" => Some(Mode::Build),
+        "auto" | "auto-approve" => Some(Mode::Auto),
+        _ => None,
+    }
+}
+
+fn label_mode(m: Mode) -> &'static str {
+    match m {
+        Mode::Plan => "plan",
+        Mode::Build => "build",
+        Mode::Auto => "auto-approve",
+    }
+}
+
+fn load_history(path: &PathBuf) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<String> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    if lines.len() > 1000 {
+        lines[lines.len() - 1000..].to_vec()
+    } else {
+        lines
+    }
+}
+
+fn append_history_line(path: &PathBuf, entry: &str) {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{entry}");
+    }
+}
+
+async fn build_file_index(root: PathBuf) -> Vec<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let walker = ignore::WalkBuilder::new(&root).build();
+        for entry in walker.flatten() {
+            let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            if is_file {
+                if let Ok(rel) = entry.path().strip_prefix(&root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            if out.len() >= 20_000 {
+                break;
+            }
+        }
+        out.sort();
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn run_editor_blocking(path: &PathBuf) -> anyhow::Result<()> {
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "notepad".into()
+            } else {
+                "vi".into()
+            }
+        });
+
+    crate::tui::suspend()?;
+    let result = std::process::Command::new(editor).arg(path).status();
+    crate::tui::resume()?;
+    result.context("editor could not be started").map(|_| ())
+}

@@ -1,0 +1,17 @@
+pub mod agent;
+pub mod app;
+pub mod commands;
+pub mod config;
+pub mod diffgen;
+pub mod envinfo;
+pub mod inputline;
+pub mod memory;
+pub mod paths;
+pub mod perms;
+pub mod providers;
+pub mod sysprompt;
+pub mod theme;
+pub mod tools;
+pub mod transcript;
+pub mod tui;
+pub mod uirender;

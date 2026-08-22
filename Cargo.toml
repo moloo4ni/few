@@ -1,0 +1,34 @@
+[package]
+name = "keiko"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Autonomous terminal coding agent"
+repository = "https://github.com/nikit/keiko"
+rust-version = "1.85"
+
+[dependencies]
+anyhow = "1"
+crossterm = { version = "0.28", features = ["event-stream"] }
+directories = "5"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+ignore = "0.4"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+unicode-width = "0.2"
+
+[features]
+default = ["tls"]
+tls = ["reqwest/rustls-tls"]
+
+[dev-dependencies]
+insta = "1"
+
+[profile.release]
+lto = true
+strip = true

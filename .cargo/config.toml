@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-gnu]
+# Локальная разработка без MSVC Build Tools: линкуем через rust-lld,
+# входящий в поставку rustup. На других платформах секция не применяется.
+linker = "rust-lld"
