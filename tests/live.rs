@@ -17,21 +17,23 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 fn load_dotenv() {
-    let Ok(text) = std::fs::read_to_string(".env") else {
-        return;
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
+    for path in [".env", "key.env"] {
+        let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
-        let k = k.trim();
-        let v = v.trim().trim_matches('"').trim_matches('\'');
-        if !k.is_empty() && std::env::var_os(k).is_none() {
-            std::env::set_var(k, v);
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let k = k.trim();
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            if !k.is_empty() && std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
         }
     }
 }
