@@ -382,6 +382,7 @@ pub async fn run_shell(
     }
 
     let mut killed = false;
+    let mut kill_deadline: Option<std::time::Instant> = None;
     let mut hard_abort = false;
 
     loop {
@@ -456,11 +457,12 @@ pub async fn run_shell(
         match ctl_rx.try_recv() {
             Ok(Ctl::SoftInterrupt { ack }) => {
                 let _ = ack.send(());
-                let _ = child.kill().await;
+                soft_terminate(&mut child);
                 killed = true;
+                kill_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
             }
             Ok(Ctl::HardAbort) => {
-                let _ = child.kill().await;
+                let _ = child.start_kill();
                 hard_abort = true;
             }
             Ok(other) => stash.push(other),
@@ -468,8 +470,29 @@ pub async fn run_shell(
             | Err(mpsc::error::TryRecvError::Disconnected) => {}
         }
 
+        if let Some(deadline) = kill_deadline {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.start_kill();
+                kill_deadline = None;
+            }
+        }
+
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+fn soft_terminate(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            let _ = std::process::Command::new("kill")
+                .arg("-15")
+                .arg(pid.to_string())
+                .status();
+            return;
+        }
+    }
+    let _ = child.start_kill();
 }
 
 fn clip_bytes(data: &[u8], cap: usize) -> String {

@@ -102,9 +102,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(lines), transcript);
 
     if busy_rows > 0 {
-        let secs = app.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         let spin = ['|', '/', '-', '\\'][app.spinner_tick % 4];
-        let mut text = format!("{spin} working · {secs}s");
+        let mut text = if let Some(t) = app.thinking_since {
+            format!("{spin} thinking · {}", t.elapsed().as_secs())
+        } else {
+            let secs = app.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            format!("{spin} working · {secs}s")
+        };
         if !app.input.is_empty() {
             text += " · typed text queued";
         }
@@ -390,7 +394,7 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             rows.push((vec![], Hit::Nothing));
         }
         match block {
-            Block::User(text) | Block::Assistant(text) => {
+            Block::User(text) | Block::Assistant(text) | Block::LiveAssistant(text) => {
                 push_wrapped_text(&mut rows, text, theme::normal(), width, Hit::Nothing);
             }
             Block::Thought {

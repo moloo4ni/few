@@ -4,10 +4,11 @@ use crate::config::Config;
 use crate::diffgen::DiffLine;
 use crate::memory::Memory;
 use crate::perms::{Capability, Check, DenySource, Grant, PermEngine};
-use crate::providers::{Msg, Provider, ProviderError, Reply, Role, ToolCall};
+use crate::providers::{Msg, Provider, ProviderError, Reply, Role, StreamDelta, ToolCall};
 use crate::tools::{self, Ctl};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -74,10 +75,17 @@ pub struct PermAskView {
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    Thought {
+    ThinkingStarted,
+    ThoughtDelta {
         text: String,
+    },
+    ThinkingFinished {
         dur_ms: u64,
     },
+    AssistantDelta {
+        text: String,
+    },
+    TurnClosed,
     Remembered {
         line: String,
     },
@@ -209,9 +217,27 @@ impl<P: Provider> Agent<P> {
                 ctx.wrote_since_user = false;
             }
 
-            let started = std::time::Instant::now();
             let msgs = self.messages_with_system();
-            let mut reply_fut = Box::pin(self.provider.complete(&msgs, &tool_defs));
+            let think_flag = Arc::new(AtomicBool::new(false));
+            let think_first = Arc::new(Mutex::new(None::<std::time::Instant>));
+            let ev_sink = ctx.ev.clone();
+            let (flag_sink, first_sink) = (Arc::clone(&think_flag), Arc::clone(&think_first));
+            let mut reply_fut = Box::pin(self.provider.complete_streaming(
+                &msgs,
+                &tool_defs,
+                move |delta| match delta {
+                    StreamDelta::Reasoning(text) => {
+                        if !flag_sink.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            *first_sink.lock().unwrap() = Some(std::time::Instant::now());
+                            let _ = ev_sink.send(AgentEvent::ThinkingStarted);
+                        }
+                        let _ = ev_sink.send(AgentEvent::ThoughtDelta { text });
+                    }
+                    StreamDelta::Text(text) => {
+                        let _ = ev_sink.send(AgentEvent::AssistantDelta { text });
+                    }
+                },
+            ));
 
             let reply: Result<Reply, ProviderError> = loop {
                 tokio::select! {
@@ -223,6 +249,16 @@ impl<P: Provider> Agent<P> {
                     }
                 }
             };
+
+            if think_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let dur_ms = think_first
+                    .lock()
+                    .unwrap()
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                let _ = ctx.ev.send(AgentEvent::ThinkingFinished { dur_ms });
+            }
+            let _ = ctx.ev.send(AgentEvent::TurnClosed);
 
             match reply {
                 Err(e) if e.to_string() == ABORT => {
@@ -247,19 +283,6 @@ impl<P: Provider> Agent<P> {
                         prompt_tokens: reply.usage.prompt_tokens,
                         completion_tokens: reply.usage.completion_tokens,
                     });
-
-                    let dur_ms = started.elapsed().as_millis() as u64;
-                    if let Some(r) = &reply.reasoning {
-                        let _ = ctx.ev.send(AgentEvent::Thought {
-                            text: r.clone(),
-                            dur_ms,
-                        });
-                    }
-                    if !reply.content.trim().is_empty() {
-                        let _ = ctx
-                            .ev
-                            .send(AgentEvent::AssistantText(reply.content.clone()));
-                    }
                     self.push_convo(Msg {
                         role: Role::Assistant,
                         content: reply.content.clone(),
@@ -960,16 +983,31 @@ mod tests {
             "scripted".to_owned()
         }
 
-        async fn complete(
+        async fn complete_streaming<F>(
             &self,
             _messages: &[Msg],
             _tools: &[ToolDef],
-        ) -> Result<Reply, ProviderError> {
-            let mut q = self.replies.lock().unwrap();
-            if q.is_empty() {
-                return Err(ProviderError::Http("script exhausted".into()));
+            mut on_delta: F,
+        ) -> Result<Reply, ProviderError>
+        where
+            F: FnMut(StreamDelta) + Send,
+        {
+            let reply = {
+                let mut q = self.replies.lock().unwrap();
+                if q.is_empty() {
+                    return Err(ProviderError::Http("script exhausted".into()));
+                }
+                q.remove(0)
+            };
+            if let Ok(r) = &reply {
+                if let Some(reasoning) = &r.reasoning {
+                    on_delta(StreamDelta::Reasoning(reasoning.clone()));
+                }
+                if !r.content.is_empty() {
+                    on_delta(StreamDelta::Text(r.content.clone()));
+                }
             }
-            q.remove(0)
+            reply
         }
     }
 

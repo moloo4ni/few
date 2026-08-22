@@ -31,6 +31,7 @@ pub struct App {
     pub scroll_from_end: usize,
     pub running: bool,
     pub started_at: Option<Instant>,
+    pub thinking_since: Option<Instant>,
     pub spinner_tick: usize,
     pub mode: Mode,
     pub model_name: String,
@@ -46,6 +47,8 @@ pub struct App {
     pub agent: Arc<Agent<OpenAiProvider>>,
     pub memory: Memory,
     history_path: PathBuf,
+    live_text_idx: Option<usize>,
+    live_thought: String,
     file_index: Arc<Mutex<Vec<String>>>,
     ctl_tx: Option<mpsc::UnboundedSender<Ctl>>,
     ev_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -73,6 +76,7 @@ impl App {
             scroll_from_end: 0,
             running: false,
             started_at: None,
+            thinking_since: None,
             spinner_tick: 0,
             mode: Mode::Build,
             model_name: cfg.model.clone(),
@@ -88,6 +92,8 @@ impl App {
             agent,
             memory,
             history_path,
+            live_text_idx: None,
+            live_thought: String::new(),
             file_index: Arc::new(Mutex::new(Vec::new())),
             ctl_tx: None,
             ev_tx,
@@ -543,6 +549,42 @@ impl App {
 
     fn on_agent_event(&mut self, ae: AgentEvent) {
         match ae {
+            AgentEvent::ThinkingStarted => {
+                self.live_thought.clear();
+                self.thinking_since = Some(Instant::now());
+            }
+            AgentEvent::ThoughtDelta { text } => {
+                self.live_thought.push_str(&text);
+            }
+            AgentEvent::ThinkingFinished { dur_ms } => {
+                self.thinking_since = None;
+                let text = std::mem::take(&mut self.live_thought);
+                if !text.is_empty() {
+                    self.blocks.push(Block::Thought {
+                        dur_ms,
+                        text,
+                        expand: Expand::Collapsed,
+                    });
+                    self.scroll_from_end = 0;
+                }
+            }
+            AgentEvent::AssistantDelta { text } => {
+                let open = match self.live_text_idx.and_then(|i| self.blocks.get_mut(i)) {
+                    Some(Block::LiveAssistant(existing)) => {
+                        existing.push_str(&text);
+                        true
+                    }
+                    _ => false,
+                };
+                if !open {
+                    self.blocks.push(Block::LiveAssistant(text));
+                    self.live_text_idx = Some(self.blocks.len() - 1);
+                }
+                self.scroll_from_end = 0;
+            }
+            AgentEvent::TurnClosed => {
+                self.seal_live_blocks();
+            }
             AgentEvent::Step(view) => {
                 let gi = match self.steps_group_idx {
                     Some(gi) => gi,
@@ -554,14 +596,6 @@ impl App {
                         expand: Expand::Collapsed,
                     });
                 }
-                self.scroll_from_end = 0;
-            }
-            AgentEvent::Thought { text, dur_ms } => {
-                self.blocks.push(Block::Thought {
-                    dur_ms,
-                    text,
-                    expand: Expand::Collapsed,
-                });
                 self.scroll_from_end = 0;
             }
             AgentEvent::Remembered { line } => {
@@ -578,7 +612,9 @@ impl App {
                 self.scroll_from_end = 0;
             }
             AgentEvent::Usage { prompt_tokens, .. } => {
-                self.ctx_used = prompt_tokens;
+                if prompt_tokens > 0 {
+                    self.ctx_used = prompt_tokens;
+                }
             }
             AgentEvent::PermAsk(view) => {
                 self.blocks.push(Block::PermAsk(PermAskBlock {
@@ -594,6 +630,9 @@ impl App {
                 self.scroll_from_end = 0;
             }
             AgentEvent::Finished(outcome) => {
+                self.seal_live_blocks();
+                self.thinking_since = None;
+                self.live_thought.clear();
                 if let Some(gi) = self.steps_group_idx {
                     let mut drop_group = false;
                     if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
@@ -614,6 +653,19 @@ impl App {
                 self.spawn_index_rebuild();
             }
         }
+    }
+
+    fn seal_live_blocks(&mut self) {
+        if let Some(i) = self.live_text_idx.take() {
+            let sealed = match self.blocks.get_mut(i) {
+                Some(Block::LiveAssistant(text)) => Some(std::mem::take(text)),
+                _ => None,
+            };
+            if let Some(text) = sealed {
+                self.blocks[i] = Block::Assistant(text);
+            }
+        }
+        self.thinking_since = None;
     }
 
     fn create_steps_group_and_set(&mut self) -> usize {

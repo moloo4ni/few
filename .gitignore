@@ -1,9 +1,9 @@
 /target
 *.snap.new
 
-# РІРЅСѓС‚СЂРµРЅРЅРёРµ РїСЂРѕРµРєС‚РЅС‹Рµ РґРѕРєСѓРјРµРЅС‚С‹
+# keiko reference docs
 /keiko-concept.md
 /keiko-ux-spec.md
 
-# локальные конфиги с секретами
-/config.toml
+# env
+/key.env

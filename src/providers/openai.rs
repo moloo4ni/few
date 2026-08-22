@@ -1,7 +1,11 @@
-use super::{Msg, Provider, ProviderError, Reply, Role, ToolCall, ToolDef, Usage};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use super::{
+    Msg, ProbeOutcome, Provider, ProviderError, Reply, Role, StreamDelta, ToolCall, ToolDef, Usage,
+};
+use futures_util::StreamExt;
+use reqwest::{Client, Response};
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -37,7 +41,7 @@ impl OpenAiProvider {
         format!("{}{path}", self.base_url)
     }
 
-    async fn post(&self, path: &str, body: &Value) -> Result<Value, ProviderError> {
+    async fn post_stream(&self, path: &str, body: &Value) -> Result<Response, ProviderError> {
         let mut req = self.client.post(self.url(path)).json(body);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -47,16 +51,64 @@ impl OpenAiProvider {
             .await
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
             return Err(classify_status(status.as_u16(), &text));
         }
-        serde_json::from_str::<Value>(&text).map_err(|e| {
-            ProviderError::Http(format!(
-                "invalid JSON from provider: {e}; body: {}",
-                truncate(&text, 300)
-            ))
-        })
+        Ok(resp)
+    }
+
+    fn chat_body(&self, messages: &[Msg], tools: &[ToolDef], tool_choice: Value) -> Value {
+        let wire_msgs: Vec<WireMsg> = messages.iter().map(WireMsg::from_msg).collect();
+        let mut body = json!({
+            "model": self.current_model(),
+            "messages": wire_msgs,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        if !tools.is_empty() {
+            body["tools"] = json!(tools
+                .iter()
+                .map(|t| json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    },
+                }))
+                .collect::<Vec<_>>());
+            body["tool_choice"] = tool_choice;
+        }
+        body
+    }
+
+    async fn stream_once<F>(
+        &self,
+        messages: &[Msg],
+        tools: &[ToolDef],
+        tool_choice: Value,
+        mut on_delta: F,
+    ) -> Result<Reply, ProviderError>
+    where
+        F: FnMut(StreamDelta) + Send,
+    {
+        let body = self.chat_body(messages, tools, tool_choice);
+        let resp = self.post_stream("/chat/completions", &body).await?;
+        let mut stream = resp.bytes_stream();
+
+        let mut asm = StreamAssembler::default();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
+            asm.push_bytes(&bytes, &mut on_delta);
+            if let Some(err) = asm.error.take() {
+                return Err(ProviderError::Http(err));
+            }
+            if asm.done {
+                break;
+            }
+        }
+        Ok(asm.finish())
     }
 
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -77,81 +129,7 @@ impl OpenAiProvider {
         Ok(ids)
     }
 
-    async fn complete_with_choice(
-        &self,
-        messages: &[Msg],
-        tools: &[ToolDef],
-        tool_choice: Value,
-    ) -> Result<Reply, ProviderError> {
-        let wire_msgs: Vec<WireMsg> = messages.iter().map(WireMsg::from_msg).collect();
-        let mut body = json!({
-            "model": self.current_model(),
-            "messages": wire_msgs,
-        });
-        if !tools.is_empty() {
-            body["tools"] = json!(tools
-                .iter()
-                .map(|t| json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    },
-                }))
-                .collect::<Vec<_>>());
-            body["tool_choice"] = tool_choice;
-        }
-
-        let value = self.post("/chat/completions", &body).await?;
-        if let Some(errmsg) = extract_error(&value) {
-            return Err(ProviderError::Http(errmsg));
-        }
-
-        let parsed: WireResponse = serde_json::from_value(value)
-            .map_err(|e| ProviderError::Http(format!("unexpected provider response shape: {e}")))?;
-
-        let choice = parsed
-            .choices
-            .as_ref()
-            .and_then(|c| c.first())
-            .ok_or_else(|| ProviderError::Http("provider returned no choices".into()))?;
-
-        let msg = &choice.message;
-        let tool_calls = msg
-            .tool_calls
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-            .map(|(i, tc)| {
-                let id = tc
-                    .id
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| format!("call_{i}"));
-                let args_text = match tc.function.arguments {
-                    Some(Value::String(s)) => s,
-                    Some(other) => other.to_string(),
-                    None => "{}".into(),
-                };
-                ToolCall::parse(id, tc.function.name, args_text)
-            })
-            .collect();
-
-        Ok(Reply {
-            content: msg.content.clone(),
-            reasoning: msg
-                .reasoning_content
-                .clone()
-                .or(msg.reasoning.clone())
-                .filter(|s| !s.is_empty()),
-            tool_calls,
-            usage: parsed.usage.unwrap_or_default(),
-        })
-    }
-
-    pub async fn probe_tool_calling(&self) -> super::ProbeOutcome {
-        use super::ProbeOutcome;
+    pub async fn probe_tool_calling(&self) -> ProbeOutcome {
         let msgs = [Msg::user("Call the keiko_probe tool immediately.")];
         let tools = [ToolDef {
             name: "keiko_probe",
@@ -161,7 +139,7 @@ impl OpenAiProvider {
 
         let mut last_error: Option<ProviderError> = None;
         for choice in [json!("required"), json!("auto")] {
-            match self.complete_with_choice(&msgs, &tools, choice).await {
+            match self.stream_once(&msgs, &tools, choice, |_| {}).await {
                 Ok(reply) => {
                     return if reply.tool_calls.is_empty() {
                         ProbeOutcome::Unsupported(
@@ -192,9 +170,150 @@ impl Provider for OpenAiProvider {
         self.current_model()
     }
 
-    async fn complete(&self, messages: &[Msg], tools: &[ToolDef]) -> Result<Reply, ProviderError> {
-        self.complete_with_choice(messages, tools, json!("auto"))
+    async fn complete_streaming<F>(
+        &self,
+        messages: &[Msg],
+        tools: &[ToolDef],
+        on_delta: F,
+    ) -> Result<Reply, ProviderError>
+    where
+        F: FnMut(StreamDelta) + Send,
+    {
+        self.stream_once(messages, tools, json!("auto"), on_delta)
             .await
+    }
+}
+
+#[derive(Default)]
+struct ToolCallAcc {
+    id: Option<String>,
+    name: String,
+    args: String,
+}
+
+#[derive(Default)]
+struct StreamAssembler {
+    buf: String,
+    done: bool,
+    error: Option<String>,
+    content: String,
+    reasoning: String,
+    calls: BTreeMap<u64, ToolCallAcc>,
+    usage: Usage,
+}
+
+impl StreamAssembler {
+    fn push_bytes(&mut self, bytes: &[u8], on_delta: &mut impl FnMut(StreamDelta)) {
+        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        while let Some(pos) = self.buf.find('\n') {
+            let line: String = self.buf.drain(..=pos).collect();
+            let line = line.trim();
+            if self.handle_line(line, on_delta).is_err() {
+                return;
+            }
+        }
+    }
+
+    fn handle_line(
+        &mut self,
+        line: &str,
+        on_delta: &mut impl FnMut(StreamDelta),
+    ) -> Result<(), ()> {
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(());
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            self.done = true;
+            return Ok(());
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return Ok(());
+        };
+        if let Some(errmsg) = extract_error(&v) {
+            self.error = Some(errmsg);
+            return Err(());
+        }
+        if let Some(u) = v.get("usage") {
+            if let Ok(parsed) = serde_json::from_value::<Usage>(u.clone()) {
+                self.usage = parsed;
+            }
+        }
+        let Some(delta) = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .and_then(|ch| ch.get("delta"))
+        else {
+            return Ok(());
+        };
+
+        if let Some(t) = delta.get("content").and_then(|t| t.as_str()) {
+            if !t.is_empty() {
+                self.content.push_str(t);
+                on_delta(StreamDelta::Text(t.to_owned()));
+            }
+        }
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(t) = delta.get(key).and_then(|t| t.as_str()) {
+                if !t.is_empty() {
+                    self.reasoning.push_str(t);
+                    on_delta(StreamDelta::Reasoning(t.to_owned()));
+                }
+            }
+        }
+        if let Some(tc_list) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            for tc in tc_list {
+                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let entry = self.calls.entry(idx).or_default();
+                if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                    if entry.id.is_none() {
+                        entry.id = Some(id.to_owned());
+                    }
+                }
+                if let Some(f) = tc.get("function") {
+                    if let Some(n) = f.get("name").and_then(|n| n.as_str()) {
+                        entry.name.push_str(n);
+                    }
+                    if let Some(a) = f.get("arguments").and_then(|a| a.as_str()) {
+                        entry.args.push_str(a);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Reply {
+        let tool_calls = self
+            .calls
+            .into_iter()
+            .map(|(idx, acc)| {
+                let id = acc
+                    .id
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("call_{idx}"));
+                let args = if acc.args.is_empty() {
+                    "{}".to_owned()
+                } else {
+                    acc.args
+                };
+                ToolCall::parse(id, acc.name, args)
+            })
+            .collect();
+        Reply {
+            content: self.content,
+            reasoning: if self.reasoning.is_empty() {
+                None
+            } else {
+                Some(self.reasoning)
+            },
+            tool_calls,
+            usage: self.usage,
+        }
     }
 }
 
@@ -311,109 +430,76 @@ struct WireFn {
     arguments: String,
 }
 
-#[derive(Deserialize)]
-struct WireResponse {
-    choices: Option<Vec<Choice>>,
-    usage: Option<Usage>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: RespMsg,
-}
-
-#[derive(Deserialize)]
-struct RespMsg {
-    #[serde(default, deserialize_with = "de_content_opt")]
-    content: String,
-    reasoning_content: Option<String>,
-    reasoning: Option<String>,
-    tool_calls: Option<Vec<RespTc>>,
-}
-
-fn de_content_opt<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let v: Option<Value> = Option::deserialize(deserializer)?;
-    Ok(match v {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s,
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join(""),
-        Some(other) => other.to_string(),
-    })
-}
-
-#[derive(Deserialize, Clone)]
-struct RespTc {
-    id: Option<String>,
-    function: RespFn,
-}
-
-#[derive(Deserialize, Clone)]
-struct RespFn {
-    name: String,
-    #[serde(default)]
-    arguments: Option<Value>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
-    #[test]
-    fn parses_full_response() {
-        let src = r#"{
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "thinking about it",
-                    "reasoning_content": "let me look",
-                    "tool_calls": [{
-                        "id": "tc1",
-                        "type": "function",
-                        "function": {"name": "read", "arguments": "{\"path\": \"README.md\"}"}
-                    }]
-                }
-            }],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 20}
-        }"#;
-        let parsed: WireResponse = serde_json::from_str(src).unwrap();
-        let msg = &parsed.choices.as_ref().unwrap()[0].message;
-        assert_eq!(msg.content, "thinking about it");
-        assert_eq!(msg.reasoning_content.as_deref(), Some("let me look"));
-        let tcs = msg.tool_calls.as_ref().unwrap();
-        assert_eq!(tcs[0].function.name, "read");
-        let usage = parsed.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, 100);
+    fn feed(sse: &str) -> (StreamAssembler, Vec<String>) {
+        let mut asm = StreamAssembler::default();
+        let out = RefCell::new(Vec::new());
+        asm.push_bytes(sse.as_bytes(), &mut |d| match d {
+            StreamDelta::Text(t) => out.borrow_mut().push(format!("text:{t}")),
+            StreamDelta::Reasoning(t) => out.borrow_mut().push(format!("think:{t}")),
+        });
+        (asm, out.into_inner())
     }
 
     #[test]
-    fn parses_parts_content_and_object_arguments() {
-        let src = r#"{
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}],
-                    "tool_calls": [{
-                        "function": {"name": "shell", "arguments": {"command": "ls"}}
-                    }]
-                }
-            }]
-        }"#;
-        let parsed: WireResponse = serde_json::from_str(src).unwrap();
-        let msg = &parsed.choices.unwrap()[0].message;
-        assert_eq!(msg.content, "hello world");
-        let args = msg.tool_calls.as_ref().unwrap()[0]
-            .function
-            .arguments
-            .clone()
-            .unwrap();
-        assert!(args.is_object());
+    fn sse_streams_text_and_reasoning_and_usage() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"reasoning_content\":\"why\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (asm, deltas) = feed(sse);
+        assert_eq!(deltas, vec!["text:Hel", "text:lo", "think:why"]);
+        let reply = asm.finish();
+        assert_eq!(reply.content, "Hello");
+        assert_eq!(reply.reasoning.as_deref(), Some("why"));
+        assert_eq!(reply.usage.prompt_tokens, 11);
+        assert_eq!(reply.usage.completion_tokens, 3);
+    }
+
+    #[test]
+    fn sse_merges_fragmented_tool_calls_by_index() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"wr\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"ite\",\"arguments\":\"th\\\": \\\"x\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"name\":\"shell\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (asm, _) = feed(sse);
+        let reply = asm.finish();
+        assert_eq!(reply.tool_calls.len(), 2);
+        let first = &reply.tool_calls[0];
+        assert_eq!(first.id, "tc1");
+        assert_eq!(first.name, "write");
+        assert_eq!(
+            first.arguments.get("path").and_then(|p| p.as_str()),
+            Some("x")
+        );
+        assert_eq!(reply.tool_calls[1].name, "shell");
+        assert!(
+            reply.tool_calls[1].arguments.is_object(),
+            "missing-args tool call must default to {{}}"
+        );
+    }
+
+    #[test]
+    fn sse_error_chunk_surfaces() {
+        let sse = "data: {\"error\":{\"message\":\"boom\"}}\n\n";
+        let (asm, _) = feed(sse);
+        assert_eq!(asm.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn sse_tolerates_garbage_lines() {
+        let sse = ": keep-alive\n\nevent: ping\ndata: not json\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+        let (asm, deltas) = feed(sse);
+        assert_eq!(deltas, vec!["text:ok"]);
+        assert_eq!(asm.finish().content, "ok");
     }
 
     #[test]

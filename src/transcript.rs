@@ -64,6 +64,7 @@ pub const PERM_OPTIONS: [&str; 4] = [
 pub enum Block {
     User(String),
     Assistant(String),
+    LiveAssistant(String),
     Thought {
         dur_ms: u64,
         text: String,

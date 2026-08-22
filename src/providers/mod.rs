@@ -152,9 +152,18 @@ pub enum ProbeOutcome {
 pub trait Provider {
     fn model_name(&self) -> String;
 
-    fn complete(
+    fn complete_streaming<F>(
         &self,
         messages: &[Msg],
         tools: &[ToolDef],
-    ) -> impl Future<Output = Result<Reply, ProviderError>> + Send;
+        on_delta: F,
+    ) -> impl Future<Output = Result<Reply, ProviderError>> + Send
+    where
+        F: FnMut(StreamDelta) + Send;
+}
+
+#[derive(Debug, Clone)]
+pub enum StreamDelta {
+    Text(String),
+    Reasoning(String),
 }
