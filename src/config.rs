@@ -26,6 +26,7 @@ pub struct ProviderCfg {
     pub model: Option<String>,
     pub models: Option<Vec<String>>,
     pub context_window: Option<u64>,
+    pub compact_threshold: Option<f32>,
     pub probe: Option<bool>,
 }
 
@@ -76,6 +77,7 @@ impl FileConfig {
                 a.model = b.model.or(a.model);
                 a.models = b.models.or(a.models);
                 a.context_window = b.context_window.or(a.context_window);
+                a.compact_threshold = b.compact_threshold.or(a.compact_threshold);
                 a.probe = b.probe.or(a.probe);
                 a
             }),
@@ -134,6 +136,8 @@ pub struct Config {
     pub model: String,
     pub models: Vec<String>,
     pub context_window: u64,
+    /// fraction of context_window at which old rounds get folded
+    pub compact_threshold: f32,
     pub probe_tools: bool,
     pub shell_program: Option<String>,
     pub verify_command: Option<String>,
@@ -156,6 +160,7 @@ impl Default for Config {
             model: String::new(),
             models: Vec::new(),
             context_window: 200_000,
+            compact_threshold: 0.75,
             probe_tools: true,
             shell_program: None,
             verify_command: None,
@@ -212,6 +217,7 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
         model,
         models: merged.provider.models.clone().unwrap_or_default(),
         context_window: merged.provider.context_window.unwrap_or(200_000),
+        compact_threshold: merged.provider.compact_threshold.unwrap_or(0.75),
         probe_tools: merged.provider.probe.unwrap_or(true),
         shell_program: merged.shell.program.clone(),
         verify_command: merged.verify.command.clone(),

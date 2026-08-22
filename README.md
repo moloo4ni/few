@@ -65,6 +65,7 @@ Global config: `~/.config/keiko/config.toml`; per-project: `<project>/.keiko/con
 base_url = "http://127.0.0.1:11434/v1"   # ollama or any OpenAI-compatible server
 model = "qwen3:8b"
 api_key_env = "OPENAI_API_KEY"           # optional; KEIKO_API_KEY / OPENAI_API_KEY also read
+compact_threshold = 0.75                 # fold old rounds at 75% of context_window
 ```
 
 Useful sections:
@@ -92,7 +93,7 @@ project-local things (`.keiko/`).
 
 ```
 src/
-  agent/        agent loop, verify gate, retry threshold
+  agent/        agent loop, verify gate, retry threshold, context compaction
   providers/    canonical message types + OpenAI-compatible adapter
   tools.rs      read/write/edit/shell, output capture, model-side truncation
   perms.rs      permissions engine, sensitive matcher

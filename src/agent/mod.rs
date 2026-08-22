@@ -1,3 +1,4 @@
+pub mod compact;
 pub mod verify;
 
 use crate::config::Config;
@@ -9,6 +10,7 @@ use crate::tools::{self, Ctl};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -120,6 +122,8 @@ pub struct Agent<P: Provider> {
     sys_project: String,
     sys_memory: Mutex<String>,
     sys_mode: Mutex<String>,
+    /// actual prompt_tokens from the provider's last reply - the compaction trigger
+    last_prompt_tokens: AtomicU64,
 }
 
 impl<P: Provider> Agent<P> {
@@ -143,6 +147,42 @@ impl<P: Provider> Agent<P> {
             sys_project: project,
             sys_memory: Mutex::new(mem),
             sys_mode: Mutex::new(mode),
+            last_prompt_tokens: AtomicU64::new(0),
+        }
+    }
+
+    /// Fold old rounds when the context is close to full.
+    /// Triggered by the real prompt_tokens reported by the provider, so the
+    /// threshold is per-provider by construction (see ux-spec, open risk).
+    fn maybe_compact(&self, ev: &mpsc::UnboundedSender<AgentEvent>) {
+        let window = self.cfg.context_window;
+        if window == 0 {
+            return;
+        }
+        let threshold = (window as f64 * self.cfg.compact_threshold as f64) as u64;
+        if self.last_prompt_tokens.load(Ordering::Relaxed) < threshold {
+            return;
+        }
+        let convo = self.snapshot_convo();
+        let (compacted, report) = compact::compact(convo);
+        match report {
+            Some(rep) => {
+                self.set_convo(compacted);
+                self.last_prompt_tokens.store(
+                    compact::estimate_tokens(&self.snapshot_convo()),
+                    Ordering::Relaxed,
+                );
+                let _ = ev.send(AgentEvent::Notice(format!(
+                    "context compacted · {} rounds folded",
+                    rep.folded_rounds
+                )));
+            }
+            // nothing foldable (e.g. one huge task); re-arm the trigger so we
+            // do not re-check every turn against a stale token count
+            None => self.last_prompt_tokens.store(
+                compact::estimate_tokens(&self.snapshot_convo()),
+                Ordering::Relaxed,
+            ),
         }
     }
 
@@ -216,6 +256,7 @@ impl<P: Provider> Agent<P> {
         let tool_defs = tools::defs();
 
         let outcome = loop {
+            self.maybe_compact(&ctx.ev);
             let notes = ctx.take_boundary_notes();
             if !notes.is_empty() {
                 self.push_convo(Msg::user(notes));
@@ -288,6 +329,8 @@ impl<P: Provider> Agent<P> {
                         prompt_tokens: reply.usage.prompt_tokens,
                         completion_tokens: reply.usage.completion_tokens,
                     });
+                    self.last_prompt_tokens
+                        .store(reply.usage.prompt_tokens, Ordering::Relaxed);
                     self.push_convo(Msg {
                         role: Role::Assistant,
                         content: reply.content.clone(),
@@ -1147,6 +1190,66 @@ mod tests {
             .snapshot_convo()
             .iter()
             .any(|m| m.role == Role::Tool && m.content.contains("old_str matches 2 locations")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compaction_triggers_at_threshold_and_re_arms() {
+        let root = temp_root("c");
+        let (perms, mem) = setup(&root);
+        let cfg = Config {
+            context_window: 1000,
+            ..(*test_cfg(&root)).clone()
+        };
+        let agent = Agent::new(
+            Scripted::new(vec![]),
+            Arc::new(cfg),
+            perms,
+            mem,
+            Default::default(),
+        );
+
+        // four rounds: task + three tool-call rounds
+        let mut convo = vec![Msg::user("task")];
+        for k in 0..3 {
+            convo.push(Msg {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall::parse(
+                    "t1".into(),
+                    "read".into(),
+                    r#"{"path":"f.txt"}"#.into(),
+                )],
+                tool_call_id: None,
+                name: None,
+            });
+            convo.push(Msg::tool_result("t1", "read", "body"));
+            convo.push(Msg::user(format!("follow-up {k}")));
+        }
+        agent.set_convo(convo);
+
+        // 900 >= 0.75 * 1000 -> compaction expected
+        agent.last_prompt_tokens.store(900, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        agent.maybe_compact(&tx);
+
+        let out = agent.snapshot_convo();
+        assert!(
+            out.iter()
+                .any(|m| m.content.starts_with("[keiko context compacted]")),
+            "compaction note must appear"
+        );
+        assert!(out.iter().any(|m| m.content == "follow-up 2"));
+        assert!(out.iter().any(|m| m.content == "task"));
+        assert!(rx.try_recv().is_ok(), "notice sent to UI");
+        // trigger re-armed below the threshold
+        assert!(agent.last_prompt_tokens.load(Ordering::Relaxed) < 750);
+
+        // below threshold -> no-op
+        let before = agent.snapshot_convo();
+        agent.last_prompt_tokens.store(10, Ordering::Relaxed);
+        agent.maybe_compact(&tx);
+        assert_eq!(agent.snapshot_convo().len(), before.len());
         let _ = std::fs::remove_dir_all(&root);
     }
 
