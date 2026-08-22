@@ -14,7 +14,7 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -43,7 +43,7 @@ impl ToolCall {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Msg {
     pub role: Role,
     pub content: String,

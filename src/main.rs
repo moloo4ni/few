@@ -24,6 +24,9 @@ async fn main() {
 }
 
 async fn run() -> anyhow::Result<()> {
+    let continue_last = std::env::args()
+        .skip(1)
+        .any(|a| a == "--continue" || a == "-c");
     let root = std::env::current_dir()?;
     let paths = keiko::paths::Paths::init()?;
     let cfg = Arc::new(config::load(&paths, &root)?);
@@ -72,7 +75,32 @@ async fn run() -> anyhow::Result<()> {
     ));
 
     let history_path = paths.history_file();
-    let mut app = App::new(Arc::clone(&cfg), Arc::clone(&agent), memory, history_path);
+
+    let mut resume = None;
+    if continue_last {
+        let (r, note) = match keiko::session::load_latest(&paths.sessions_dir(), &root) {
+            Ok(Some((r, sess))) => {
+                let n = sess.messages.len();
+                agent.set_convo(sess.messages);
+                (Some(r), format!("resumed session · {n} messages restored"))
+            }
+            Ok(None) => (
+                None,
+                "no previous session found for this project - starting fresh".into(),
+            ),
+            Err(e) => (None, format!("failed loading previous session: {e}")),
+        };
+        resume = Some((r, note));
+    }
+
+    let mut app = App::new(
+        Arc::clone(&cfg),
+        Arc::clone(&agent),
+        memory,
+        history_path,
+        paths.sessions_dir(),
+        resume,
+    );
 
     let mut terminal = tui::init()?;
     let result = app.run_app(&mut terminal).await;

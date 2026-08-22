@@ -42,7 +42,11 @@ Requires stable Rust (pinned via `rust-toolchain.toml`):
 ```sh
 cargo build --release
 ./target/release/keiko          # inside a project directory
+./target/release/keiko -c       # resume the last session for this project
 ```
+
+Sessions persist automatically after each completed task as JSON under the user's
+data directory (`sessions/`), never inside the project.
 
 TLS ships as the default `tls` feature (`reqwest` + `rustls`). Alternatives: an HTTP-only
 build (`--no-default-features`) or the OS-native backend
@@ -92,6 +96,7 @@ src/
   providers/    canonical message types + OpenAI-compatible adapter
   tools.rs      read/write/edit/shell, output capture, model-side truncation
   perms.rs      permissions engine, sensitive matcher
+  session.rs    session persistence / `--continue` resume
   app.rs        TUI event loop, commands, Ctrl+C ladder
   uirender.rs   transcript, status bar, input rendering
 prompts/base.md base layer of the system prompt (compiled into the binary)

@@ -571,7 +571,14 @@ mod tests {
             memory.clone(),
             Default::default(),
         ));
-        let mut app = App::new(cfg, agent, memory, root.join("hist.txt"));
+        let mut app = App::new(
+            cfg,
+            agent,
+            memory,
+            root.join("hist.txt"),
+            root.join("sessions"),
+            None,
+        );
         app.model_name = "sonnet-5".into();
         app.mode = Mode::Build;
         app.ctx_used = 12_400;

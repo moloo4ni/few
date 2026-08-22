@@ -163,6 +163,11 @@ impl<P: Provider> Agent<P> {
         self.convo.lock().unwrap().clone()
     }
 
+    /// Seed the conversation with persisted history (session resume).
+    pub fn set_convo(&self, msgs: Vec<Msg>) {
+        *self.convo.lock().unwrap() = msgs;
+    }
+
     fn push_convo(&self, msg: Msg) {
         self.convo.lock().unwrap().push(msg);
     }

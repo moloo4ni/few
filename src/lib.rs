@@ -9,6 +9,7 @@ pub mod memory;
 pub mod paths;
 pub mod perms;
 pub mod providers;
+pub mod session;
 pub mod sysprompt;
 pub mod theme;
 pub mod tools;

@@ -5,6 +5,7 @@ use crate::inputline::InputState;
 use crate::memory::{MemLevel, Memory};
 use crate::perms::{Grant, Mode};
 use crate::providers::openai::OpenAiProvider;
+use crate::providers::Provider as _;
 use crate::sysprompt;
 use crate::tools::Ctl;
 use crate::transcript::{
@@ -47,6 +48,8 @@ pub struct App {
     pub agent: Arc<Agent<OpenAiProvider>>,
     pub memory: Memory,
     history_path: PathBuf,
+    sessions_dir: PathBuf,
+    session: Option<crate::session::SessionRef>,
     live_text_idx: Option<usize>,
     live_thought: String,
     file_index: Arc<Mutex<Vec<String>>>,
@@ -62,13 +65,15 @@ impl App {
         agent: Arc<Agent<OpenAiProvider>>,
         memory: Memory,
         history_path: PathBuf,
+        sessions_dir: PathBuf,
+        resume: Option<(Option<crate::session::SessionRef>, String)>,
     ) -> Self {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let mut input = InputState::new();
         for entry in load_history(&history_path) {
             input.push_history(&entry);
         }
-        Self {
+        let mut app = Self {
             blocks: Vec::new(),
             steps_group_idx: None,
             active_ask: None,
@@ -92,13 +97,19 @@ impl App {
             agent,
             memory,
             history_path,
+            sessions_dir,
+            session: resume.as_ref().and_then(|(r, _)| r.clone()),
             live_text_idx: None,
             live_thought: String::new(),
             file_index: Arc::new(Mutex::new(Vec::new())),
             ctl_tx: None,
             ev_tx,
             ev_rx,
+        };
+        if let Some((_, note)) = resume {
+            app.push_notice(note);
         }
+        app
     }
 
     pub async fn run_app(
@@ -650,6 +661,7 @@ impl App {
                 self.escalation = None;
                 self.ctl_tx = None;
                 self.active_ask = None;
+                self.save_session();
                 self.spawn_index_rebuild();
             }
         }
@@ -715,6 +727,24 @@ impl App {
             let outcome: TaskOutcome = agent.run(text, ev, ctl_rx).await;
             let _ = outcome;
         });
+    }
+
+    fn save_session(&mut self) {
+        let convo = self.agent.snapshot_convo();
+        if convo.is_empty() {
+            return;
+        }
+        let root = self.cfg.project_root.clone();
+        let model = self.agent.provider.model_name();
+        let dir = self.sessions_dir.clone();
+        let prev = self.session.take();
+        match crate::session::save(&dir, &root, &model, prev.as_ref(), convo) {
+            Ok(r) => self.session = Some(r),
+            Err(e) => {
+                self.session = prev;
+                self.push_notice(format!("failed saving session: {e}"));
+            }
+        }
     }
 
     fn spawn_index_rebuild(&mut self) {
