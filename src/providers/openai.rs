@@ -150,7 +150,8 @@ impl OpenAiProvider {
         })
     }
 
-    pub async fn probe_tool_calling(&self) -> Result<(), String> {
+    pub async fn probe_tool_calling(&self) -> super::ProbeOutcome {
+        use super::ProbeOutcome;
         let msgs = [Msg::user("Call the keiko_probe tool immediately.")];
         let tools = [ToolDef {
             name: "keiko_probe",
@@ -158,29 +159,31 @@ impl OpenAiProvider {
             parameters: json!({"type": "object", "properties": {}, "required": []}),
         }];
 
-        match self
-            .complete_with_choice(&msgs, &tools, json!("required"))
-            .await
-        {
-            Ok(reply) => {
-                if reply.tool_calls.is_empty() {
-                    Err("model responded with plain text instead of a native tool call".into())
-                } else {
-                    Ok(())
+        let mut last_error: Option<ProviderError> = None;
+        for choice in [json!("required"), json!("auto")] {
+            match self.complete_with_choice(&msgs, &tools, choice).await {
+                Ok(reply) => {
+                    return if reply.tool_calls.is_empty() {
+                        ProbeOutcome::Unsupported(
+                            "model responded with plain text instead of a native tool call"
+                                .to_owned(),
+                        )
+                    } else {
+                        ProbeOutcome::Supported
+                    };
                 }
-            }
-            Err(e) => {
-                let retry = self
-                    .complete_with_choice(&msgs, &tools, json!("auto"))
-                    .await;
-                match retry {
-                    Ok(reply) if !reply.tool_calls.is_empty() => Ok(()),
-                    _ => Err(format!(
-                        "provider/model does not provide native structured tool-calling ({e}); Keiko refuses prompt-based fallback - choose a tool-calling capable model"
-                    )),
+                Err(e @ ProviderError::NoToolSupport(_)) => {
+                    return ProbeOutcome::Unsupported(e.to_string());
                 }
+                Err(e) => last_error = Some(e),
             }
         }
+
+        ProbeOutcome::Unavailable(
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no response".into()),
+        )
     }
 }
 
@@ -195,11 +198,19 @@ impl Provider for OpenAiProvider {
     }
 }
 
+const UNSUPPORT_PHRASES: &[&str] = &[
+    "not supported",
+    "unsupported",
+    "does not support",
+    "doesn't support",
+    "no support for",
+];
+
 fn classify_status(status: u16, body: &str) -> ProviderError {
     let lowered = body.to_lowercase();
-    let mentions_tools =
-        lowered.contains("tool") || lowered.contains("function") || lowered.contains("support");
-    if matches!(status, 400 | 404 | 422 | 501) && mentions_tools {
+    let mentions_tools = lowered.contains("tool") || lowered.contains("function");
+    let denies_capability = UNSUPPORT_PHRASES.iter().any(|p| lowered.contains(p));
+    if matches!(status, 400 | 404 | 422 | 501) && mentions_tools && denies_capability {
         ProviderError::NoToolSupport(truncate(body, 500))
     } else {
         ProviderError::Http(format!("HTTP {status}: {}", truncate(body, 500)))
@@ -409,8 +420,18 @@ mod tests {
     fn classifies_no_tool_support() {
         let e = classify_status(400, r#"{"error":"model does not support tools"}"#);
         assert!(matches!(e, ProviderError::NoToolSupport(_)));
-        let e2 = classify_status(400, "bad request");
-        assert!(matches!(e2, ProviderError::Http(_)));
+        let e = classify_status(400, "function calling is unsupported by this model");
+        assert!(matches!(e, ProviderError::NoToolSupport(_)));
+        let e = classify_status(
+            400,
+            r#"{"error":{"message":"Upstream request failed: Model is unavailable."}}"#,
+        );
+        assert!(
+            matches!(e, ProviderError::Http(_)),
+            "transient gateway errors must not look like missing tool support"
+        );
+        let e = classify_status(400, "bad request");
+        assert!(matches!(e, ProviderError::Http(_)));
     }
 
     #[test]

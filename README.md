@@ -44,12 +44,9 @@ cargo build --release
 ./target/release/keiko          # inside a project directory
 ```
 
-TLS ships as the default `tls` feature (`reqwest` + `rustls`). On toolchains without a C
-compiler an HTTP-only build is possible:
-
-```sh
-cargo build --no-default-features
-```
+TLS ships as the default `tls` feature (`reqwest` + `rustls`). Alternatives: an HTTP-only
+build (`--no-default-features`) or the OS-native backend
+(`--no-default-features --features tls-native`) for toolchains without a C compiler.
 
 At startup Keiko checks that the selected model answers with native tool calls; otherwise it
 exits with an explicit error - switch models rather than hoping text parsing will work.

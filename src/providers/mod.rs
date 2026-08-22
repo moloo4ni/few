@@ -142,6 +142,13 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+#[derive(Debug, Clone)]
+pub enum ProbeOutcome {
+    Supported,
+    Unsupported(String),
+    Unavailable(String),
+}
+
 pub trait Provider {
     fn model_name(&self) -> String;
 

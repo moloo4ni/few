@@ -25,6 +25,7 @@ unicode-width = "0.2"
 [features]
 default = ["tls"]
 tls = ["reqwest/rustls-tls"]
+tls-native = ["reqwest/native-tls"]
 
 [dev-dependencies]
 insta = "1"

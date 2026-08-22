@@ -42,11 +42,16 @@ async fn run() -> anyhow::Result<()> {
     let provider = OpenAiProvider::new(&cfg.provider_base_url, cfg.api_key.as_deref(), &cfg.model)?;
 
     if cfg.probe_tools {
-        if let Err(msg) = provider.probe_tool_calling().await {
-            anyhow::bail!(
+        println!("keiko · probing structured tool-calling of {} …", cfg.model);
+        match provider.probe_tool_calling().await {
+            keiko::providers::ProbeOutcome::Supported => {}
+            keiko::providers::ProbeOutcome::Unsupported(msg) => anyhow::bail!(
                 "model '{}' does not provide native structured tool-calling.\n{msg}\nKeiko refuses prompt-based fallback - configure a tool-calling capable model.",
                 cfg.model
-            );
+            ),
+            keiko::providers::ProbeOutcome::Unavailable(msg) => anyhow::bail!(
+                "tool-calling probe could not be verified against the provider:\n{msg}\nCheck base_url/model availability and retry."
+            ),
         }
     }
 
