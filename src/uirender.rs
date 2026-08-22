@@ -389,6 +389,16 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
     let mut rows: Vec<(Vec<Seg>, Hit)> = Vec::new();
     let cap = app.cfg.diff_lines.max(10);
 
+    // reverse video marks the keyboard-focused element
+    let focused = |bi: usize, si: usize| -> bool { app.focus == Some((bi, si)) };
+    let mark = |s: ratatui::style::Style, on: bool| -> ratatui::style::Style {
+        if on {
+            s.add_modifier(ratatui::style::Modifier::REVERSED)
+        } else {
+            s
+        }
+    };
+
     for (bi, block) in app.blocks.iter().enumerate() {
         if !rows.is_empty() {
             rows.push((vec![], Hit::Nothing));
@@ -409,7 +419,10 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                     'v'
                 };
                 rows.push((
-                    vec![(format!("{marker} thought {secs}s"), theme::dim())],
+                    vec![(
+                        format!("{marker} thought {secs}s"),
+                        mark(theme::dim(), focused(bi, usize::MAX)),
+                    )],
                     Hit::Block(bi),
                 ));
                 if *expand != Expand::Collapsed {
@@ -471,7 +484,10 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             Block::Steps(group) => {
                 let marker = if group.expanded { 'v' } else { '>' };
                 rows.push((
-                    vec![(format!("{marker} {}", group.summary()), theme::dim())],
+                    vec![(
+                        format!("{marker} {}", group.summary()),
+                        mark(theme::dim(), focused(bi, usize::MAX)),
+                    )],
                     Hit::Step(bi, usize::MAX),
                 ));
                 if group.expanded {
@@ -482,7 +498,10 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                             _ => theme::dim(),
                         };
                         rows.push((
-                            vec![(format!("  {}", step.headline()), style)],
+                            vec![(
+                                format!("  {}", step.headline()),
+                                mark(style, focused(bi, si)),
+                            )],
                             Hit::Step(bi, si),
                         ));
                         if step.expand != Expand::Collapsed {
@@ -658,5 +677,104 @@ mod tests {
             !joined.contains("README.md"),
             "collapsed group must hide step args"
         );
+    }
+
+    fn thought_block(dur_ms: u64) -> Block {
+        Block::Thought {
+            dur_ms,
+            text: "considering options".into(),
+            expand: Expand::Collapsed,
+        }
+    }
+
+    fn step_with_diff(arg: &str) -> StepBlock {
+        StepBlock {
+            view: crate::agent::StepView {
+                verb: crate::agent::Verb::Wrote,
+                arg: arg.into(),
+                detail: Some(crate::agent::Detail::Diff {
+                    lines: vec![crate::diffgen::DiffLine {
+                        sign: '+',
+                        text: "new line".into(),
+                    }],
+                    capped_at: None,
+                }),
+            },
+            expand: Expand::Collapsed,
+        }
+    }
+
+    #[test]
+    fn expandable_targets_in_visual_order() {
+        let mut app = test_app("targets");
+        app.blocks.push(thought_block(1500));
+        let mut group = StepsGroup {
+            steps: vec![step_with_diff("a.txt")],
+            expanded: false,
+            outcome: None,
+        };
+        group.steps.push(StepBlock {
+            view: crate::agent::StepView {
+                verb: crate::agent::Verb::Ran,
+                arg: "cargo fmt".into(),
+                detail: Some(crate::agent::Detail::Message("ok".into())),
+            },
+            expand: Expand::Collapsed,
+        });
+        app.blocks.push(Block::Steps(group));
+
+        // thought header, group header, diff-capable step only
+        // (Message detail does not respect Expand, so it is not a target)
+        assert_eq!(
+            app.expandable_targets(),
+            vec![(0, usize::MAX), (1, usize::MAX), (1, 0)]
+        );
+    }
+
+    #[test]
+    fn focus_moves_wraps_and_space_toggles() {
+        let mut app = test_app("focus");
+        app.blocks.push(thought_block(1500));
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![step_with_diff("a.txt")],
+            expanded: false,
+            outcome: None,
+        }));
+
+        app.move_focus(true);
+        assert_eq!(app.focus, Some((0, usize::MAX)));
+        app.move_focus(false);
+        assert_eq!(app.focus, Some((1, 0)), "wraps backwards to last target");
+
+        app.focus = Some((1, usize::MAX));
+        assert!(app.toggle_focused());
+        match &app.blocks[1] {
+            Block::Steps(g) => assert!(g.expanded, "space on group headline expands it"),
+            _ => panic!("expected steps block"),
+        }
+
+        app.focus = Some((1, 0));
+        assert!(app.toggle_focused());
+        match &app.blocks[1] {
+            Block::Steps(g) => {
+                assert_eq!(g.steps[0].expand, Expand::Shown);
+            }
+            _ => panic!("expected steps block"),
+        }
+    }
+
+    #[test]
+    fn mouse_click_on_thought_toggles() {
+        let mut app = test_app("thought-click");
+        app.blocks.push(thought_block(1500));
+        render(&mut app, 60, 12); // builds the hitmap
+        assert_eq!(app.hitmap[0], Hit::Block(0));
+        app.on_click(0); // first transcript row is the thought header
+        match &app.blocks[0] {
+            Block::Thought { expand, .. } => {
+                assert!(*expand != Expand::Collapsed, "click must unfold thought");
+            }
+            _ => panic!("expected thought block"),
+        }
     }
 }

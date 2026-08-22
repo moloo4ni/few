@@ -1,4 +1,4 @@
-use crate::agent::{Agent, AgentEvent, TaskOutcome};
+use crate::agent::{Agent, AgentEvent, Detail, TaskOutcome};
 use crate::commands::{find_command, ArgKind};
 use crate::config::Config;
 use crate::inputline::InputState;
@@ -41,6 +41,9 @@ pub struct App {
     pub escalation: Option<Instant>,
     pub quit: bool,
     pub hitmap: Vec<Hit>,
+    /// keyboard focus over expandable transcript elements: (block_idx, step_idx)
+    /// (step_idx == usize::MAX means a group/thought header)
+    pub focus: Option<(usize, usize)>,
     pub transcript_area: ratatui::layout::Rect,
     pub palette_sel: usize,
     pub models_cache: Vec<String>,
@@ -90,6 +93,7 @@ impl App {
             escalation: None,
             quit: false,
             hitmap: Vec::new(),
+            focus: None,
             transcript_area: Default::default(),
             palette_sel: 0,
             models_cache: cfg.models.clone(),
@@ -195,13 +199,19 @@ impl App {
         }
     }
 
-    fn on_click(&mut self, row: u16) {
+    pub fn on_click(&mut self, row: u16) {
         let rel = row.saturating_sub(self.transcript_area.y) as usize;
         let Some(hit) = self.hitmap.get(rel).copied() else {
             return;
         };
         match hit {
-            Hit::Nothing | Hit::Block(_) => {}
+            Hit::Nothing => {}
+            Hit::Block(bi) => {
+                // only thought headers are toggleable via Hit::Block
+                if let Some(Block::Thought { expand, .. }) = self.blocks.get_mut(bi) {
+                    *expand = expand.next();
+                }
+            }
             Hit::Step(bi, usize::MAX) => {
                 if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
                     g.expanded = !g.expanded;
@@ -223,10 +233,111 @@ impl App {
         self.scroll_from_end = 0;
     }
 
+    /// Expandable transcript elements in visual order. A step is listed when
+    /// its detail actually respects Expand (diffs and captured output).
+    pub fn expandable_targets(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (bi, block) in self.blocks.iter().enumerate() {
+            match block {
+                Block::Thought { .. } => out.push((bi, usize::MAX)),
+                Block::Steps(g) => {
+                    out.push((bi, usize::MAX));
+                    for (si, s) in g.steps.iter().enumerate() {
+                        if matches!(
+                            s.view.detail,
+                            Some(Detail::Diff { .. }) | Some(Detail::Output { .. })
+                        ) {
+                            out.push((bi, si));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    pub fn move_focus(&mut self, forward: bool) {
+        let targets = self.expandable_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let next = match self.focus {
+            None => {
+                if forward {
+                    0
+                } else {
+                    targets.len() - 1
+                }
+            }
+            Some(cur) => {
+                let pos = targets.iter().position(|&t| t == cur).unwrap_or(0);
+                if forward {
+                    (pos + 1) % targets.len()
+                } else {
+                    (pos + targets.len() - 1) % targets.len()
+                }
+            }
+        };
+        self.focus = Some(targets[next]);
+    }
+
+    pub fn toggle_focused(&mut self) -> bool {
+        let Some((bi, si)) = self.focus else {
+            return false;
+        };
+        match self.blocks.get_mut(bi) {
+            Some(Block::Thought { expand, .. }) if si == usize::MAX => {
+                *expand = expand.next();
+                true
+            }
+            Some(Block::Steps(g)) if si == usize::MAX => {
+                g.expanded = !g.expanded;
+                true
+            }
+            Some(Block::Steps(g)) => match g.steps.get_mut(si) {
+                Some(s) => {
+                    s.expand = s.expand.next();
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     async fn on_key(&mut self, k: KeyEvent) {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             self.ctrl_c_ladder();
             return;
+        }
+
+        // transcript cursor: Alt+Up/Down to move, Space toggles, typing clears
+        if k.modifiers.contains(KeyModifiers::ALT) && matches!(k.code, KeyCode::Up | KeyCode::Down)
+        {
+            self.move_focus(k.code == KeyCode::Down);
+            self.scroll_from_end = 0;
+            return;
+        }
+        if self.focus.is_some() {
+            match k.code {
+                KeyCode::Char(' ') => {
+                    if !self.toggle_focused() {
+                        self.focus = None;
+                    }
+                    self.scroll_from_end = 0;
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.focus = None;
+                    return;
+                }
+                KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Tab => {
+                    self.focus = None;
+                    // fall through: the key keeps its normal meaning
+                }
+                _ => {}
+            }
         }
 
         if self.active_ask.is_some() {

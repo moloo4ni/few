@@ -190,7 +190,7 @@ impl StepsGroup {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
     Nothing,
     Block(usize),
