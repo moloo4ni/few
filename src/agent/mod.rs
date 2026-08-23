@@ -36,10 +36,23 @@ impl Verb {
             Verb::Wrote => "wrote",
             Verb::Deleted => "deleted",
             Verb::Renamed => "renamed",
-            Verb::Ran => "run",
+            Verb::Ran => "ran",
             Verb::Failed => "failed",
             Verb::Errored => "error",
             Verb::Denied => "denied",
+        }
+    }
+
+    /// Present progressive form, shown while the action is still running.
+    /// Terminal states (failed/error/denied) never get a live form.
+    pub fn doing(&self) -> &'static str {
+        match self {
+            Verb::Read => "reading",
+            Verb::Wrote => "writing",
+            Verb::Deleted => "deleting",
+            Verb::Renamed => "renaming",
+            Verb::Ran => "running",
+            other => other.word(),
         }
     }
 }
@@ -76,6 +89,12 @@ pub struct PermAskView {
 }
 
 #[derive(Debug, Clone)]
+pub struct StepStartView {
+    pub verb: Verb,
+    pub arg: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum AgentEvent {
     ThinkingStarted,
     ThoughtDelta {
@@ -92,6 +111,7 @@ pub enum AgentEvent {
         line: String,
     },
     Step(StepView),
+    StepStarted(StepStartView),
     PermAsk(PermAskView),
     Notice(String),
     AssistantText(String),
@@ -414,6 +434,10 @@ impl<P: Provider> Agent<P> {
         let _ = ctx
             .ev
             .send(AgentEvent::Notice(format!("verify · {}", plan.command)));
+        let _ = ctx.ev.send(AgentEvent::StepStarted(StepStartView {
+            verb: Verb::Ran,
+            arg: plan.command.clone(),
+        }));
         let mut stash = std::mem::take(&mut ctx.stash);
         let run = tools::run_shell(
             ctx.cfg.shell_program.as_deref(),
@@ -550,7 +574,12 @@ impl<P: Provider> Agent<P> {
             .gate(ctx, Capability::FsRead, Some(&abs), path_arg.clone())
             .await
         {
-            GateResult::Proceed => {}
+            GateResult::Proceed => {
+                let _ = ctx.ev.send(AgentEvent::StepStarted(StepStartView {
+                    verb: Verb::Read,
+                    arg: path_arg.clone(),
+                }));
+            }
             GateResult::Aborted => return false,
             GateResult::Denied(msg) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
@@ -621,7 +650,12 @@ impl<P: Provider> Agent<P> {
             .gate(ctx, Capability::FsWrite, Some(&abs), path_arg.clone())
             .await
         {
-            GateResult::Proceed => {}
+            GateResult::Proceed => {
+                let _ = ctx.ev.send(AgentEvent::StepStarted(StepStartView {
+                    verb: if delete { Verb::Deleted } else { Verb::Wrote },
+                    arg: path_arg.clone(),
+                }));
+            }
             GateResult::Aborted => return false,
             GateResult::Denied(msg) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
@@ -698,7 +732,12 @@ impl<P: Provider> Agent<P> {
             .gate(ctx, Capability::FsWrite, Some(&abs), path_arg.clone())
             .await
         {
-            GateResult::Proceed => {}
+            GateResult::Proceed => {
+                let _ = ctx.ev.send(AgentEvent::StepStarted(StepStartView {
+                    verb: Verb::Wrote,
+                    arg: path_arg.clone(),
+                }));
+            }
             GateResult::Aborted => return false,
             GateResult::Denied(msg) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
@@ -749,7 +788,12 @@ impl<P: Provider> Agent<P> {
             .gate(ctx, Capability::ShellExec, None, command.clone())
             .await
         {
-            GateResult::Proceed => {}
+            GateResult::Proceed => {
+                let _ = ctx.ev.send(AgentEvent::StepStarted(StepStartView {
+                    verb: Verb::Ran,
+                    arg: command.clone(),
+                }));
+            }
             GateResult::Aborted => return false,
             GateResult::Denied(msg) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
@@ -1102,6 +1146,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[tokio::test]
+    async fn step_started_arrives_in_present_tense_before_final_step() {
+        let root = temp_root("s");
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        let (perms, mem) = setup(&root);
+        perms.lock().unwrap().set_mode(Mode::Build); // read stays silent-allowed
+        let prov = Scripted::new(vec![
+            reply_call("read", r#"{"path":"a.txt"}"#),
+            reply_text("done"),
+        ]);
+        let agent = Agent::new(prov, test_cfg(&root), perms, mem, Default::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_ttx, trx) = mpsc::unbounded_channel();
+        let outcome = agent.run("show a.txt".into(), tx, trx).await;
+        assert_eq!(outcome, TaskOutcome::Done);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        // StepStarted(reading) strictly before the final past-tense step
+        let start_pos = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::StepStarted(v) if v.verb.doing() == "reading"))
+            .expect("StepStarted(reading) must be emitted");
+        let step_pos = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Step(s) if s.verb.word() == "read"))
+            .expect("final read step must follow");
+        assert!(start_pos < step_pos);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

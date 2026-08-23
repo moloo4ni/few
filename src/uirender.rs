@@ -522,6 +522,17 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
         }
     }
 
+    // action currently executing, in present tense; replaced by the final
+    // past-tense step once it completes
+    if let Some((doing, arg)) = &app.live_step {
+        let dots = ".".repeat(1 + app.spinner_tick % 3);
+        rows.push((vec![], Hit::Nothing));
+        rows.push((
+            vec![(format!("  {doing} {arg} {dots}"), theme::dim())],
+            Hit::Nothing,
+        ));
+    }
+
     rows
 }
 
@@ -761,6 +772,25 @@ mod tests {
             }
             _ => panic!("expected steps block"),
         }
+    }
+
+    #[test]
+    fn live_step_renders_in_present_tense() {
+        let mut app = test_app("live-step");
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![],
+            expanded: false,
+            outcome: None,
+        }));
+        app.live_step = Some(("reading".into(), "src/main.rs".into()));
+        let rows = render(&mut app, 60, 12);
+        let joined = rows.join("\n");
+        assert!(joined.contains("reading src/main.rs ."), "{joined:?}");
+
+        // once the step completes, only the past-tense form remains
+        app.live_step = None;
+        let rows = render(&mut app, 60, 12);
+        assert!(!rows.join("\n").contains("reading"));
     }
 
     #[test]

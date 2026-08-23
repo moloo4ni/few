@@ -55,6 +55,8 @@ pub struct App {
     session: Option<crate::session::SessionRef>,
     live_text_idx: Option<usize>,
     live_thought: String,
+    /// action currently executing, shown in present tense until its final step arrives
+    pub live_step: Option<(String, String)>,
     file_index: Arc<Mutex<Vec<String>>>,
     ctl_tx: Option<mpsc::UnboundedSender<Ctl>>,
     ev_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -105,6 +107,7 @@ impl App {
             session: resume.as_ref().and_then(|(r, _)| r.clone()),
             live_text_idx: None,
             live_thought: String::new(),
+            live_step: None,
             file_index: Arc::new(Mutex::new(Vec::new())),
             ctl_tx: None,
             ev_tx,
@@ -751,10 +754,18 @@ impl App {
                 self.active_ask = Some(self.blocks.len() - 1);
                 self.scroll_from_end = 0;
             }
+            AgentEvent::StepStarted(view) => {
+                self.live_step = Some((view.verb.doing().to_owned(), view.arg));
+                self.scroll_from_end = 0;
+            }
+            AgentEvent::Step(_) => {
+                self.live_step = None;
+            }
             AgentEvent::Finished(outcome) => {
                 self.seal_live_blocks();
                 self.thinking_since = None;
                 self.live_thought.clear();
+                self.live_step = None;
                 if let Some(gi) = self.steps_group_idx {
                     let mut drop_group = false;
                     if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {

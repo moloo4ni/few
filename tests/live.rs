@@ -85,6 +85,7 @@ async fn drain_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
             AgentEvent::Step(s) => println!("step · {} {}", s.verb.word(), s.arg),
+            AgentEvent::StepStarted(v) => println!("… {} {}", v.verb.doing(), v.arg),
             AgentEvent::ThinkingStarted => println!("thinking…"),
             AgentEvent::ThoughtDelta { text } => print!("{text}"),
             AgentEvent::ThinkingFinished { dur_ms } => println!("\nthought {}ms", dur_ms),
