@@ -30,6 +30,9 @@ tls-native = ["reqwest/native-tls"]
 [dev-dependencies]
 insta = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 lto = true
 strip = true

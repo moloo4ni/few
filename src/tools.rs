@@ -350,6 +350,13 @@ pub async fn run_shell(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // own process group, so a soft interrupt reaches the whole tree
+    // (shell + its children like compilers and test runners), not just the shell
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -472,6 +479,11 @@ pub async fn run_shell(
 
         if let Some(deadline) = kill_deadline {
             if std::time::Instant::now() >= deadline {
+                #[cfg(unix)]
+                if let Some(pid) = child.id() {
+                    kill_group(pid as i32, libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
                 let _ = child.start_kill();
                 kill_deadline = None;
             }
@@ -485,14 +497,17 @@ fn soft_terminate(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            let _ = std::process::Command::new("kill")
-                .arg("-15")
-                .arg(pid.to_string())
-                .status();
+            kill_group(pid as i32, libc::SIGTERM);
             return;
         }
     }
     let _ = child.start_kill();
+}
+
+#[cfg(unix)]
+fn kill_group(pgid: i32, sig: i32) -> bool {
+    // negative pid targets the whole process group
+    unsafe { libc::kill(-pgid, sig) == 0 }
 }
 
 fn clip_bytes(data: &[u8], cap: usize) -> String {

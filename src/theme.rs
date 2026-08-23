@@ -30,6 +30,9 @@ pub fn blue_dim() -> Style {
         .add_modifier(Modifier::DIM)
 }
 
-pub fn reversed() -> Style {
-    Style::new().add_modifier(Modifier::REVERSED)
+/// dimmed yellow - a settled permission decision: decided, but worth spotting
+pub fn amber_dim() -> Style {
+    Style::new()
+        .fg(ratatui::style::Color::Yellow)
+        .add_modifier(Modifier::DIM)
 }

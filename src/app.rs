@@ -25,6 +25,12 @@ use tokio::sync::{mpsc, oneshot};
 
 const ESCALATION_WINDOW: Duration = Duration::from_millis(1200);
 
+/// Internal application messages, separate from agent events.
+pub enum AppMsg {
+    /// $EDITOR session finished - resume drawing
+    EditorDone,
+}
+
 pub struct App {
     pub blocks: Vec<Block>,
     pub steps_group_idx: Option<usize>,
@@ -62,6 +68,10 @@ pub struct App {
     pub live_step: Option<(String, String)>,
     file_index: Arc<Mutex<Vec<String>>>,
     ctl_tx: Option<mpsc::UnboundedSender<Ctl>>,
+    app_tx: mpsc::UnboundedSender<AppMsg>,
+    app_rx: mpsc::UnboundedReceiver<AppMsg>,
+    /// true while an external $EDITOR owns the terminal
+    suspended: bool,
     ev_tx: mpsc::UnboundedSender<AgentEvent>,
     ev_rx: mpsc::UnboundedReceiver<AgentEvent>,
 }
@@ -77,6 +87,7 @@ impl App {
         resume: Option<(Option<crate::session::SessionRef>, String)>,
     ) -> Self {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let (app_tx, app_rx) = mpsc::unbounded_channel();
         let mut input = InputState::new();
         for entry in load_history(&history_path) {
             input.push_history(&entry);
@@ -113,6 +124,9 @@ impl App {
             live_step: None,
             file_index: Arc::new(Mutex::new(Vec::new())),
             ctl_tx: None,
+            app_tx,
+            app_rx,
+            suspended: false,
             ev_tx,
             ev_rx,
         };
@@ -136,9 +150,12 @@ impl App {
             if self.quit {
                 break;
             }
-            terminal.draw(|f| uirender::draw(f, self))?;
+            // while $EDITOR owns the terminal, Keiko must not draw anything
+            if !self.suspended {
+                terminal.draw(|f| uirender::draw(f, self))?;
+            }
             tokio::select! {
-                maybe_ev = events.next() => {
+                maybe_ev = events.next(), if !self.suspended => {
                     match maybe_ev {
                         Some(Ok(ev)) => self.on_term_event(ev).await,
                         Some(Err(e)) => {
@@ -148,6 +165,9 @@ impl App {
                     }
                 }
                 Some(ae) = self.ev_rx.recv() => self.on_agent_event(ae),
+                Some(msg) = self.app_rx.recv() => match msg {
+                    AppMsg::EditorDone => self.suspended = false,
+                },
                 _ = tick.tick() => {
                     if let Some(t) = self.escalation {
                         if t.elapsed() > ESCALATION_WINDOW {
@@ -392,13 +412,11 @@ impl App {
         match k.code {
             KeyCode::PageUp => {
                 self.scroll_from_end += self.transcript_area.height as usize;
-                return;
             }
             KeyCode::PageDown => {
                 self.scroll_from_end = self
                     .scroll_from_end
                     .saturating_sub(self.transcript_area.height as usize);
-                return;
             }
             KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.newline()
@@ -635,8 +653,11 @@ impl App {
     fn memory_edit(&mut self, level: MemLevel) {
         let path = self.memory.level_path(level).to_path_buf();
         let _ = self.memory.ensure_files();
+        // hand the terminal over to $EDITOR: stop drawing until it returns
+        self.suspended = true;
         let agent = Arc::clone(&self.agent);
         let tx = self.ev_tx.clone();
+        let atx = self.app_tx.clone();
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || run_editor_blocking(&path)).await;
             agent.refresh_memory_layer();
@@ -646,6 +667,8 @@ impl App {
                 Err(e) => format!("editor join failed: {e}"),
             };
             let _ = tx.send(AgentEvent::Notice(msg));
+            // always restore drawing, even when the editor failed
+            let _ = atx.send(AppMsg::EditorDone);
         });
     }
 
@@ -913,6 +936,31 @@ pub fn label_mode(m: Mode) -> &'static str {
     }
 }
 
+fn escape_history(entry: &str) -> String {
+    entry.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+fn unescape_history(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn load_history(path: &PathBuf) -> Vec<String> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -920,7 +968,7 @@ fn load_history(path: &PathBuf) -> Vec<String> {
     let lines: Vec<String> = content
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(str::to_owned)
+        .map(unescape_history)
         .collect();
     if lines.len() > 1000 {
         lines[lines.len() - 1000..].to_vec()
@@ -939,7 +987,7 @@ fn append_history_line(path: &PathBuf, entry: &str) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{entry}");
+        let _ = writeln!(f, "{}", escape_history(entry));
     }
 }
 
@@ -980,4 +1028,20 @@ fn run_editor_blocking(path: &PathBuf) -> anyhow::Result<()> {
     let result = std::process::Command::new(editor).arg(path).status();
     crate::tui::resume()?;
     result.context("editor could not be started").map(|_| ())
+}
+
+#[cfg(test)]
+mod history_escape_tests {
+    use super::*;
+
+    #[test]
+    fn multiline_history_roundtrips() {
+        let entry = "first line\ncode: let x = \n 1;\nlast";
+        let esc = escape_history(entry);
+        assert!(!esc.contains('\n'), "escaped entry is one file line");
+        assert_eq!(unescape_history(&esc), entry);
+        // a literal backslash survives the roundtrip
+        let bs = "path\\to\\file";
+        assert_eq!(unescape_history(&escape_history(bs)), bs);
+    }
 }

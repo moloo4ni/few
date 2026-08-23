@@ -385,11 +385,12 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
     let mut rows: Vec<(Vec<Seg>, Hit)> = Vec::new();
     let cap = app.cfg.diff_lines.max(10);
 
-    // reverse video marks the keyboard-focused element
+    // keyboard focus is shown purely by contrast: dim text becomes normal
+    // (the same mechanism as the selected permission option turning amber)
     let focused = |bi: usize, si: usize| -> bool { app.focus == Some((bi, si)) };
     let mark = |s: ratatui::style::Style, on: bool| -> ratatui::style::Style {
         if on {
-            s.add_modifier(ratatui::style::Modifier::REVERSED)
+            theme::normal()
         } else {
             s
         }
@@ -451,8 +452,9 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             }
             Block::PermAsk(ask) => match &ask.resolved {
                 Some(choice) => {
-                    let text = format!("✓ {} {} ({})", ask.verb, ask.target, choice);
-                    rows.push((vec![(text, theme::dim())], Hit::Nothing));
+                    // settled decision: no glyph, just dimmed amber
+                    let text = format!("{} {} ({})", ask.verb, ask.target, choice);
+                    rows.push((vec![(text, theme::amber_dim())], Hit::Nothing));
                 }
                 None => {
                     let header = format!(
@@ -464,10 +466,12 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                     );
                     push_wrapped_text(&mut rows, &header, theme::amber(), width, Hit::Nothing);
                     for (oi, opt) in PERM_OPTIONS.iter().enumerate() {
+                        // unselected options sit at base contrast; the cursor
+                        // is the amber color itself, nothing else
                         let style = if oi == ask.selected {
                             theme::amber()
                         } else {
-                            theme::dim()
+                            theme::normal()
                         };
                         let marker = if oi == ask.selected { ">" } else { " " };
                         rows.push((
@@ -859,6 +863,50 @@ mod tests {
         // the tail of the long output must survive wrapping (not be clipped)
         let tail = &"x".repeat(120)[100..];
         assert!(joined.contains(tail), "wrapped output must keep its tail");
+    }
+
+    #[test]
+    fn focus_is_contrast_not_reverse() {
+        let mut app = test_app("focus-contrast");
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![],
+            expanded: false,
+            outcome: None,
+        }));
+
+        let headline_style = |app: &App| -> Style {
+            build_rows(app, 40)
+                .iter()
+                .find(|(_, hit)| matches!(hit, Hit::Step(_, usize::MAX)))
+                .and_then(|(segs, _)| segs.first())
+                .map(|(_, s)| *s)
+                .unwrap()
+        };
+
+        app.focus = None;
+        assert_eq!(headline_style(&app), theme::dim());
+        // the cursor is pure contrast: focused dim text renders normal,
+        // no reverse video, no extra glyph
+        app.focus = Some((0, usize::MAX));
+        assert_eq!(headline_style(&app), theme::normal());
+    }
+
+    #[test]
+    fn resolved_ask_is_dimmed_amber_without_glyph() {
+        let mut app = test_app("resolved");
+        app.blocks.push(Block::PermAsk(PermAskBlock {
+            id: 1,
+            verb: "write".into(),
+            target: ".env".into(),
+            cap_label: "filesystem.write".into(),
+            sensitive: true,
+            selected: 0,
+            resolved: Some("allow once"),
+        }));
+        let rows = render(&mut app, 60, 12);
+        let joined = rows.join("\n");
+        assert!(joined.contains("write .env (allow once)"), "{joined:?}");
+        assert!(!joined.contains('✓'), "no unicode glyphs in resolved line");
     }
 
     #[test]
