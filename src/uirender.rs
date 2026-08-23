@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{label_mode, App};
 use crate::commands::{arg_options, filter_commands, find_command};
 use crate::theme;
 use crate::transcript::{Block, Expand, Hit, Level, PERM_OPTIONS};
@@ -80,6 +80,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let all_rows = build_rows(app, width.max(4));
     let total = all_rows.len();
+    // anchor manual scroll: while the user is scrolled up (offset > 0), new
+    // transcript rows must not drag the viewport back toward the live edge
+    if app.scroll_from_end > 0 {
+        let delta = total as isize - app.scroll_total_seen as isize;
+        if delta != 0 {
+            app.scroll_from_end = (app.scroll_from_end as isize + delta).max(0) as usize;
+        }
+    }
+    app.scroll_total_seen = total;
     let h = transcript.height as usize;
     let offset = app.scroll_from_end.min(total.saturating_sub(h));
     let start = total
@@ -153,11 +162,7 @@ fn render_status(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 }
 
 fn mode_label(m: crate::perms::Mode) -> &'static str {
-    match m {
-        crate::perms::Mode::Plan => "plan",
-        crate::perms::Mode::Build => "auto",
-        crate::perms::Mode::Auto => "auto-approve",
-    }
+    label_mode(m)
 }
 
 fn human_tokens(n: u64) -> String {
@@ -638,7 +643,7 @@ mod tests {
         assert!(status.contains("model:"), "{status:?}");
         assert!(status.contains("sonnet-5"), "{status:?}");
         assert!(status.contains("mode:"), "{status:?}");
-        assert!(status.contains("auto"), "{status:?}");
+        assert!(status.contains("build"), "{status:?}");
         assert!(status.contains("ctx:"), "{status:?}");
         assert!(status.contains("12.4k / 200k (6%)"), "{status:?}");
         let sep = char::from_u32(0x2500).unwrap().to_string().repeat(80);

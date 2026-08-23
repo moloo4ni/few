@@ -1,4 +1,4 @@
-use crate::agent::{Agent, AgentEvent, Detail, TaskOutcome};
+use crate::agent::{Agent, AgentEvent, Detail, StepView, TaskOutcome};
 use crate::commands::{find_command, ArgKind};
 use crate::config::Config;
 use crate::inputline::InputState;
@@ -11,6 +11,7 @@ use crate::tools::Ctl;
 use crate::transcript::{
     classify_notice, Block, Expand, Hit, Level, PermAskBlock, StepBlock, StepsGroup, PERM_OPTIONS,
 };
+use crate::ui_text::clean;
 use crate::uirender;
 use anyhow::Context as _;
 use crossterm::event::{EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -30,6 +31,9 @@ pub struct App {
     pub active_ask: Option<usize>,
     pub input: InputState,
     pub scroll_from_end: usize,
+    /// transcript row count at the previous frame - keeps manual scroll
+    /// anchored while new content arrives
+    pub scroll_total_seen: usize,
     pub running: bool,
     pub started_at: Option<Instant>,
     pub thinking_since: Option<Instant>,
@@ -83,6 +87,7 @@ impl App {
             active_ask: None,
             input,
             scroll_from_end: 0,
+            scroll_total_seen: 0,
             running: false,
             started_at: None,
             thinking_since: None,
@@ -178,7 +183,7 @@ impl App {
             }
             crossterm::event::Event::Mouse(m) => self.on_mouse(m),
             crossterm::event::Event::Paste(text) => {
-                self.input.insert_str(&text);
+                self.input.insert_str(&clean(&text));
                 self.after_edit();
             }
             _ => {}
@@ -230,7 +235,6 @@ impl App {
                 }
             }
         }
-        self.scroll_from_end = 0;
     }
 
     /// Expandable transcript elements in visual order. A step is listed when
@@ -316,7 +320,6 @@ impl App {
         if k.modifiers.contains(KeyModifiers::ALT) && matches!(k.code, KeyCode::Up | KeyCode::Down)
         {
             self.move_focus(k.code == KeyCode::Down);
-            self.scroll_from_end = 0;
             return;
         }
         if self.focus.is_some() {
@@ -325,7 +328,6 @@ impl App {
                     if !self.toggle_focused() {
                         self.focus = None;
                     }
-                    self.scroll_from_end = 0;
                     return;
                 }
                 KeyCode::Esc => {
@@ -436,7 +438,6 @@ impl App {
             KeyCode::Down => self.input.history_next(),
             _ => {}
         }
-        self.scroll_from_end = 0;
     }
 
     fn after_edit(&mut self) {
@@ -474,7 +475,6 @@ impl App {
         } else {
             self.push_notice("^C press again to exit".into());
         }
-        self.scroll_from_end = 0;
     }
 
     fn on_ask_key(&mut self, code: KeyCode) {
@@ -523,7 +523,6 @@ impl App {
             }
         }
         self.active_ask = None;
-        self.scroll_from_end = 0;
     }
 
     async fn pick_palette(&mut self) {
@@ -629,9 +628,8 @@ impl App {
             }
         }
         self.blocks.push(Block::MemoryView {
-            text: out.trim_end().to_owned(),
+            text: clean(out.trim_end()),
         });
-        self.scroll_from_end = 0;
     }
 
     fn memory_edit(&mut self, level: MemLevel) {
@@ -666,7 +664,6 @@ impl App {
 
     fn push_notice_level(&mut self, text: String, level: Level) {
         self.blocks.push(Block::Notice { text, level });
-        self.scroll_from_end = 0;
     }
 
     fn on_agent_event(&mut self, ae: AgentEvent) {
@@ -680,17 +677,20 @@ impl App {
             }
             AgentEvent::ThinkingFinished { dur_ms } => {
                 self.thinking_since = None;
-                let text = std::mem::take(&mut self.live_thought);
+                let text = clean(&std::mem::take(&mut self.live_thought));
                 if !text.is_empty() {
                     self.blocks.push(Block::Thought {
                         dur_ms,
                         text,
                         expand: Expand::Collapsed,
                     });
-                    self.scroll_from_end = 0;
                 }
             }
             AgentEvent::AssistantDelta { text } => {
+                // per-delta cleaning: a control sequence split across chunk
+                // boundaries could survive, but assistant text is the least
+                // hostile source; complete strings are cleaned fully elsewhere
+                let text = clean(&text);
                 let open = match self.live_text_idx.and_then(|i| self.blocks.get_mut(i)) {
                     Some(Block::LiveAssistant(existing)) => {
                         existing.push_str(&text);
@@ -702,7 +702,6 @@ impl App {
                     self.blocks.push(Block::LiveAssistant(text));
                     self.live_text_idx = Some(self.blocks.len() - 1);
                 }
-                self.scroll_from_end = 0;
             }
             AgentEvent::TurnClosed => {
                 self.seal_live_blocks();
@@ -715,24 +714,23 @@ impl App {
                 };
                 if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
                     g.steps.push(StepBlock {
-                        view,
+                        view: sanitize_step(view),
                         expand: Expand::Collapsed,
                     });
                 }
-                self.scroll_from_end = 0;
             }
             AgentEvent::Remembered { line } => {
-                self.blocks.push(Block::Remembered(line));
-                self.scroll_from_end = 0;
+                self.blocks.push(Block::Remembered(clean(&line)));
             }
             AgentEvent::Notice(text) => {
                 let level = classify_notice(&text);
-                self.blocks.push(Block::Notice { text, level });
-                self.scroll_from_end = 0;
+                self.blocks.push(Block::Notice {
+                    text: clean(&text),
+                    level,
+                });
             }
             AgentEvent::AssistantText(text) => {
-                self.blocks.push(Block::Assistant(text));
-                self.scroll_from_end = 0;
+                self.blocks.push(Block::Assistant(clean(&text)));
             }
             AgentEvent::Usage { prompt_tokens, .. } => {
                 if prompt_tokens > 0 {
@@ -742,19 +740,18 @@ impl App {
             AgentEvent::PermAsk(view) => {
                 self.blocks.push(Block::PermAsk(PermAskBlock {
                     id: view.id,
-                    verb: view.verb,
-                    target: view.target,
-                    cap_label: view.cap_label.to_owned(),
+                    verb: clean(&view.verb),
+                    target: clean(&view.target),
+                    cap_label: clean(view.cap_label),
                     sensitive: view.sensitive,
                     selected: 0,
                     resolved: None,
                 }));
                 self.active_ask = Some(self.blocks.len() - 1);
-                self.scroll_from_end = 0;
             }
             AgentEvent::StepStarted(view) => {
-                self.live_step = Some((view.verb.doing().to_owned(), view.arg));
-                self.scroll_from_end = 0;
+                let v = sanitize_step_start(view);
+                self.live_step = Some((v.0.to_owned(), v.1));
             }
             AgentEvent::Finished(outcome) => {
                 self.seal_live_blocks();
@@ -829,7 +826,8 @@ impl App {
 
     fn start_task(&mut self, text: String) {
         self.input.push_history(&text);
-        self.blocks.push(Block::User(text.clone()));
+        // display goes through the sanitizer; the agent receives raw text
+        self.blocks.push(Block::User(clean(&text)));
         let gi = self.create_steps_group();
         self.steps_group_idx = Some(gi);
         self.running = true;
@@ -883,7 +881,31 @@ fn parse_mode(s: &str) -> Option<Mode> {
     }
 }
 
-fn label_mode(m: Mode) -> &'static str {
+/// Sanitize step data at the UI boundary - tool output and file paths are
+/// untrusted rendering input.
+fn sanitize_step(mut view: StepView) -> StepView {
+    view.arg = clean(&view.arg);
+    view.detail = view.detail.map(|d| match d {
+        Detail::Output {
+            text,
+            total_bytes,
+            truncated,
+        } => Detail::Output {
+            text: clean(&text),
+            total_bytes,
+            truncated,
+        },
+        Detail::Message(m) => Detail::Message(clean(&m)),
+        other => other,
+    });
+    view
+}
+
+fn sanitize_step_start(view: crate::agent::StepStartView) -> (&'static str, String) {
+    (view.verb.doing(), clean(&view.arg))
+}
+
+pub fn label_mode(m: Mode) -> &'static str {
     match m {
         Mode::Plan => "plan",
         Mode::Build => "build",
