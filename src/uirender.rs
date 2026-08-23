@@ -7,7 +7,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 type Seg = (String, Style);
 
@@ -49,15 +49,12 @@ fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
     rows
 }
 
-fn str_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
-}
-
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let width = area.width as usize;
 
-    let input_h = app.input.lines_count().clamp(1, 6) as u16;
+    let input_rows = build_input_rows(app, width.max(4));
+    let input_h = input_rows.rows.len().clamp(1, 6) as u16;
     let busy_rows: u16 = if app.running { 1 } else { 0 };
     let pal_items = palette_items(app);
     let pal_rows = pal_items
@@ -130,7 +127,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         render_palette(f, chunks[2], items, app.palette_sel);
     }
 
-    render_input(f, chunks[3], app);
+    render_input(f, chunks[3], app, input_rows);
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled("─".repeat(width), theme::dim()))),
@@ -183,7 +180,7 @@ fn human_tokens(n: u64) -> String {
     }
 }
 
-fn render_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn render_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, ir: InputRender) {
     let height = area.height as usize;
     let width = area.width as usize;
 
@@ -205,13 +202,12 @@ fn render_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         return;
     }
 
-    let styled_lines = build_styled_input_lines(app);
-    let (cur_line, cur_col) = app.input.cursor_line_col();
-
-    let shown_from = cur_line.saturating_sub(height - 1);
-    let window: Vec<&Vec<Seg>> = styled_lines.iter().skip(shown_from).take(height).collect();
-    let lines: Vec<Line> = window
+    let shown_from = ir.cursor_row.saturating_sub(height.saturating_sub(1));
+    let lines: Vec<Line> = ir
+        .rows
         .iter()
+        .skip(shown_from)
+        .take(height)
         .map(|row| {
             Line::from(
                 row.iter()
@@ -222,91 +218,87 @@ fn render_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .collect();
     f.render_widget(Paragraph::new(lines), area);
 
-    let vis_line = cur_line - shown_from;
-    if vis_line < height {
-        let line_chars: Vec<char> = {
-            let mut out = Vec::new();
-            for (i, ch) in app.input.text.iter().enumerate() {
-                if i >= app.input.cursor {
-                    break;
-                }
-                if *ch == '\n' {
-                    out.clear();
-                    continue;
-                }
-                out.push(*ch);
-            }
-            out
-        };
-        let prefix = if cur_line == 0 {
-            "> ".to_owned()
-        } else {
-            "  ".to_owned()
-        };
-        let x = area.x as usize + str_width(&prefix) + display_col(&line_chars, cur_col);
-        let y = area.y as usize + vis_line;
-        if y < area.y as usize + height {
+    let vis_row = ir.cursor_row - shown_from;
+    if vis_row < height {
+        let x = area.x as usize + ir.cursor_col;
+        let y = area.y as usize + vis_row;
+        if x < area.x as usize + width {
             f.set_cursor_position(ratatui::prelude::Position::new(x as u16, y as u16));
         }
     }
 }
 
-fn build_styled_input_lines(app: &App) -> Vec<Vec<Seg>> {
-    let mention_style = theme::blue_dim();
-    let mut lines: Vec<Vec<Seg>> = vec![Vec::new()];
-    let mut line_idx = 0usize;
-
-    let push_seg = |lines: &mut Vec<Vec<Seg>>, li: usize, text: String, st: Style| {
-        let row = &mut lines[li];
-        match row.last_mut() {
-            Some((t, s)) if *s == st => t.push_str(&text),
-            _ => row.push((text, st)),
-        }
-    };
-
-    let first_prefix = "> ";
-    let cont_prefix = "  ";
-    push_seg(&mut lines, 0, first_prefix.to_owned(), theme::normal());
-
-    let mentions = &app.input.mentions;
-    for (gi, ch) in app.input.text.iter().enumerate() {
-        if *ch == '\n' {
-            line_idx += 1;
-            lines.push(Vec::new());
-            push_seg(
-                &mut lines,
-                line_idx,
-                cont_prefix.to_owned(),
-                theme::normal(),
-            );
-            continue;
-        }
-        let in_mention = mentions.iter().any(|(a, b)| gi >= *a && gi < *b);
-        push_seg(
-            &mut lines,
-            line_idx,
-            ch.to_string(),
-            if in_mention {
-                mention_style
-            } else {
-                theme::normal()
-            },
-        );
-    }
-
-    let (cur_line, _) = app.input.cursor_line_col();
-    if let Some(tail) = app.input.ghost_tail() {
-        push_seg(&mut lines, cur_line, tail, theme::dim());
-    }
-
-    lines
+/// Visually wrapped input lines plus the terminal position of the cursor.
+pub struct InputRender {
+    rows: Vec<Vec<Seg>>,
+    cursor_row: usize,
+    cursor_col: usize,
 }
 
-fn display_col(chars: &[char], upto: usize) -> usize {
-    chars[..upto.min(chars.len())]
-        .iter()
-        .map(|c| c.width().unwrap_or(0))
-        .sum()
+pub fn build_input_rows(app: &App, width: usize) -> InputRender {
+    let mut rows: Vec<Vec<Seg>> = vec![Vec::new()];
+    let mut row_w = 0usize;
+    let mut cursor: Option<(usize, usize)> = None;
+    let mention_style = theme::blue_dim();
+
+    // first line gets "> ", continuations get "  " - same as before
+    let mut expect_prefix = true;
+    for (gi, ch) in app.input.text.iter().enumerate() {
+        if gi == app.input.cursor {
+            cursor = Some((rows.len() - 1, row_w));
+        }
+        if *ch == '\n' {
+            rows.push(Vec::new());
+            row_w = 0;
+            expect_prefix = true;
+            continue;
+        }
+        if expect_prefix {
+            let prefix = if rows.len() == 1 && rows[0].is_empty() {
+                "> "
+            } else {
+                "  "
+            };
+            for pc in prefix.chars() {
+                push_input_char(&mut rows, &mut row_w, pc, theme::normal(), width);
+            }
+            expect_prefix = false;
+        }
+        let st = if app.input.mentions.iter().any(|(a, b)| gi >= *a && gi < *b) {
+            mention_style
+        } else {
+            theme::normal()
+        };
+        push_input_char(&mut rows, &mut row_w, *ch, st, width);
+    }
+    let (cursor_row, cursor_col) = cursor.unwrap_or((rows.len() - 1, row_w));
+
+    // ghost completion hint trails after the typed text
+    if let Some(tail) = app.input.ghost_tail() {
+        for c in tail.chars() {
+            push_input_char(&mut rows, &mut row_w, c, theme::dim(), width);
+        }
+    }
+
+    InputRender {
+        rows,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+fn push_input_char(rows: &mut Vec<Vec<Seg>>, row_w: &mut usize, c: char, st: Style, width: usize) {
+    let cw = c.width().unwrap_or(0);
+    if *row_w + cw > width && *row_w > 0 {
+        rows.push(Vec::new());
+        *row_w = 0;
+    }
+    let row = rows.last_mut().unwrap();
+    match row.last_mut() {
+        Some((t, s)) if *s == st => t.push(c),
+        _ => row.push((c.to_string(), st)),
+    }
+    *row_w += cw;
 }
 
 fn placeholder_text() -> &'static str {
@@ -454,7 +446,7 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                     } else {
                         theme::blue_dim()
                     };
-                    rows.push((vec![(l.to_owned(), style)], Hit::Nothing));
+                    push_wrapped_text(&mut rows, l, style, width, Hit::Nothing);
                 }
             }
             Block::PermAsk(ask) => match &ask.resolved {
@@ -470,7 +462,7 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                         if ask.sensitive { " (sensitive)" } else { "" },
                         ask.cap_label
                     );
-                    rows.push((vec![(header, theme::amber())], Hit::Nothing));
+                    push_wrapped_text(&mut rows, &header, theme::amber(), width, Hit::Nothing);
                     for (oi, opt) in PERM_OPTIONS.iter().enumerate() {
                         let style = if oi == ask.selected {
                             theme::amber()
@@ -487,13 +479,13 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             },
             Block::Steps(group) => {
                 let marker = if group.expanded { 'v' } else { '>' };
-                rows.push((
-                    vec![(
-                        format!("{marker} {}", group.summary()),
-                        mark(theme::dim(), focused(bi, usize::MAX)),
-                    )],
+                push_wrapped_text(
+                    &mut rows,
+                    &format!("{marker} {}", group.summary()),
+                    mark(theme::dim(), focused(bi, usize::MAX)),
+                    width,
                     Hit::Step(bi, usize::MAX),
-                ));
+                );
                 if group.expanded {
                     for (si, step) in group.steps.iter().enumerate() {
                         let style = match step.view.verb.word() {
@@ -501,13 +493,13 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                             "denied" => theme::amber(),
                             _ => theme::dim(),
                         };
-                        rows.push((
-                            vec![(
-                                format!("  {}", step.headline()),
-                                mark(style, focused(bi, si)),
-                            )],
+                        push_wrapped_text(
+                            &mut rows,
+                            &format!("  {}", step.headline()),
+                            mark(style, focused(bi, si)),
+                            width,
                             Hit::Step(bi, si),
-                        ));
+                        );
                         if step.expand != Expand::Collapsed {
                             for dr in step.detail_rows(cap) {
                                 let dstyle = if dr.starts_with('+') {
@@ -517,7 +509,13 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                                 } else {
                                     theme::dim()
                                 };
-                                rows.push((vec![(format!("    {dr}"), dstyle)], Hit::Step(bi, si)));
+                                push_wrapped_text(
+                                    &mut rows,
+                                    &format!("    {dr}"),
+                                    dstyle,
+                                    width,
+                                    Hit::Step(bi, si),
+                                );
                             }
                         }
                     }
@@ -530,10 +528,13 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
     // past-tense step once it completes. Static by design - no animations.
     if let Some((doing, arg)) = &app.live_step {
         rows.push((vec![], Hit::Nothing));
-        rows.push((
-            vec![(format!("  {doing} {arg}"), theme::dim())],
+        push_wrapped_text(
+            &mut rows,
+            &format!("  {doing} {arg}"),
+            theme::dim(),
+            width,
             Hit::Nothing,
-        ));
+        );
     }
 
     rows
@@ -811,6 +812,53 @@ mod tests {
                 "spinner frames are gone"
             );
         }
+    }
+
+    #[test]
+    fn long_input_wraps_and_cursor_follows() {
+        let mut app = test_app("input-wrap");
+        let long = "a".repeat(100);
+        app.input.set_text(&long);
+        let ir = build_input_rows(&app, 40);
+        assert!(
+            ir.rows.len() >= 3,
+            "long line must wrap, got {}",
+            ir.rows.len()
+        );
+        // cursor sits at the end of the text
+        assert!(ir.cursor_row >= 2);
+
+        // CJK characters count double and are not split
+        app.input.set_text("日本語テスト");
+        let ir2 = build_input_rows(&app, 8);
+        assert!(ir2.rows.len() >= 2, "cjk line must wrap by display width");
+    }
+
+    #[test]
+    fn wide_content_is_wrapped_not_clipped() {
+        let mut app = test_app("wide-detail");
+        let long_out = format!("out-{}", "x".repeat(120));
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![StepBlock {
+                view: crate::agent::StepView {
+                    verb: crate::agent::Verb::Ran,
+                    arg: "cmd".into(),
+                    detail: Some(crate::agent::Detail::Output {
+                        text: long_out,
+                        total_bytes: 124,
+                        truncated: false,
+                    }),
+                },
+                expand: Expand::Shown,
+            }],
+            expanded: true,
+            outcome: None,
+        }));
+        let rows = render(&mut app, 50, 20);
+        let joined = rows.join("\n");
+        // the tail of the long output must survive wrapping (not be clipped)
+        let tail = &"x".repeat(120)[100..];
+        assert!(joined.contains(tail), "wrapped output must keep its tail");
     }
 
     #[test]

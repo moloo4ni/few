@@ -13,7 +13,7 @@ pub mod session;
 pub mod sysprompt;
 pub mod theme;
 pub mod tools;
-pub mod ui_text;
 pub mod transcript;
 pub mod tui;
+pub mod ui_text;
 pub mod uirender;
