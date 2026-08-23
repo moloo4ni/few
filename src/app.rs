@@ -33,7 +33,6 @@ pub struct App {
     pub running: bool,
     pub started_at: Option<Instant>,
     pub thinking_since: Option<Instant>,
-    pub spinner_tick: usize,
     pub mode: Mode,
     pub model_name: String,
     pub ctx_used: u64,
@@ -87,7 +86,6 @@ impl App {
             running: false,
             started_at: None,
             thinking_since: None,
-            spinner_tick: 0,
             mode: Mode::Build,
             model_name: cfg.model.clone(),
             ctx_used: 0,
@@ -146,7 +144,6 @@ impl App {
                 }
                 Some(ae) = self.ev_rx.recv() => self.on_agent_event(ae),
                 _ = tick.tick() => {
-                    self.spinner_tick = self.spinner_tick.wrapping_add(1);
                     if let Some(t) = self.escalation {
                         if t.elapsed() > ESCALATION_WINDOW {
                             self.escalation = None;

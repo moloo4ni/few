@@ -102,12 +102,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(lines), transcript);
 
     if busy_rows > 0 {
-        let spin = ['|', '/', '-', '\\'][app.spinner_tick % 4];
         let mut text = if let Some(t) = app.thinking_since {
-            format!("{spin} thinking · {}", t.elapsed().as_secs())
+            format!("thinking · {}", t.elapsed().as_secs())
         } else {
             let secs = app.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-            format!("{spin} working · {secs}s")
+            format!("working · {secs}s")
         };
         if !app.input.is_empty() {
             text += " · typed text queued";
@@ -523,12 +522,11 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
     }
 
     // action currently executing, in present tense; replaced by the final
-    // past-tense step once it completes
+    // past-tense step once it completes. Static by design - no animations.
     if let Some((doing, arg)) = &app.live_step {
-        let dots = ".".repeat(1 + app.spinner_tick % 3);
         rows.push((vec![], Hit::Nothing));
         rows.push((
-            vec![(format!("  {doing} {arg} {dots}"), theme::dim())],
+            vec![(format!("  {doing} {arg}"), theme::dim())],
             Hit::Nothing,
         ));
     }
@@ -575,6 +573,7 @@ mod tests {
     use crate::providers::openai::OpenAiProvider;
     use crate::transcript::{StepBlock, StepsGroup};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     fn test_app(tag: &str) -> App {
         let root = std::env::temp_dir().join(format!("keiko-ui-{tag}-{}", std::process::id()));
@@ -785,12 +784,28 @@ mod tests {
         app.live_step = Some(("reading".into(), "src/main.rs".into()));
         let rows = render(&mut app, 60, 12);
         let joined = rows.join("\n");
-        assert!(joined.contains("reading src/main.rs ."), "{joined:?}");
+        assert!(joined.contains("reading src/main.rs"), "{joined:?}");
 
         // once the step completes, only the past-tense form remains
         app.live_step = None;
         let rows = render(&mut app, 60, 12);
         assert!(!rows.join("\n").contains("reading"));
+    }
+
+    #[test]
+    fn no_spinner_in_busy_line() {
+        let mut app = test_app("busy");
+        app.running = true;
+        app.started_at = Some(Instant::now());
+        let rows = render(&mut app, 60, 12);
+        let joined = rows.join("\n");
+        assert!(joined.contains("working · "), "{joined:?}");
+        for frame in ['|', '/', '-', '\\'] {
+            assert!(
+                !joined.contains(&format!("{frame} working")),
+                "spinner frames are gone"
+            );
+        }
     }
 
     #[test]
