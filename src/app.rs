@@ -711,6 +711,7 @@ impl App {
                 self.seal_live_blocks();
             }
             AgentEvent::Step(view) => {
+                self.live_step = None;
                 let gi = match self.steps_group_idx {
                     Some(gi) => gi,
                     None => self.create_steps_group_and_set(),
@@ -757,9 +758,6 @@ impl App {
             AgentEvent::StepStarted(view) => {
                 self.live_step = Some((view.verb.doing().to_owned(), view.arg));
                 self.scroll_from_end = 0;
-            }
-            AgentEvent::Step(_) => {
-                self.live_step = None;
             }
             AgentEvent::Finished(outcome) => {
                 self.seal_live_blocks();
