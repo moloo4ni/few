@@ -581,7 +581,7 @@ mod tests {
     use crate::memory::Memory;
     use crate::perms::{Mode, PermEngine};
     use crate::providers::openai::OpenAiProvider;
-    use crate::transcript::{StepBlock, StepsGroup};
+    use crate::transcript::{PermAskBlock, StepBlock, StepsGroup};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
