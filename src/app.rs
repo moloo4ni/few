@@ -1,4 +1,4 @@
-use crate::agent::{Agent, AgentEvent, Detail, StepView, TaskOutcome};
+use crate::agent::{Agent, AgentEvent, Detail, NoticeLevel, StepView, TaskOutcome};
 use crate::commands::{find_command, ArgKind};
 use crate::config::Config;
 use crate::inputline::InputState;
@@ -8,9 +8,8 @@ use crate::providers::openai::OpenAiProvider;
 use crate::providers::Provider as _;
 use crate::sysprompt;
 use crate::tools::Ctl;
-use crate::transcript::{
-    classify_notice, Block, Expand, Hit, Level, PermAskBlock, StepBlock, StepsGroup, PERM_OPTIONS,
-};
+
+use crate::transcript::{Block, Expand, Hit, PermAskBlock, StepBlock, StepsGroup, PERM_OPTIONS};
 use crate::ui_text::clean;
 use crate::uirender;
 use anyhow::Context as _;
@@ -627,7 +626,7 @@ impl App {
                 _ => self.input.set_text("/memory "),
             },
             other => {
-                self.push_notice_level(format!("unknown command: {other}"), Level::Error);
+                self.push_notice_level(format!("unknown command: {other}"), NoticeLevel::Error);
             }
         }
         self.scroll_from_end = 0;
@@ -676,7 +675,10 @@ impl App {
                 Ok(Err(e)) => format!("editor failed: {e:#}"),
                 Err(e) => format!("editor join failed: {e}"),
             };
-            let _ = tx.send(AgentEvent::Notice(msg));
+            let _ = tx.send(AgentEvent::Notice {
+                text: msg,
+                level: crate::agent::NoticeLevel::Info,
+            });
             // always restore drawing, even when the editor failed
             let _ = atx.send(AppMsg::EditorDone);
         });
@@ -692,10 +694,10 @@ impl App {
     }
 
     fn push_notice(&mut self, text: String) {
-        self.push_notice_level(text, Level::Info);
+        self.push_notice_level(text, NoticeLevel::Info);
     }
 
-    fn push_notice_level(&mut self, text: String, level: Level) {
+    fn push_notice_level(&mut self, text: String, level: NoticeLevel) {
         self.blocks.push(Block::Notice { text, level });
     }
 
@@ -755,8 +757,7 @@ impl App {
             AgentEvent::Remembered { line } => {
                 self.blocks.push(Block::Remembered(clean(&line)));
             }
-            AgentEvent::Notice(text) => {
-                let level = classify_notice(&text);
+            AgentEvent::Notice { text, level } => {
                 self.blocks.push(Block::Notice {
                     text: clean(&text),
                     level,
@@ -905,7 +906,10 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    let _ = ev.send(AgentEvent::Notice(format!("failed saving session: {e}")));
+                    let _ = ev.send(AgentEvent::Notice {
+                        text: format!("failed saving session: {e}"),
+                        level: crate::agent::NoticeLevel::Error,
+                    });
                 }
             }
         });

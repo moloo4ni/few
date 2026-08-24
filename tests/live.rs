@@ -92,7 +92,9 @@ async fn drain_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
             AgentEvent::AssistantDelta { text } => print!("{text}"),
             AgentEvent::TurnClosed => println!("\n--- turn closed ---"),
             AgentEvent::Remembered { line } => println!("remembered · {line}"),
-            AgentEvent::Notice(t) => println!("notice · {t}"),
+            AgentEvent::Notice { text, level } => {
+                println!("notice({level:?}) · {text}")
+            }
             AgentEvent::AssistantText(t) => {
                 println!("assistant · {}", t.lines().next().unwrap_or(""))
             }

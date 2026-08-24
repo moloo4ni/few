@@ -1,7 +1,8 @@
+use crate::agent::NoticeLevel;
 use crate::app::{label_mode, App};
 use crate::commands::{arg_options, filter_commands, find_command};
 use crate::theme;
-use crate::transcript::{Block, Expand, Hit, Level, PERM_OPTIONS};
+use crate::transcript::{Block, Expand, Hit, PERM_OPTIONS};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -434,9 +435,9 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             }
             Block::Notice { text, level } => {
                 let style = match level {
-                    Level::Info => theme::dim(),
-                    Level::Error => theme::red(),
-                    Level::Warn => theme::amber(),
+                    NoticeLevel::Info => theme::dim(),
+                    NoticeLevel::Error => theme::red(),
+                    NoticeLevel::Warn => theme::amber(),
                 };
                 push_wrapped_text(&mut rows, text, style, width, Hit::Nothing);
             }

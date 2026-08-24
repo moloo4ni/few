@@ -1,4 +1,4 @@
-use crate::agent::{Detail, StepView, TaskOutcome, Verb};
+use crate::agent::{Detail, NoticeLevel, StepView, TaskOutcome, Verb};
 use ratatui::style::Style;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,13 +24,6 @@ impl Expand {
             Expand::Collapsed
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Level {
-    Info,
-    Error,
-    Warn,
 }
 
 pub struct StepBlock {
@@ -73,30 +66,13 @@ pub enum Block {
     Remembered(String),
     Notice {
         text: String,
-        level: Level,
+        level: NoticeLevel,
     },
     Steps(StepsGroup),
     PermAsk(PermAskBlock),
     MemoryView {
         text: String,
     },
-}
-
-pub fn classify_notice(text: &str) -> Level {
-    let lowered = text.to_lowercase();
-    if lowered.contains("provider error")
-        || lowered.contains("refusing")
-        || lowered.contains("failed saving")
-    {
-        Level::Error
-    } else if lowered.starts_with("gave up")
-        || lowered.contains("^c")
-        || lowered.contains("aborted")
-    {
-        Level::Warn
-    } else {
-        Level::Info
-    }
 }
 
 impl StepBlock {
