@@ -7,7 +7,8 @@ pub enum Capability {
     FsRead,
     FsWrite,
     ShellExec,
-    Network,
+    // Network is a future axis: no tool performs network I/O today, and the
+    // provider's own HTTP traffic cannot reasonably be gated by itself.
 }
 
 impl Capability {
@@ -16,7 +17,6 @@ impl Capability {
             Capability::FsRead => "filesystem.read",
             Capability::FsWrite => "filesystem.write",
             Capability::ShellExec => "shell.execute",
-            Capability::Network => "network",
         }
     }
 
@@ -25,7 +25,6 @@ impl Capability {
             Capability::FsRead => "read",
             Capability::FsWrite => "write",
             Capability::ShellExec => "execute",
-            Capability::Network => "net",
         }
     }
 }
@@ -86,7 +85,6 @@ pub struct PermEngine {
     session: HashSet<(Capability, String)>,
     write_policy: Policy,
     shell_policy: Policy,
-    net_policy: Policy,
 }
 
 impl PermEngine {
@@ -114,7 +112,6 @@ impl PermEngine {
             session: HashSet::new(),
             write_policy: Policy::Ask,
             shell_policy: Policy::Ask,
-            net_policy: Policy::Deny,
         }
     }
 
@@ -175,7 +172,38 @@ impl PermEngine {
         if self.granted.get(key).map(String::as_str) == Some("all") {
             return true;
         }
+        if cap == Capability::ShellExec && self.shell_prefix_granted(key) {
+            return true;
+        }
         self.session.contains(&(cap, key.to_owned()))
+    }
+
+    /// An "always allow" decision covers the exact command plus anything that
+    /// extends it with further arguments (`cargo test` also grants
+    /// `cargo test --release`), so users are not re-prompted for every flag.
+    fn shell_prefix_granted(&self, key: &str) -> bool {
+        const PREFIX: &str = "shell::";
+        let Some(cmd) = key.strip_prefix(PREFIX) else {
+            return false;
+        };
+        for (k, v) in &self.granted {
+            if !matches!(v.as_str(), "execute" | "all") {
+                continue;
+            }
+            let Some(stored) = k.strip_prefix(PREFIX) else {
+                continue;
+            };
+            if cmd == stored {
+                return true;
+            }
+            if cmd.len() > stored.len()
+                && cmd.starts_with(stored)
+                && cmd.as_bytes()[stored.len()] == b' '
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn check(&self, cap: Capability, target: Option<&Path>) -> Check {
@@ -185,6 +213,11 @@ impl PermEngine {
                     Some(t) => t,
                     None => return Check::Allowed,
                 };
+                // a saved "always allow" wins even for sensitive files:
+                // the spec promises no re-prompting after the user decided
+                if self.granted_allows(cap, &self.target_key(t)) {
+                    return Check::Allowed;
+                }
                 if self.is_sensitive(t) {
                     return Check::Ask { sensitive: true };
                 }
@@ -221,14 +254,6 @@ impl PermEngine {
                     Policy::Ask => Check::Ask { sensitive: false },
                 }
             }
-            Capability::Network => match self.net_policy {
-                Policy::Allow => Check::Allowed,
-                other => Check::Denied(if other == Policy::Deny {
-                    DenySource::ModePolicy
-                } else {
-                    DenySource::UserDenied
-                }),
-            },
         }
     }
 
@@ -341,6 +366,32 @@ mod tests {
 
         e.set_mode(Mode::Auto);
         assert_eq!(e.check(Capability::FsWrite, Some(other)), Check::Allowed);
+    }
+
+    #[test]
+    fn read_grant_stops_reprompting_sensitive() {
+        let mut e = engine(vec![]);
+        let env = Path::new("/proj/.env");
+        assert_eq!(
+            e.check(Capability::FsRead, Some(env)),
+            Check::Ask { sensitive: true }
+        );
+        // user grants "always allow" once - the spec promises no re-asking
+        e.apply_grant(Capability::FsRead, ".env", Grant::Always);
+        assert_eq!(e.check(Capability::FsRead, Some(env)), Check::Allowed);
+    }
+
+    #[test]
+    fn shell_grant_covers_argument_extensions_only() {
+        let mut e = engine(vec![]);
+        let key = PermEngine::shell_key("cargo test");
+        e.apply_grant(Capability::ShellExec, &key, Grant::Always);
+
+        let check = |cmd: &str| e.check(Capability::ShellExec, Some(Path::new(cmd)));
+        assert_eq!(check("cargo test"), Check::Allowed);
+        assert_eq!(check("cargo test --release"), Check::Allowed);
+        assert_ne!(check("cargo tests"), Check::Allowed, "word boundary");
+        assert_ne!(check("rm -rf /"), Check::Allowed);
     }
 
     #[test]

@@ -53,14 +53,38 @@ fn autodetect(root: &Path) -> Option<VerifyPlan> {
     None
 }
 
+/// Identify a verify failure stably across runs of the same command:
+/// prefer the first line that actually looks like an error (cargo prints
+/// "Compiling ..." noise first), fall back to the last non-empty line.
 pub fn error_signature(output: &str) -> String {
-    let first = output
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    let normalized: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.chars().take(200).collect()
+    const HINTS: &[&str] = &[
+        "error[",
+        "error:",
+        "error ",
+        "failed",
+        "failure",
+        "panic",
+        "assertion",
+        "syntax",
+        "undefined",
+        "cannot find",
+    ];
+    let normalize = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut last_non_empty = "";
+    let mut chosen: Option<String> = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lowered = trimmed.to_lowercase();
+        if chosen.is_none() && HINTS.iter().any(|h| lowered.contains(h)) {
+            chosen = Some(normalize(trimmed));
+        }
+        last_non_empty = trimmed;
+    }
+    let sig = chosen.unwrap_or_else(|| normalize(last_non_empty));
+    sig.chars().take(200).collect()
 }
 
 #[derive(Debug)]
@@ -142,5 +166,23 @@ mod tests {
         assert!(t.record_failure(&s1));
         assert!(!t.record_failure("different error"));
         assert_eq!(t.count(), 1);
+    }
+
+    #[test]
+    fn signature_skips_build_noise() {
+        // cargo prints progress lines before the actual failure; the old
+        // first-line heuristic would have keyed on "Compiling keiko v0.1.0"
+        let output = "\n   Compiling keiko v0.1.0\n    Finished test [unoptimized]\n".to_owned()
+            + "error[E0308]: mismatched types\nsome detail\n";
+        let s = error_signature(&output);
+        assert!(s.contains("error[E0308]"), "got {s:?}");
+
+        // no recognizable error line -> last non-empty line
+        let plain = "step 1 done\nstep 2 failed state";
+        assert_eq!(error_signature(plain), "step 2 failed state");
+
+        // different failures must differ
+        let other = "warning: unused\nerror[E0382]: borrow of moved value";
+        assert_ne!(error_signature(&output), error_signature(other));
     }
 }
