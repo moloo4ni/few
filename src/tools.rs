@@ -91,18 +91,47 @@ pub struct ShellRun {
 }
 
 fn resolve(root: &std::path::Path, arg: &str) -> std::path::PathBuf {
-    let p = std::path::Path::new(arg);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        root.join(p)
-    }
+    crate::paths::resolve_under(root, arg)
 }
 
 fn display_rel(root: &std::path::Path, p: &std::path::Path) -> String {
-    p.strip_prefix(root)
-        .map(|r| r.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"))
+    crate::paths::rel_display(root, p)
+}
+
+/// Write via temp file + rename so a crash mid-write never leaves the user's
+/// file half-written. On Windows rename-over-existing fails, hence the
+/// remove-then-rename fallback (the tiny non-atomic window is documented).
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ToolError> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return Err(ToolError(format!(
+            "cannot create directory {}: {e}",
+            dir.display()
+        )));
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    let tmp = dir.join(format!(".{name}.keiko-tmp-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ToolError(format!("cannot write {}: {e}", tmp.display())));
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) if cfg!(windows) => {
+            let r = std::fs::remove_file(path).and_then(|_| std::fs::rename(&tmp, path));
+            if r.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            r.map_err(|e| ToolError(format!("cannot write {}: {e}", path.display())))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(ToolError(format!("cannot write {}: {e}", path.display())))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -192,7 +221,7 @@ pub fn exec_write(
         std::fs::create_dir_all(parent)
             .map_err(|e| ToolError(format!("cannot create directories for {disp}: {e}")))?;
     }
-    std::fs::write(&path, new_bytes).map_err(|e| ToolError(format!("cannot write {disp}: {e}")))?;
+    atomic_write(&path, new_bytes)?;
 
     let old_is_bin = old_bytes
         .as_deref()
@@ -288,8 +317,7 @@ pub fn exec_edit(
     }
 
     let updated = text.replacen(old_str, new_str, 1);
-    std::fs::write(&path, updated.as_bytes())
-        .map_err(|e| ToolError(format!("cannot write {disp}: {e}")))?;
+    atomic_write(&path, updated.as_bytes())?;
     Ok(EditOut {
         for_model: format!("edited {disp}"),
         path_display: disp,
@@ -538,6 +566,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing() {
+        let root = tmpdir("atomic");
+        let file = root.join("f.txt");
+        std::fs::write(&file, "old content that is quite long\n").unwrap();
+        atomic_write(&file, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        // no temp leftovers
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("keiko-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must be cleaned up");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

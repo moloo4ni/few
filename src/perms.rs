@@ -88,6 +88,15 @@ pub struct PermEngine {
 }
 
 impl PermEngine {
+    /// Lock the engine without panicking on a poisoned mutex: after a panic
+    /// elsewhere the data stays consistent enough, and a TUI must not take
+    /// the whole app down over a lock flag.
+    pub fn lock(engine: &std::sync::Mutex<PermEngine>) -> std::sync::MutexGuard<'_, PermEngine> {
+        engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn new(
         root: PathBuf,
         extra_sensitive: Vec<String>,
@@ -134,10 +143,7 @@ impl PermEngine {
     }
 
     pub fn target_key(&self, path: &Path) -> String {
-        match path.strip_prefix(&self.root) {
-            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
-            Err(_) => path.to_string_lossy().replace('\\', "/"),
-        }
+        crate::paths::rel_display(&self.root, path)
     }
 
     pub fn shell_key(cmd: &str) -> String {

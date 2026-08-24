@@ -1,4 +1,23 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Resolve `p` against the project root unless it is already absolute.
+/// Single source of truth - tools, agent and perms all resolve identically.
+pub fn resolve_under(root: &Path, p: &str) -> PathBuf {
+    let path = Path::new(p);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+/// Display a path relative to the project root when possible,
+/// with forward slashes everywhere.
+pub fn rel_display(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"))
+}
 
 #[derive(Debug, Clone)]
 pub struct Paths {

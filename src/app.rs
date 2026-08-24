@@ -3,7 +3,7 @@ use crate::commands::{find_command, ArgKind};
 use crate::config::Config;
 use crate::inputline::InputState;
 use crate::memory::{MemLevel, Memory};
-use crate::perms::{Grant, Mode};
+use crate::perms::{Grant, Mode, PermEngine};
 use crate::providers::openai::OpenAiProvider;
 use crate::providers::Provider as _;
 use crate::sysprompt;
@@ -61,7 +61,8 @@ pub struct App {
     pub memory: Memory,
     history_path: PathBuf,
     sessions_dir: PathBuf,
-    session: Option<crate::session::SessionRef>,
+    /// session identity, updated by background saves (serialized by the mutex)
+    session: Arc<std::sync::Mutex<Option<crate::session::SessionRef>>>,
     live_text_idx: Option<usize>,
     live_thought: String,
     /// action currently executing, shown in present tense until its final step arrives
@@ -118,7 +119,9 @@ impl App {
             memory,
             history_path,
             sessions_dir,
-            session: resume.as_ref().and_then(|(r, _)| r.clone()),
+            session: Arc::new(std::sync::Mutex::new(
+                resume.as_ref().and_then(|(r, _)| r.clone()),
+            )),
             live_text_idx: None,
             live_thought: String::new(),
             live_step: None,
@@ -372,7 +375,14 @@ impl App {
             match k.code {
                 KeyCode::Esc => self.input.clear(),
                 KeyCode::Up => self.palette_sel = self.palette_sel.saturating_sub(1),
-                KeyCode::Down | KeyCode::Tab => self.palette_sel += 1,
+                KeyCode::Down | KeyCode::Tab => {
+                    let len = uirender::current_palette(self)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    if len > 0 {
+                        self.palette_sel = (self.palette_sel + 1).min(len - 1);
+                    }
+                }
                 KeyCode::Enter => {
                     self.pick_palette().await;
                     return;
@@ -625,7 +635,7 @@ impl App {
 
     fn apply_mode(&mut self, m: Mode) {
         self.mode = m;
-        self.agent.perms.lock().unwrap().set_mode(m);
+        PermEngine::lock(&self.agent.perms).set_mode(m);
         self.agent.set_mode_directive(sysprompt::mode_directive(m));
     }
 
@@ -782,14 +792,20 @@ impl App {
                 self.live_thought.clear();
                 self.live_step = None;
                 if let Some(gi) = self.steps_group_idx {
-                    let mut drop_group = false;
+                    let mut dropped = false;
                     if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
                         g.outcome = Some(outcome.clone());
                         g.expanded = false;
-                        drop_group = g.steps.is_empty() && outcome == TaskOutcome::Done;
+                        dropped = g.steps.is_empty() && outcome == TaskOutcome::Done;
                     }
-                    if drop_group && self.blocks.len() == gi + 1 {
+                    if dropped && self.blocks.len() == gi + 1 {
                         self.blocks.remove(gi);
+                        // keep the keyboard focus pointing at a real element
+                        if let Some((bi, _)) = self.focus {
+                            if bi == gi {
+                                self.focus = None;
+                            }
+                        }
                     }
                 }
                 self.steps_group_idx = None;
@@ -875,14 +891,24 @@ impl App {
         let root = self.cfg.project_root.clone();
         let model = self.agent.provider.model_name();
         let dir = self.sessions_dir.clone();
-        let prev = self.session.take();
-        match crate::session::save(&dir, &root, &model, prev.as_ref(), convo) {
-            Ok(r) => self.session = Some(r),
-            Err(e) => {
-                self.session = prev;
-                self.push_notice(format!("failed saving session: {e}"));
+        let session = Arc::clone(&self.session);
+        let ev = self.ev_tx.clone();
+        // serialization + disk IO happen off the render loop; the shared
+        // mutex also serializes overlapping saves so an older snapshot can
+        // never overwrite a newer one
+        tokio::task::spawn_blocking(move || {
+            let prev = session.lock().ok().and_then(|g| g.clone());
+            match crate::session::save(&dir, &root, &model, prev.as_ref(), convo) {
+                Ok(r) => {
+                    if let Ok(mut g) = session.lock() {
+                        *g = Some(r);
+                    }
+                }
+                Err(e) => {
+                    let _ = ev.send(AgentEvent::Notice(format!("failed saving session: {e}")));
+                }
             }
-        }
+        });
     }
 
     fn spawn_index_rebuild(&mut self) {

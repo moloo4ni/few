@@ -40,7 +40,7 @@ async fn run() -> anyhow::Result<()> {
         cfg.sensitive_extra.clone(),
         cfg.granted.clone(),
     )));
-    perms.lock().unwrap().set_mode(Mode::Build);
+    PermEngine::lock(&perms).set_mode(Mode::Build);
 
     let provider = OpenAiProvider::new(&cfg.provider_base_url, cfg.api_key.as_deref(), &cfg.model)?;
 

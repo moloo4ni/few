@@ -490,14 +490,14 @@ impl<P: Provider> Agent<P> {
         target_display: String,
     ) -> GateResult {
         let check = {
-            let engine = self.perms.lock().unwrap();
+            let engine = PermEngine::lock(&self.perms);
             engine.check(cap, target_path)
         };
         match check {
             Check::Allowed => GateResult::Proceed,
             Check::Denied(source) => {
                 let msg = {
-                    let engine = self.perms.lock().unwrap();
+                    let engine = PermEngine::lock(&self.perms);
                     engine.deny_message(cap, source, target_path)
                 };
                 GateResult::Denied(msg)
@@ -530,14 +530,14 @@ impl<P: Provider> Agent<P> {
                 match grant {
                     None => {
                         let msg = {
-                            let engine = self.perms.lock().unwrap();
+                            let engine = PermEngine::lock(&self.perms);
                             engine.deny_message(cap, DenySource::UserDenied, target_path)
                         };
                         GateResult::Denied(msg)
                     }
                     Some(g) => {
                         let persist = {
-                            let mut engine = self.perms.lock().unwrap();
+                            let mut engine = PermEngine::lock(&self.perms);
                             let key = match cap {
                                 Capability::ShellExec => PermEngine::shell_key(&target_display),
                                 _ => target_path
@@ -950,12 +950,7 @@ fn str_arg(args: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 fn resolve_path(root: &Path, p: &str) -> PathBuf {
-    let path = Path::new(p);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
+    crate::paths::resolve_under(root, p)
 }
 
 fn combine_output(c: &tools::OutputCapture) -> String {
@@ -1136,7 +1131,7 @@ mod tests {
             vec![],
             Default::default(),
         )));
-        perms.lock().unwrap().set_mode(Mode::Auto);
+        PermEngine::lock(&perms).set_mode(Mode::Auto);
         let mem = Memory::new(root, &root.join(".data"));
         (perms, mem)
     }
@@ -1153,7 +1148,7 @@ mod tests {
         let root = temp_root("s");
         std::fs::write(root.join("a.txt"), "hello\n").unwrap();
         let (perms, mem) = setup(&root);
-        perms.lock().unwrap().set_mode(Mode::Build); // read stays silent-allowed
+        PermEngine::lock(&perms).set_mode(Mode::Build); // read stays silent-allowed
         let prov = Scripted::new(vec![
             reply_call("read", r#"{"path":"a.txt"}"#),
             reply_text("done"),
