@@ -137,7 +137,7 @@ impl App {
         }
         // Показываем в интерфейсе, если конфигурация фиктивная или отсутствует
         if cfg.model == "dummy-model" || cfg.provider_base_url.contains("localhost:9999") {
-            app.push_notice("Нужно сконфигурировать модель в .few/config.toml или через OPENAI_API_KEY / FEW_API_KEY".into());
+            app.push_notice("Нужно сконфигурировать провайдер: задайте model и api_key_env (по умолчанию OPENAI_API_KEY) в .few/config.toml".into());
         }
         app
     }
