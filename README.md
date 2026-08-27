@@ -108,3 +108,8 @@ Development: `cargo test`, `cargo clippy --all-targets`, `cargo fmt`.
 ## License
 
 [MPL-2.0](LICENSE).
+
+## Wiki
+
+Project documentation lives on the [GitHub Wiki](https://github.com/moloo4ni/few/wiki):
+overview, configuration, commands, and architecture.
