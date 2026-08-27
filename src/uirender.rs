@@ -106,6 +106,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .collect::<Vec<_>>(),
         ));
     }
+
+    // Bottom-anchor short transcripts: at the live edge, when the content is
+    // shorter than the area, pad blank lines above so new output grows upward
+    // from the input instead of hugging the top. Once the area fills, the tail
+    // is shown and older rows scroll off the top (handled by the start/end slice).
+    let n = visible.len();
+    if app.scroll_from_end == 0 && n < h {
+        let pad = h - n;
+        let blank = Line::default();
+        let mut padded_lines = vec![blank; pad];
+        padded_lines.extend(lines);
+        lines = padded_lines;
+        let mut padded_hits = vec![Hit::Nothing; h];
+        padded_hits[pad..].copy_from_slice(&hits[..n]);
+        hits = padded_hits;
+    }
+
     app.hitmap = hits;
     f.render_widget(Paragraph::new(lines), transcript);
 
@@ -918,8 +935,13 @@ mod tests {
         let mut app = test_app("thought-click");
         app.blocks.push(thought_block(1500));
         render(&mut app, 60, 12); // builds the hitmap
-        assert_eq!(app.hitmap[0], Hit::Block(0));
-        app.on_click(0); // first transcript row is the thought header
+        // bottom-anchored: the single block sits at the last transcript row, not row 0
+        let row = app
+            .hitmap
+            .iter()
+            .position(|hit| *hit == Hit::Block(0))
+            .expect("thought hit present");
+        app.on_click(row as u16); // click the thought header wherever it landed
         match &app.blocks[0] {
             Block::Thought { expand, .. } => {
                 assert!(*expand != Expand::Collapsed, "click must unfold thought");
