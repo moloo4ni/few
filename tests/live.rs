@@ -9,7 +9,7 @@
 use keiko::agent::{Agent, AgentEvent, TaskOutcome};
 use keiko::config::Config;
 use keiko::memory::Memory;
-use keiko::perms::{Mode, PermEngine};
+use keiko::perms::{Mode, PermEngine, Policy};
 use keiko::providers::openai::OpenAiProvider;
 use keiko::tools::Ctl;
 use std::sync::{Arc, Mutex};
@@ -115,6 +115,8 @@ fn setup(root: &std::path::Path) -> (Arc<Mutex<PermEngine>>, Memory) {
         root.to_path_buf(),
         vec![],
         Default::default(),
+        Policy::Ask,
+        Policy::Ask,
     )));
     perms.lock().unwrap().set_mode(Mode::Auto);
     let memory = Memory::new(root, &root.join(".data"));

@@ -580,7 +580,7 @@ mod tests {
     use crate::app::App;
     use crate::config::Config;
     use crate::memory::Memory;
-    use crate::perms::{Mode, PermEngine};
+    use crate::perms::{Mode, PermEngine, Policy};
     use crate::providers::openai::OpenAiProvider;
     use crate::transcript::{PermAskBlock, StepBlock, StepsGroup};
     use std::sync::{Arc, Mutex};
@@ -601,6 +601,8 @@ mod tests {
             root.clone(),
             vec![],
             Default::default(),
+            Policy::Ask,
+            Policy::Ask,
         )));
         let memory = Memory::new(&root, &root.join(".data"));
         let provider = OpenAiProvider::new("http://127.0.0.1:9/v1", None, "test-model").unwrap();

@@ -382,7 +382,6 @@ pub async fn run_shell(
     // (shell + its children like compilers and test runners), not just the shell
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
     }
 

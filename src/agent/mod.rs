@@ -527,7 +527,7 @@ pub fn system_prompt(layers: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perms::Mode;
+    use crate::perms::{Mode, Policy};
     use crate::providers::ToolCall;
     use crate::providers::{ToolDef, Usage};
     use std::path::PathBuf;
@@ -609,6 +609,8 @@ mod tests {
             root.to_path_buf(),
             vec![],
             Default::default(),
+            Policy::Ask,
+            Policy::Ask,
         )));
         PermEngine::lock(&perms).set_mode(Mode::Auto);
         let mem = Memory::new(root, &root.join(".data"));

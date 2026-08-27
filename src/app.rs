@@ -113,7 +113,7 @@ impl App {
             transcript_area: Default::default(),
             palette_sel: 0,
             models_cache: cfg.models.clone(),
-            cfg,
+            cfg: cfg.clone(),
             agent,
             memory,
             history_path,
@@ -134,6 +134,10 @@ impl App {
         };
         if let Some((_, note)) = resume {
             app.push_notice(note);
+        }
+        // Показываем в интерфейсе, если конфигурация фиктивная или отсутствует
+        if cfg.model == "dummy-model" || cfg.provider_base_url.contains("localhost:9999") {
+            app.push_notice("Нужно сконфигурировать модель в .keiko/config.toml или через OPENAI_API_KEY / KEIKO_MODEL".into());
         }
         app
     }

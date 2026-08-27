@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use crate::perms::Policy;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct FileConfig {
@@ -56,9 +57,32 @@ pub struct LimitsCfg {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct PermsCfg {
     #[serde(default)]
+    pub filesystem: FsPermsCfg,
+    #[serde(default)]
+    pub shell: DefaultPolicyCfg,
+    #[serde(default)]
+    pub network: DefaultPolicyCfg,
+    #[serde(default)]
     pub sensitive: SensitiveCfg,
     #[serde(default)]
     pub granted: BTreeMap<String, String>,
+}
+
+/// `[permissions.filesystem]`: `read` is the read policy, `write` is the
+/// default write policy (overridden by the active mode for plan/auto).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct FsPermsCfg {
+    #[serde(default)]
+    pub read: Option<String>,
+    #[serde(default)]
+    pub write: DefaultPolicyCfg,
+}
+
+/// A capability default policy, e.g. `[permissions.shell] default = "ask"`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct DefaultPolicyCfg {
+    #[serde(default)]
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -97,6 +121,11 @@ impl FileConfig {
                 diff_lines: b.diff_lines.or(a.diff_lines),
             }),
             permissions: merge_opt(self.permissions, over.permissions, |mut a, b| {
+                a.filesystem.read = b.filesystem.read.or(a.filesystem.read);
+                a.filesystem.write.default =
+                    b.filesystem.write.default.or(a.filesystem.write.default);
+                a.shell.default = b.shell.default.or(a.shell.default);
+                a.network.default = b.network.default.or(a.network.default);
                 a.sensitive.extra.extend(b.sensitive.extra);
                 for (k, v) in b.granted {
                     a.granted.insert(k, v);
@@ -148,6 +177,12 @@ pub struct Config {
     pub diff_lines: usize,
     pub sensitive_extra: Vec<String>,
     pub granted: BTreeMap<String, String>,
+    /// base default policy for writes (used by build mode; plan/auto override)
+    pub perm_write_default: Policy,
+    /// base default policy for shell execution
+    pub perm_shell_default: Policy,
+    /// base default policy for the network axis
+    pub perm_network_default: Policy,
     pub project_root: PathBuf,
     pub project_config_path: PathBuf,
 }
@@ -171,6 +206,9 @@ impl Default for Config {
             diff_lines: 400,
             sensitive_extra: Vec::new(),
             granted: Default::default(),
+            perm_write_default: Policy::Ask,
+            perm_shell_default: Policy::Ask,
+            perm_network_default: Policy::Deny,
             project_root: PathBuf::new(),
             project_config_path: PathBuf::new(),
         }
@@ -228,6 +266,28 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
         diff_lines: merged.limits.diff_lines.unwrap_or(400),
         sensitive_extra: merged.permissions.sensitive.extra.clone(),
         granted: merged.permissions.granted.clone(),
+        perm_write_default: merged
+            .permissions
+            .filesystem
+            .write
+            .default
+            .as_deref()
+            .and_then(parse_policy)
+            .unwrap_or(Policy::Ask),
+        perm_shell_default: merged
+            .permissions
+            .shell
+            .default
+            .as_deref()
+            .and_then(parse_policy)
+            .unwrap_or(Policy::Ask),
+        perm_network_default: merged
+            .permissions
+            .network
+            .default
+            .as_deref()
+            .and_then(parse_policy)
+            .unwrap_or(Policy::Deny),
         project_root: root.to_path_buf(),
         project_config_path: pcfg,
     })
@@ -326,6 +386,15 @@ fn parse_quoted_key(trimmed_line: &str) -> Option<String> {
     None
 }
 
+fn parse_policy(s: &str) -> Option<Policy> {
+    match s {
+        "allow" => Some(Policy::Allow),
+        "ask" => Some(Policy::Ask),
+        "deny" => Some(Policy::Deny),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +485,12 @@ extra = ["*.txt"]
             Some("write")
         );
         assert_eq!(cfg.permissions.sensitive.extra, vec!["*.txt"]);
+        assert_eq!(cfg.permissions.filesystem.read.as_deref(), Some("project"));
+        assert_eq!(
+            cfg.permissions.filesystem.write.default.as_deref(),
+            Some("ask")
+        );
+        assert_eq!(cfg.permissions.shell.default.as_deref(), Some("ask"));
+        assert_eq!(cfg.permissions.network.default.as_deref(), Some("deny"));
     }
 }

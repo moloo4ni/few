@@ -18,7 +18,13 @@ async fn main() {
         return;
     }
     if let Err(e) = run().await {
-        eprintln!("keiko: {e:#}");
+        eprintln!("\nkeiko: {e:#}\n");
+        // Ожидаем Enter, чтобы окно не закрывалось мгновенно (особенно в kitty/sway)
+        use std::io::{self, Write};
+        print!("Нажмите Enter для выхода...");
+        io::stdout().flush().unwrap();
+        let mut buf = String::new();
+        let _ = io::stdin().read_line(&mut buf);
         std::process::exit(2);
     }
 }
@@ -39,6 +45,8 @@ async fn run() -> anyhow::Result<()> {
         root.clone(),
         cfg.sensitive_extra.clone(),
         cfg.granted.clone(),
+        cfg.perm_write_default,
+        cfg.perm_shell_default,
     )));
     PermEngine::lock(&perms).set_mode(Mode::Build);
 
