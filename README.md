@@ -37,22 +37,31 @@ but the contract is not frozen yet and details will change.
 
 ## Build & run
 
-Requires stable Rust (pinned via `rust-toolchain.toml`):
+Requires stable Rust (pinned via `rust-toolchain.toml`). Build the binary once:
 
 ```sh
-cargo build --release
-./target/release/keiko          # inside a project directory
-./target/release/keiko -c       # resume the last session for this project
+cargo build --release     # binary at ./target/release/few
+cargo build               # or a debug build at ./target/debug/few
 ```
 
-Sessions persist automatically after each completed task as JSON under the user's
-data directory (`sessions/`), never inside the project.
+Run **from inside the project directory** you want Few to work in:
+
+```sh
+cd /path/to/your/project
+/path/to/few/target/release/few        # start a fresh session
+/path/to/few/target/release/few -c     # resume the last session for this project
+```
+
+Few reads `<project>/.few/config.toml` (per-project, overrides global) and
+`~/.config/few/config.toml` (global: provider, model, key). Sessions persist
+automatically after each completed task as JSON under the user's data directory
+(`sessions/`), never inside the project.
 
 TLS ships as the default `tls` feature (`reqwest` + `rustls`). Alternatives: an HTTP-only
 build (`--no-default-features`) or the OS-native backend
 (`--no-default-features --features tls-native`) for toolchains without a C compiler.
 
-At startup Few checks that the selected model answers with native tool calls; otherwise it
+At startup Few probes that the selected model answers with native tool calls; otherwise it
 exits with an explicit error - switch models rather than hoping text parsing will work.
 
 ## Configuration
@@ -64,7 +73,7 @@ Global config: `~/.config/few/config.toml`; per-project: `<project>/.few/config.
 [provider]
 base_url = "http://127.0.0.1:11434/v1"   # ollama or any OpenAI-compatible server
 model = "qwen3:8b"
-api_key_env = "OPENAI_API_KEY"           # optional; FEW_API_KEY / OPENAI_API_KEY also read
+api_key_env = "OPENAI_API_KEY"           # optional; env var Few reads for the key
 compact_threshold = 0.75                 # fold old rounds at 75% of context_window
 ```
 
@@ -105,11 +114,11 @@ prompts/base.md base layer of the system prompt (compiled into the binary)
 
 Development: `cargo test`, `cargo clippy --all-targets`, `cargo fmt`.
 
-## License
-
-[MPL-2.0](LICENSE).
-
 ## Wiki
 
 Project documentation lives on the [GitHub Wiki](https://github.com/moloo4ni/few/wiki):
 overview, configuration, commands, and architecture.
+
+## License
+
+[MPL-2.0](LICENSE).

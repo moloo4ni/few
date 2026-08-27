@@ -237,14 +237,13 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
         .api_key
         .clone()
         .or_else(|| {
-            merged
+            let env_name = merged
                 .provider
                 .api_key_env
                 .clone()
-                .and_then(|name| std::env::var(name).ok())
-        })
-        .or_else(|| std::env::var("FEW_API_KEY").ok())
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+            std::env::var(env_name).ok()
+        });
 
     Ok(Config {
         provider_base_url: merged
