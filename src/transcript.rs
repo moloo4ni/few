@@ -37,13 +37,22 @@ pub struct StepBlock {
 /// thinking never becomes a separate top-level block.
 pub enum StepItem {
     Step(StepBlock),
-    Thought { text: String, expand: Expand },
-    Narration { text: String, expand: Expand },
+    Thought {
+        text: String,
+        expand: Expand,
+    },
+    Narration {
+        text: String,
+        expand: Expand,
+    },
+    /// A memory write surfaces as a remembered fact inside the step group
+    /// (it is a step, counted in the summary, not a floating top-level block).
+    Remembered(String),
 }
 
 impl StepItem {
     pub fn is_step(&self) -> bool {
-        matches!(self, StepItem::Step(_))
+        matches!(self, StepItem::Step(_) | StepItem::Remembered(_))
     }
 
     pub fn is_error(&self) -> bool {
@@ -76,16 +85,11 @@ pub const PERM_OPTIONS: [&str; 4] = [
 
 pub enum Block {
     User(String),
-    Remembered(String),
-    Notice {
-        text: String,
-        level: NoticeLevel,
-    },
+    Assistant(String),
+    Notice { text: String, level: NoticeLevel },
     Steps(StepsGroup),
     PermAsk(PermAskBlock),
-    MemoryView {
-        text: String,
-    },
+    MemoryView { text: String },
 }
 
 impl StepBlock {

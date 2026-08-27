@@ -2,7 +2,7 @@ use crate::agent::NoticeLevel;
 use crate::app::{label_mode, App};
 use crate::commands::{arg_options, filter_commands, find_command};
 use crate::theme;
-use crate::transcript::{Block, Expand, Hit, PERM_OPTIONS, StepItem};
+use crate::transcript::{Block, Expand, Hit, StepItem, PERM_OPTIONS};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -16,28 +16,60 @@ fn wrap_segments(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
     let mut rows: Vec<Vec<Seg>> = vec![Vec::new()];
     let mut row_w = 0usize;
 
-    fn push_char(rows: &mut Vec<Vec<Seg>>, row_w: &mut usize, c: char, st: Style, width: usize) {
-        let cw = c.width().unwrap_or(0);
-        if *row_w + cw > width {
-            rows.push(Vec::new());
-            *row_w = 0;
+    /// Append a run of text, merging it into the previous segment when the style
+    /// matches. Over-long runs are allowed to overflow (and clip at the buffer)
+    /// rather than being broken mid-word.
+    // This helper appends rows as wrapping proceeds, so it intentionally needs
+    // the growable Vec rather than a slice.
+    #[allow(clippy::ptr_arg)]
+    fn push_run(rows: &mut Vec<Vec<Seg>>, row_w: &mut usize, s: &str, st: Style) {
+        if s.is_empty() {
+            return;
         }
+        let w: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
         let row = rows.last_mut().unwrap();
         match row.last_mut() {
-            Some((t, s)) if *s == st && !t.ends_with(' ') => t.push(c),
-            _ => row.push((c.to_string(), st)),
+            Some((t, s2)) if *s2 == st => t.push_str(s),
+            _ => row.push((s.to_string(), st)),
         }
-        *row_w += cw;
+        *row_w += w;
+    }
+
+    /// Place one whitespace-delimited word, breaking only before it (never in
+    /// the middle of it). A word longer than the whole line overflows intact.
+    fn place_word(
+        rows: &mut Vec<Vec<Seg>>,
+        row_w: &mut usize,
+        word: &str,
+        st: Style,
+        width: usize,
+    ) {
+        let wlen: usize = word.chars().map(|c| c.width().unwrap_or(0)).sum();
+        if *row_w == 0 {
+            push_run(rows, row_w, word, st);
+        } else if *row_w + 1 + wlen <= width {
+            push_run(rows, row_w, &format!(" {word}"), st);
+        } else {
+            rows.push(Vec::new());
+            *row_w = 0;
+            push_run(rows, row_w, word, st);
+        }
     }
 
     for (text, st) in segs {
+        let mut word = String::new();
         for c in text.chars() {
-            if c == '\n' {
-                rows.push(Vec::new());
-                row_w = 0;
-                continue;
+            if c.is_whitespace() {
+                if !word.is_empty() {
+                    place_word(&mut rows, &mut row_w, &word, *st, width);
+                    word.clear();
+                }
+            } else {
+                word.push(c);
             }
-            push_char(&mut rows, &mut row_w, c, *st, width);
+        }
+        if !word.is_empty() {
+            place_word(&mut rows, &mut row_w, &word, *st, width);
         }
     }
 
@@ -56,7 +88,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let input_rows = build_input_rows(app, width.max(4));
     let input_h = input_rows.rows.len().clamp(1, 6) as u16;
-    let busy_rows: u16 = if app.running { 1 } else { 0 };
+    // two rows while busy: a leading blank separates the live thinking/working
+    // indicator from the transcript above, so the user prompt and the indicator
+    // are clearly spaced instead of crammed onto adjacent lines
+    let busy_rows: u16 = if app.running { 2 } else { 0 };
     let pal_items = palette_items(app);
     let pal_rows = pal_items
         .as_ref()
@@ -128,7 +163,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if busy_rows > 0 {
         let mut text = if let Some(t) = app.thinking_since {
-            format!("thinking · {}", t.elapsed().as_secs())
+            format!("thinking · {}s", t.elapsed().as_secs())
         } else {
             let secs = app.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             format!("working · {secs}s")
@@ -136,8 +171,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if !app.input.is_empty() {
             text += " · typed text queued";
         }
+        // leading blank row separates this from the transcript above; the line
+        // itself is dim so it reads as transient status, not a log entry
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(text, theme::dim()))),
+            Paragraph::new(vec![
+                Line::default(),
+                Line::from(Span::styled(text, theme::dim())),
+            ]),
             chunks[1],
         );
     }
@@ -157,11 +197,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn render_status(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let pct = app
-        .ctx_used
-        .checked_mul(100)
-        .and_then(|n| n.checked_div(app.ctx_window))
-        .unwrap_or(if app.ctx_window > 0 { 100 } else { 0 });
+    // percentage of the context window used, rounded to the nearest percent so
+    // a small task (e.g. 1.6k / 200k) shows "1%" instead of flooring to "0%"
+    let pct = if app.ctx_window > 0 {
+        let used = app.ctx_used.min(app.ctx_window);
+        ((used.saturating_mul(100) + app.ctx_window / 2) / app.ctx_window) as usize
+    } else {
+        0
+    };
     let spans = vec![
         Span::styled("model:", theme::dim()),
         Span::raw(format!(" {}    ", app.model_name)),
@@ -321,7 +364,7 @@ fn push_input_char(rows: &mut Vec<Vec<Seg>>, row_w: &mut usize, c: char, st: Sty
 }
 
 fn placeholder_text() -> &'static str {
-    "ask few anything · / commands · shift+enter newline"
+    "ask few anything · /commands · shift+enter newline"
 }
 
 fn render_palette(f: &mut Frame, area: ratatui::layout::Rect, items: &[String], sel: usize) {
@@ -416,11 +459,21 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
     };
 
     for (bi, block) in app.blocks.iter().enumerate() {
+        // A step group with no actual step (only interim thought/narration) has
+        // nothing meaningful to headline - skip it so "0 steps" never shows.
+        if matches!(block, Block::Steps(g) if !g.steps.iter().any(|s| s.is_step())) {
+            continue;
+        }
         if !rows.is_empty() {
             rows.push((vec![], Hit::Nothing));
         }
         match block {
             Block::User(text) => {
+                // the `>` quote is flush-left; wrapped continuation lines hang-
+                // indent under the text after `> ` to keep one coherent block
+                push_user_prompt(&mut rows, text, theme::normal(), width);
+            }
+            Block::Assistant(text) => {
                 push_wrapped_text(&mut rows, text, theme::normal(), width, Hit::Nothing);
             }
             Block::Steps(group) => {
@@ -441,11 +494,12 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                                     "denied" => theme::amber(),
                                     _ => theme::dim(),
                                 };
-                                push_wrapped_text(
+                                push_indented_hit(
                                     &mut rows,
-                                    &format!("  {}", step.headline()),
+                                    &step.headline(),
                                     mark(style, focused(bi, si)),
                                     width,
+                                    2,
                                     Hit::Step(bi, si),
                                 );
                                 if step.expand != Expand::Collapsed {
@@ -457,11 +511,12 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                                         } else {
                                             theme::dim()
                                         };
-                                        push_wrapped_text(
+                                        push_indented_hit(
                                             &mut rows,
-                                            &format!("    {dr}"),
+                                            &dr,
                                             dstyle,
                                             width,
+                                            4,
                                             Hit::Step(bi, si),
                                         );
                                     }
@@ -501,15 +556,19 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                                     push_indented(&mut rows, text, theme::dim(), width, 4);
                                 }
                             }
+                            StepItem::Remembered(text) => {
+                                push_indented_hit(
+                                    &mut rows,
+                                    &format!("remembered: {text}"),
+                                    mark(theme::blue_dim(), focused(bi, si)),
+                                    width,
+                                    2,
+                                    Hit::Step(bi, si),
+                                );
+                            }
                         }
                     }
                 }
-            }
-            Block::Remembered(line) => {
-                rows.push((
-                    vec![(format!("remembered: {line}"), theme::blue_dim())],
-                    Hit::Nothing,
-                ));
             }
             Block::Notice { text, level } => {
                 let style = match level {
@@ -531,9 +590,10 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             }
             Block::PermAsk(ask) => match &ask.resolved {
                 Some(choice) => {
-                    // settled decision: no glyph, just dimmed amber
+                    // settled decision: no glyph, just dimmed amber, still wrapped
+                    // so long commands don't run off the window
                     let text = format!("{} {} ({})", ask.verb, ask.target, choice);
-                    rows.push((vec![(text, theme::amber_dim())], Hit::Nothing));
+                    push_wrapped_text(&mut rows, &text, theme::amber_dim(), width, Hit::Nothing);
                 }
                 None => {
                     let header = format!(
@@ -563,8 +623,9 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
         }
     }
 
-    // action currently executing, in present tense; replaced by the final
-    // past-tense step once it completes. Static by design - no animations.
+    // live action currently executing, in present tense; replaced by the final
+    // past-tense step once it completes. The reasoning timer is shown in the
+    // status strip above the input, so we do not duplicate it here.
     if let Some((doing, arg)) = &app.live_step {
         rows.push((vec![], Hit::Nothing));
         push_wrapped_text(
@@ -598,12 +659,51 @@ fn push_indented(
     width: usize,
     indent: usize,
 ) {
+    // Wrap inside the indented width and re-apply the indent on every wrapped
+    // row, so continued lines keep the same depth as the first.
+    let inner = width.saturating_sub(indent).max(1);
     let pad = " ".repeat(indent);
     for l in text.lines() {
-        let segs = vec![(format!("{pad}{l}"), style)];
-        for r in wrap_segments(&segs, width) {
-            rows.push((r, Hit::Nothing));
+        for segs in wrap_segments(&[(l.to_owned(), style)], inner) {
+            let mut row: Vec<Seg> = vec![(pad.clone(), style)];
+            row.extend(segs);
+            rows.push((row, Hit::Nothing));
         }
+    }
+}
+
+/// Like `push_indented` but attaches a click hit to every produced row.
+fn push_indented_hit(
+    rows: &mut Vec<(Vec<Seg>, Hit)>,
+    text: &str,
+    style: Style,
+    width: usize,
+    indent: usize,
+    hit: Hit,
+) {
+    let inner = width.saturating_sub(indent).max(1);
+    let pad = " ".repeat(indent);
+    for l in text.lines() {
+        for segs in wrap_segments(&[(l.to_owned(), style)], inner) {
+            let mut row: Vec<Seg> = vec![(pad.clone(), style)];
+            row.extend(segs);
+            rows.push((row, hit));
+        }
+    }
+}
+
+/// Render the user's submitted prompt as a coherent quoted block: the `>`
+/// quote sits flush-left (no left margin), and continuation lines are
+/// hang-indented by 2 chars so they align under the text after `> `.
+fn push_user_prompt(rows: &mut Vec<(Vec<Seg>, Hit)>, text: &str, style: Style, width: usize) {
+    let indent = 2usize; // "> " on the first line, "  " on continuation
+    let inner = width.saturating_sub(indent).max(1);
+    let wrapped = wrap_segments(&[(text.to_owned(), style)], inner);
+    for (i, segs) in wrapped.iter().enumerate() {
+        let pad: &str = if i == 0 { "> " } else { "  " };
+        let mut row: Vec<Seg> = vec![(pad.to_string(), style)];
+        row.extend(segs.iter().cloned());
+        rows.push((row, Hit::Nothing));
     }
 }
 
@@ -611,6 +711,7 @@ fn push_indented(
 mod tests {
     use super::*;
     use crate::agent::Agent;
+    use crate::agent::{StepView, Verb};
     use crate::app::App;
     use crate::config::Config;
     use crate::memory::Memory;
@@ -910,7 +1011,16 @@ mod tests {
     fn focus_is_contrast_not_reverse() {
         let mut app = test_app("focus-contrast");
         app.blocks.push(Block::Steps(StepsGroup {
-            steps: vec![],
+            // a group needs at least one step to be rendered; the test only
+            // cares about the header contrast, so a single write step suffices
+            steps: vec![StepItem::Step(StepBlock {
+                view: StepView {
+                    verb: Verb::Wrote,
+                    arg: "x".into(),
+                    detail: None,
+                },
+                expand: Expand::Collapsed,
+            })],
             expanded: false,
             outcome: None,
         }));
@@ -930,6 +1040,60 @@ mod tests {
         // no reverse video, no extra glyph
         app.focus = Some((0, usize::MAX));
         assert_eq!(headline_style(&app), theme::normal());
+    }
+
+    #[test]
+    fn wrapped_step_keeps_indent() {
+        let mut app = test_app("wrap-indent");
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![StepItem::Step(StepBlock {
+                view: StepView {
+                    verb: Verb::Ran,
+                    arg:
+                        "cd /home/moloo4ni/few-sandbox && python3 -m py_compile greet.py && echo OK"
+                            .into(),
+                    detail: None,
+                },
+                expand: Expand::Collapsed,
+            })],
+            expanded: true,
+            outcome: None,
+        }));
+        // only the step item rows (si != MAX, which is the group header)
+        let step_rows: Vec<String> = build_rows(&app, 40)
+            .into_iter()
+            .filter(|(_, h)| matches!(h, Hit::Step(_, si) if *si != usize::MAX))
+            .map(|(segs, _)| segs.into_iter().map(|(t, _)| t).collect())
+            .collect();
+        assert!(
+            step_rows.len() >= 2,
+            "expected the step to wrap across rows, got {step_rows:?}"
+        );
+        for r in &step_rows {
+            assert!(
+                r.starts_with("  "),
+                "wrapped step line lost its 2-space depth: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_zero_steps_group_when_only_thought() {
+        let mut app = test_app("no-zero");
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![StepItem::Thought {
+                text: "interim thinking".into(),
+                expand: Expand::Collapsed,
+            }],
+            expanded: false,
+            outcome: None,
+        }));
+        // a group with no actual step must not render at all, so the
+        // "0 steps" header never appears
+        assert!(
+            build_rows(&app, 40).is_empty(),
+            "a 0-step group should be skipped entirely"
+        );
     }
 
     #[test]
@@ -966,7 +1130,7 @@ mod tests {
             outcome: None,
         }));
         render(&mut app, 60, 12); // builds the hitmap
-        // the thought is the first item inside the group (after the header)
+                                  // the thought is the first item inside the group (after the header)
         let row = app
             .hitmap
             .iter()

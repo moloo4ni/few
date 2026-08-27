@@ -117,9 +117,6 @@ pub enum AgentEvent {
         text: String,
     },
     TurnClosed,
-    Remembered {
-        line: String,
-    },
     Step(StepView),
     StepStarted(StepStartView),
     PermAsk(PermAskView),
@@ -387,10 +384,6 @@ impl<P: Provider> Agent<P> {
                                 ctx.steps += 1;
                                 if ok {
                                     tracker.reset();
-                                    let _ = ctx.ev.send(AgentEvent::Notice {
-                                        text: "verify passed".into(),
-                                        level: NoticeLevel::Info,
-                                    });
                                     break TaskOutcome::Done;
                                 }
                                 ctx.errors += 1;

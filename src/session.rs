@@ -191,8 +191,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let d =
-            std::env::temp_dir().join(format!("few-session-{tag}-{}-{ms}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("few-session-{tag}-{}-{ms}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }

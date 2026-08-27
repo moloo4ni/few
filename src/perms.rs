@@ -48,6 +48,10 @@ pub enum DenySource {
     UserDenied,
     SensitivePolicy,
     ModePolicy,
+    /// The target path resolved outside the project root - Few only operates
+    /// inside the project directory, so this is always denied with a message
+    /// that points the agent back at the correct root.
+    OutOfProject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +237,13 @@ impl PermEngine {
             }
             Capability::FsWrite => {
                 let t = target.unwrap_or_else(|| Path::new(""));
+                // Writes are confined to the project directory. A path that
+                // resolves outside the root is denied outright (not even in
+                // auto-approve) with a message naming the root, so the agent
+                // self-corrects instead of hitting a confusing OS error.
+                if !t.as_os_str().is_empty() && !self.is_under_root(t) {
+                    return Check::Denied(DenySource::OutOfProject);
+                }
                 let key = self.target_key(t);
                 if self.granted_allows(cap, &key) {
                     return Check::Allowed;
@@ -298,6 +309,12 @@ impl PermEngine {
             DenySource::ModePolicy => {
                 format!("permission denied: current mode forbids {}{}", cap.label(), tgt)
             }
+            DenySource::OutOfProject => format!(
+                "permission denied: {}{} is outside the project root {} - reference files by their path relative to the project directory",
+                cap.label(),
+                tgt,
+                self.root.display()
+            ),
         }
     }
 
@@ -318,6 +335,22 @@ mod tests {
             Policy::Ask,
             Policy::Ask,
         )
+    }
+
+    #[test]
+    fn write_outside_root_is_denied() {
+        let e = engine(vec![]);
+        // A write that resolves outside the project root is denied outright,
+        // with a message naming the root, regardless of the active mode.
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(Path::new("/elsewhere/x.txt"))),
+            Check::Denied(DenySource::OutOfProject)
+        );
+        // Writes inside the root are still governed by the mode/policy.
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(Path::new("/proj/x.txt"))),
+            Check::Ask { sensitive: false }
+        );
     }
 
     #[test]

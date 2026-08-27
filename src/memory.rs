@@ -38,10 +38,7 @@ fn display_path(p: &Path) -> String {
 impl Memory {
     pub fn new(project_root: &Path, data_dir: &Path) -> Self {
         Self {
-            project_path: project_root
-                .join(".few")
-                .join("memory")
-                .join("project.md"),
+            project_path: project_root.join(".few").join("memory").join("project.md"),
             persistent_path: data_dir.join("memory.md"),
         }
     }

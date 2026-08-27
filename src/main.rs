@@ -19,9 +19,9 @@ async fn main() {
     }
     if let Err(e) = run().await {
         eprintln!("\nfew: {e:#}\n");
-        // Ожидаем Enter, чтобы окно не закрывалось мгновенно (особенно в kitty/sway)
+        // Wait for Enter so the window does not close immediately (especially under kitty/sway).
         use std::io::{self, Write};
-        print!("Нажмите Enter для выхода...");
+        print!("Press Enter to exit...");
         io::stdout().flush().unwrap();
         let mut buf = String::new();
         let _ = io::stdin().read_line(&mut buf);

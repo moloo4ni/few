@@ -1,7 +1,7 @@
+use crate::perms::Policy;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use crate::perms::Policy;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct FileConfig {
@@ -232,18 +232,14 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
             pcfg.display()
         )
     })?;
-    let api_key = merged
-        .provider
-        .api_key
-        .clone()
-        .or_else(|| {
-            let env_name = merged
-                .provider
-                .api_key_env
-                .clone()
-                .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
-            std::env::var(env_name).ok()
-        });
+    let api_key = merged.provider.api_key.clone().or_else(|| {
+        let env_name = merged
+            .provider
+            .api_key_env
+            .clone()
+            .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+        std::env::var(env_name).ok()
+    });
 
     Ok(Config {
         provider_base_url: merged
