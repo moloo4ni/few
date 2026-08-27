@@ -19,10 +19,8 @@ impl<P: Provider> Agent<P> {
         plan: &VerifyPlan,
         ctx: &mut RunCtx<'_>,
     ) -> (bool, String) {
-        let _ = ctx.ev.send(AgentEvent::Notice {
-            text: format!("verify · {}", plan.command),
-            level: NoticeLevel::Info,
-        });
+        // verify is surfaced as an ordinary `ran` step (emitted just below); a
+        // separate notice line would only duplicate it, so we skip it here
         let _ = ctx.ev.send(AgentEvent::StepStarted(StepStartView {
             verb: Verb::Ran,
             arg: plan.command.clone(),
@@ -40,11 +38,17 @@ impl<P: Provider> Agent<P> {
         ctx.drain_ctl();
 
         let tail = combine_output(&run.capture);
+        let mut out = combine_output_pretty(&run.capture);
+        if run.success {
+            // "verify passed" is the outcome of the verify step itself, so it
+            // lives in the step's result rather than as a standalone notice line
+            out.push_str("\nverify passed");
+        }
         let _ = ctx.ev.send(AgentEvent::Step(StepView {
             verb: if run.success { Verb::Ran } else { Verb::Failed },
             arg: plan.command.clone(),
             detail: Some(Detail::Output {
-                text: combine_output_pretty(&run.capture),
+                text: out,
                 total_bytes: run.capture.total_bytes,
                 truncated: run.capture.truncated_from.is_some(),
             }),
@@ -259,22 +263,9 @@ impl<P: Provider> Agent<P> {
                 return true;
             }
         }
-        let mem_paths = vec![
-            self.memory.project_path.clone(),
-            self.memory.persistent_path.clone(),
-        ];
-        match tools::exec_write(
-            &ctx.cfg.project_root,
-            &mem_paths,
-            &path_arg,
-            content,
-            delete,
-        ) {
+        match tools::exec_write(&ctx.cfg.project_root, &path_arg, content, delete) {
             Ok(out) => {
                 ctx.wrote_since_user = true;
-                for line in &out.remembered_lines {
-                    let _ = ctx.ev.send(AgentEvent::Remembered { line: line.clone() });
-                }
                 let detail = if let Some(note) = &out.binary_note {
                     Some(Detail::BinaryNote(note.clone()))
                 } else {

@@ -172,12 +172,10 @@ pub struct WriteOut {
     pub deleted: bool,
     pub diff: Option<Vec<DiffLine>>,
     pub binary_note: Option<String>,
-    pub remembered_lines: Vec<String>,
 }
 
 pub fn exec_write(
     root: &std::path::Path,
-    mem_paths: &[std::path::PathBuf],
     arg_path: &str,
     content: &str,
     delete: bool,
@@ -212,7 +210,6 @@ pub fn exec_write(
             deleted: true,
             diff,
             binary_note: None,
-            remembered_lines: vec![],
         });
     }
 
@@ -252,22 +249,6 @@ pub fn exec_write(
         None
     };
 
-    let mut remembered_lines = Vec::new();
-    for mp in mem_paths {
-        if *mp == path {
-            if let Some(d) = &diff {
-                for l in d.iter().filter(|l| l.sign == '+') {
-                    let t = l.text.trim();
-                    if let Some(stripped) = t.strip_prefix("- ") {
-                        remembered_lines.push(stripped.to_owned());
-                    } else if t.len() > 2 && t.chars().next().is_some() {
-                        remembered_lines.push(t.to_owned());
-                    }
-                }
-            }
-        }
-    }
-
     let verb = if existed { "updated" } else { "created" };
     Ok(WriteOut {
         for_model: format!("{} {disp}", verb),
@@ -276,7 +257,6 @@ pub fn exec_write(
         deleted: false,
         diff,
         binary_note,
-        remembered_lines,
     })
 }
 
@@ -609,12 +589,12 @@ mod tests {
     #[test]
     fn write_create_and_delete() {
         let root = tmpdir("write");
-        let out = exec_write(&root, &[], "sub/dir/f.txt", "hello\n", false).unwrap();
+        let out = exec_write(&root, "sub/dir/f.txt", "hello\n", false).unwrap();
         assert!(out.created);
         assert_eq!(stats_of(out.diff.as_ref().unwrap()), (1, 0));
         assert!(root.join("sub/dir/f.txt").exists());
 
-        let del = exec_write(&root, &[], "sub/dir/f.txt", "", true).unwrap();
+        let del = exec_write(&root, "sub/dir/f.txt", "", true).unwrap();
         assert!(del.deleted);
         assert!(!root.join("sub/dir/f.txt").exists());
         assert_eq!(stats_of(del.diff.as_ref().unwrap()), (0, 1));
@@ -628,22 +608,6 @@ mod tests {
         let out = exec_read(&root, "img.png").unwrap();
         assert!(out.binary_note.is_some());
         assert!(out.for_model.contains("binary"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn memory_lines_extracted() {
-        let root = tmpdir("mem");
-        let mem = root.join(".few/memory/project.md");
-        let out = exec_write(
-            &root,
-            std::slice::from_ref(&mem),
-            ".few/memory/project.md",
-            "- fact one\n- fact two\n",
-            false,
-        )
-        .unwrap();
-        assert_eq!(out.remembered_lines, vec!["fact one", "fact two"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

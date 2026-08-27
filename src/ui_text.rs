@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn plain_text_untouched() {
-        let t = "привет ✓ — keep unicode text\nsecond line";
+        let t = "hello ✓ — keep unicode text\nsecond line";
         assert_eq!(clean(t), t);
     }
 

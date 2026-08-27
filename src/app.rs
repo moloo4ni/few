@@ -9,7 +9,9 @@ use crate::providers::Provider as _;
 use crate::sysprompt;
 use crate::tools::Ctl;
 
-use crate::transcript::{Block, Expand, Hit, PermAskBlock, StepBlock, StepItem, StepsGroup, PERM_OPTIONS};
+use crate::transcript::{
+    Block, Expand, Hit, PermAskBlock, StepBlock, StepItem, StepsGroup, PERM_OPTIONS,
+};
 use crate::ui_text::clean;
 use crate::uirender;
 use anyhow::Context as _;
@@ -64,6 +66,13 @@ pub struct App {
     session: Arc<std::sync::Mutex<Option<crate::session::SessionRef>>>,
     live_narration: String,
     live_thought: String,
+    /// slot of the most recent folded Narration pushed this turn, so Finished
+    /// can promote it to a visible answer if the final turn ended with no prose
+    /// after its last tool call (i.e. the model wrote the answer then ran a verify)
+    last_said: Option<(usize, usize)>,
+    /// whether the most recent (final) turn left any prose after its last tool
+    /// call - gates promotion of a folded Narration to a visible answer
+    final_turn_had_post_prose: bool,
     /// action currently executing, shown in present tense until its final step arrives
     pub live_step: Option<(String, String)>,
     file_index: Arc<Mutex<Vec<String>>>,
@@ -123,6 +132,8 @@ impl App {
             )),
             live_narration: String::new(),
             live_thought: String::new(),
+            last_said: None,
+            final_turn_had_post_prose: false,
             live_step: None,
             file_index: Arc::new(Mutex::new(Vec::new())),
             ctl_tx: None,
@@ -135,9 +146,9 @@ impl App {
         if let Some((_, note)) = resume {
             app.push_notice(note);
         }
-        // Показываем в интерфейсе, если конфигурация фиктивная или отсутствует
+        // Surface in the UI if the configuration is dummy or missing.
         if cfg.model == "dummy-model" || cfg.provider_base_url.contains("localhost:9999") {
-            app.push_notice("Нужно сконфигурировать провайдер: задайте model и api_key_env (по умолчанию OPENAI_API_KEY) в .few/config.toml".into());
+            app.push_notice("Configure a provider: set model and api_key_env (default OPENAI_API_KEY) in .few/config.toml".into());
         }
         app
     }
@@ -172,7 +183,14 @@ impl App {
                 }
                 Some(ae) = self.ev_rx.recv() => self.on_agent_event(ae),
                 Some(msg) = self.app_rx.recv() => match msg {
-                    AppMsg::EditorDone => self.suspended = false,
+                    AppMsg::EditorDone => {
+                        // $EDITOR returned: re-take the terminal and force a full
+                        // redraw. ratatui diffs against its own buffer, which still
+                        // holds the pre-editor frame, so without a clear the
+                        // (already cleared) alternate screen would keep missing rows.
+                        self.suspended = false;
+                        let _ = terminal.clear();
+                    }
                 },
                 _ = tick.tick() => {
                     if let Some(t) = self.escalation {
@@ -209,7 +227,10 @@ impl App {
             }
             crossterm::event::Event::Mouse(m) => self.on_mouse(m),
             crossterm::event::Event::Paste(text) => {
-                self.input.insert_str(&clean(&text));
+                // Drop a trailing newline from pasted text (copies from a terminal
+                // or chat UI usually end with one) so no empty input line appears.
+                let pasted = clean(&text).trim_end_matches('\n').to_string();
+                self.input.insert_str(&pasted);
                 self.after_edit();
             }
             _ => {}
@@ -226,6 +247,25 @@ impl App {
                 self.scroll_from_end = self.scroll_from_end.saturating_sub(3)
             }
             MouseEventKind::Up(MouseButton::Left) => self.on_click(m.row),
+            // hover highlights clickable (expandable) rows so the user can see
+            // what responds to a click
+            MouseEventKind::Moved => {
+                // only highlight rows that actually expand on click (the group
+                // header, steps with detail, and thought/said lines) - not
+                // remembered lines or detail-less steps, which are no-ops
+                let rel = m.row.saturating_sub(self.transcript_area.y) as usize;
+                self.focus = self.hitmap.get(rel).copied().and_then(|h| match h {
+                    Hit::Step(bi, si) => {
+                        let t = (bi, si);
+                        if self.expandable_targets().contains(&t) {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                });
+            }
             _ => {}
         }
     }
@@ -238,18 +278,31 @@ impl App {
         match hit {
             Hit::Nothing => {}
             Hit::Step(bi, usize::MAX) => {
+                self.focus = Some((bi, usize::MAX));
                 if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
                     g.expanded = !g.expanded;
                 }
             }
             Hit::Step(bi, si) => {
+                let t = (bi, si);
+                // only focus (and toggle) rows that actually respond to a click;
+                // a no-op row like `remembered:` or a detail-less step must not
+                // look clickable after the click either
+                if !self.expandable_targets().contains(&t) {
+                    return;
+                }
+                self.focus = Some(t);
                 if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
                     match g.steps.get_mut(si) {
-                        Some(StepItem::Step(s)) => s.expand = s.expand.next(),
+                        // toggle expands/collapses in a single click (a second
+                        // click collapses again) rather than cycling through a
+                        // separate "full" state that would need two clicks to close
+                        Some(StepItem::Step(s)) => s.expand = s.expand.toggle(),
                         Some(StepItem::Thought { expand, .. })
                         | Some(StepItem::Narration { expand, .. }) => {
-                            *expand = expand.next();
+                            *expand = expand.toggle();
                         }
+                        Some(StepItem::Remembered(_)) => {}
                         None => {}
                     }
                 }
@@ -268,26 +321,24 @@ impl App {
     pub fn expandable_targets(&self) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         for (bi, block) in self.blocks.iter().enumerate() {
-            match block {
-                Block::Steps(g) => {
-                    out.push((bi, usize::MAX));
-                    for (si, item) in g.steps.iter().enumerate() {
-                        match item {
-                            StepItem::Step(step) => {
-                                if matches!(
-                                    step.view.detail,
-                                    Some(Detail::Diff { .. }) | Some(Detail::Output { .. })
-                                ) {
-                                    out.push((bi, si));
-                                }
-                            }
-                            StepItem::Thought { .. } | StepItem::Narration { .. } => {
+            if let Block::Steps(g) = block {
+                out.push((bi, usize::MAX));
+                for (si, item) in g.steps.iter().enumerate() {
+                    match item {
+                        StepItem::Step(step) => {
+                            if matches!(
+                                step.view.detail,
+                                Some(Detail::Diff { .. }) | Some(Detail::Output { .. })
+                            ) {
                                 out.push((bi, si));
                             }
                         }
+                        StepItem::Thought { .. } | StepItem::Narration { .. } => {
+                            out.push((bi, si));
+                        }
+                        StepItem::Remembered(_) => {}
                     }
                 }
-                _ => {}
             }
         }
         out
@@ -337,6 +388,7 @@ impl App {
                     *expand = expand.next();
                     true
                 }
+                Some(StepItem::Remembered(_)) => false,
                 None => false,
             },
             _ => false,
@@ -456,6 +508,10 @@ impl App {
                 drop(index);
                 if self.input.completion.is_some() {
                     self.input.accept_selected();
+                } else if k.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.cycle_mode_rev();
+                } else {
+                    self.cycle_mode();
                 }
             }
             KeyCode::Esc => self.input.completion = None,
@@ -649,6 +705,26 @@ impl App {
         self.agent.set_mode_directive(sysprompt::mode_directive(m));
     }
 
+    /// Cycle the agent mode (Build -> Plan -> Auto -> Build) so it can be
+    /// switched from the keyboard, e.g. mid-prompt via Tab.
+    fn cycle_mode(&mut self) {
+        let next = match self.mode {
+            Mode::Build => Mode::Plan,
+            Mode::Plan => Mode::Auto,
+            Mode::Auto => Mode::Build,
+        };
+        self.apply_mode(next);
+    }
+
+    fn cycle_mode_rev(&mut self) {
+        let next = match self.mode {
+            Mode::Build => Mode::Auto,
+            Mode::Plan => Mode::Build,
+            Mode::Auto => Mode::Plan,
+        };
+        self.apply_mode(next);
+    }
+
     fn memory_view(&mut self, level: MemLevel) {
         let path = self.memory.level_path(level).to_path_buf();
         let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -696,6 +772,9 @@ impl App {
     }
 
     fn create_steps_group(&mut self) -> usize {
+        // Expanded by default: while a task runs the transcript shows the step
+        // headlines with a live "N steps" counter. The one task-wide group
+        // collapses to a compact "> N steps" header only at Finished.
         self.blocks.push(Block::Steps(StepsGroup {
             steps: Vec::new(),
             expanded: true,
@@ -725,7 +804,7 @@ impl App {
                 self.thinking_since = None;
                 let text = clean(&std::mem::take(&mut self.live_thought));
                 if !text.is_empty() {
-                    self.flush_narration();
+                    self.flush_narration(false);
                     self.push_step_item(StepItem::Thought {
                         text,
                         expand: Expand::Collapsed,
@@ -738,16 +817,26 @@ impl App {
                 self.live_narration.push_str(&clean(&text));
             }
             AgentEvent::TurnClosed => {
-                self.flush_narration();
+                // Remember whether this turn left any prose after its last tool
+                // call: only then is the concluding answer auto-visible. The
+                // final-turn promotion (if needed) happens at Finished.
+                //
+                // The step group is intentionally NOT collapsed or detached here.
+                // Per the UX spec the whole task collapses into ONE line on
+                // completion - not several nested sub-groups - so a task is a
+                // single group that stays expanded through every turn and only
+                // collapses to "> N steps" at Finished.
+                self.final_turn_had_post_prose = !self.live_narration.trim().is_empty();
+                self.flush_narration(true);
             }
             AgentEvent::Step(view) => {
                 self.live_step = None;
-                self.flush_narration();
+                self.flush_narration(false);
                 // A memory write is surfaced as `remembered:` entries rather than
                 // a generic file step, so durable facts read back cleanly.
                 if let Some(facts) = memory_facts(&self.memory, &self.cfg.project_root, &view) {
                     for fact in facts {
-                        self.blocks.push(Block::Remembered(clean(&fact)));
+                        self.push_step_item(StepItem::Remembered(clean(&fact)));
                     }
                     return;
                 }
@@ -756,9 +845,6 @@ impl App {
                     expand: Expand::Collapsed,
                 }));
             }
-            AgentEvent::Remembered { line } => {
-                self.blocks.push(Block::Remembered(clean(&line)));
-            }
             AgentEvent::Notice { text, level } => {
                 self.blocks.push(Block::Notice {
                     text: clean(&text),
@@ -766,10 +852,8 @@ impl App {
                 });
             }
             AgentEvent::AssistantText(text) => {
-                self.push_step_item(StepItem::Narration {
-                    text: clean(&text),
-                    expand: Expand::Collapsed,
-                });
+                // the concluding answer is shown verbatim, not folded into steps
+                self.blocks.push(Block::Assistant(clean(&text)));
             }
             AgentEvent::Usage { prompt_tokens, .. } => {
                 if prompt_tokens > 0 {
@@ -793,7 +877,24 @@ impl App {
                 self.live_step = Some((v.0.to_owned(), v.1));
             }
             AgentEvent::Finished(outcome) => {
-                self.flush_narration();
+                self.flush_narration(true);
+                // The final turn's answer: if it was written before the last
+                // verify step it sits folded as a Narration - promote it to a
+                // visible top-level answer so it is not hidden. Narration from
+                // earlier turns stays folded inside its own group.
+                if !self.final_turn_had_post_prose {
+                    if let Some((gi, si)) = self.last_said.take() {
+                        if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
+                            if let Some(StepItem::Narration { text, .. }) = g.steps.get(si) {
+                                let t = text.clone();
+                                g.steps.remove(si);
+                                self.blocks.push(Block::Assistant(t));
+                            }
+                        }
+                    }
+                }
+                self.last_said = None;
+                self.final_turn_had_post_prose = false;
                 self.thinking_since = None;
                 self.live_thought.clear();
                 self.live_step = None;
@@ -836,13 +937,30 @@ impl App {
         }
     }
 
-    fn flush_narration(&mut self) {
+    /// Flush accumulated assistant prose. Intermediate narration (mid-turn) is
+    /// folded into the step group as a collapsed item; the concluding answer is
+    /// shown verbatim as its own block so the agent is never left silent.
+    fn flush_narration(&mut self, final_answer: bool) {
         let text = std::mem::take(&mut self.live_narration);
-        if !text.trim().is_empty() {
+        if text.trim().is_empty() {
+            return;
+        }
+        if final_answer {
+            // the turn's concluding answer is shown verbatim, never folded away
+            self.blocks.push(Block::Assistant(text));
+        } else {
+            // interim prose is folded into the current step group as a collapsed
+            // Narration; remember its slot so Finished can promote it to a
+            // visible top-level answer if the final turn ended without post-step prose
             self.push_step_item(StepItem::Narration {
-                text,
+                text: text.clone(),
                 expand: Expand::Collapsed,
             });
+            if let Some(gi) = self.steps_group_idx {
+                if let Some(Block::Steps(g)) = self.blocks.get(gi) {
+                    self.last_said = Some((gi, g.steps.len() - 1));
+                }
+            }
         }
     }
 
@@ -946,15 +1064,12 @@ fn parse_mode(s: &str) -> Option<Mode> {
     }
 }
 
-
-/// If a step mutates a known memory file, return the newly recorded
-/// `- fact` lines (excluding ones already stored) so they can be shown as
-/// `remembered:` entries instead of a generic write/edit step.
-fn memory_facts(
-    memory: &Memory,
-    root: &std::path::Path,
-    view: &StepView,
-) -> Option<Vec<String>> {
+/// If a step mutates a known memory file, return the recorded `- fact`
+/// lines so they can be shown as `remembered:` entries instead of a generic
+/// write/edit step. Every added fact line is surfaced - the diff already
+/// contains only what changed, so re-reading the file (which now includes the
+/// fact) must not be used to filter additions out.
+fn memory_facts(memory: &Memory, root: &std::path::Path, view: &StepView) -> Option<Vec<String>> {
     match view.verb {
         Verb::Wrote | Verb::Deleted | Verb::Renamed => {}
         _ => return None,
@@ -964,9 +1079,7 @@ fn memory_facts(
     } else {
         root.join(&view.arg)
     };
-    let level = memory.path_level(&candidate)?;
-    let existing: std::collections::HashSet<String> =
-        Memory::entries(&memory.read_level(level)).into_iter().collect();
+    let _ = memory.path_level(&candidate)?;
     let Detail::Diff { lines, .. } = view.detail.as_ref()? else {
         return None;
     };
@@ -975,7 +1088,7 @@ fn memory_facts(
         if l.sign == '+' {
             if let Some(fact) = l.text.trim().strip_prefix("- ") {
                 let fact = fact.trim().to_string();
-                if !fact.is_empty() && !existing.contains(&fact) {
+                if !fact.is_empty() {
                     facts.push(fact);
                 }
             }
@@ -1164,7 +1277,14 @@ mod memory_step_tests {
             memory.clone(),
             Default::default(),
         ));
-        App::new(cfg, agent, memory, root.join("hist"), root.join("sessions"), None)
+        App::new(
+            cfg,
+            agent,
+            memory,
+            root.join("hist"),
+            root.join("sessions"),
+            None,
+        )
     }
 
     #[test]
@@ -1177,7 +1297,7 @@ mod memory_step_tests {
 
         app.on_agent_event(AgentEvent::Step(StepView {
             verb: Verb::Wrote,
-            arg: mem_path,
+            arg: mem_path.clone(),
             detail: Some(Detail::Diff {
                 lines: vec![crate::diffgen::DiffLine {
                     sign: '+',
@@ -1187,15 +1307,38 @@ mod memory_step_tests {
             }),
         }));
 
+        // The memory write surfaces as a `remembered:` step INSIDE the step
+        // group (counted in the summary), not as a floating top-level block and
+        // not as a generic wrote step.
+        let remembered: Vec<String> = app
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Steps(g) => Some(
+                    g.steps
+                        .iter()
+                        .filter_map(|s| match s {
+                            StepItem::Remembered(f) => Some(f.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         assert!(
-            app.blocks
-                .iter()
-                .any(|b| matches!(b, Block::Remembered(f) if f.contains("adds two numbers"))),
-            "memory write must surface as remembered:"
+            remembered.iter().any(|f| f.contains("adds two numbers")),
+            "memory write must surface as remembered inside the step group"
         );
         assert!(
-            !app.blocks.iter().any(|b| matches!(b, Block::Steps(_))),
-            "memory write must not be a generic step"
+            !app.blocks.iter().any(|b| match b {
+                Block::Steps(g) => g.steps.iter().any(|s| {
+                    matches!(s, StepItem::Step(st) if matches!(st.view.verb, Verb::Wrote) && st.view.arg == mem_path)
+                }),
+                _ => false,
+            }),
+            "memory write must not be a generic wrote step"
         );
 
         // a non-memory file write stays a normal step
@@ -1205,24 +1348,31 @@ mod memory_step_tests {
             detail: None,
         }));
         assert!(
-            app.blocks.iter().any(|b| matches!(b, Block::Steps(_))),
+            app.blocks.iter().any(|b| matches!(b, Block::Steps(g) if g
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s, StepItem::Step(_))))),
             "non-memory write stays a step"
         );
     }
 
     #[test]
-    fn memory_write_skips_already_stored_facts() {
+    fn memory_write_shows_every_added_fact_line() {
         let root = std::env::temp_dir().join(format!("few-mem-{}-{}", std::process::id(), "b"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let mut app = app_with(root.clone());
         let mem_path = app.memory.project_path.to_string_lossy().to_string();
         let _ = std::fs::create_dir_all(app.memory.project_path.parent().unwrap());
-        std::fs::write(&app.memory.project_path, "# Few memory\n\n- already known fact\n").unwrap();
+        std::fs::write(
+            &app.memory.project_path,
+            "# Few memory\n\n- already known fact\n",
+        )
+        .unwrap();
 
         app.on_agent_event(AgentEvent::Step(StepView {
             verb: Verb::Wrote,
-            arg: mem_path,
+            arg: mem_path.clone(),
             detail: Some(Detail::Diff {
                 lines: vec![
                     crate::diffgen::DiffLine {
@@ -1242,17 +1392,154 @@ mod memory_step_tests {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                Block::Remembered(f) => Some(f.clone()),
+                Block::Steps(g) => Some(
+                    g.steps
+                        .iter()
+                        .filter_map(|s| match s {
+                            StepItem::Remembered(f) => Some(f.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             })
+            .flatten()
             .collect();
+        // Every added `- fact` line is surfaced immediately as `remembered:`
+        // (the diff already carries only what changed, so we never filter by
+        // the now-updated file content).
         assert!(
             remembered.iter().any(|f| f.contains("brand new fact")),
             "new fact shown"
         );
         assert!(
-            !remembered.iter().any(|f| f.contains("already known")),
-            "already-stored fact not repeated"
+            remembered.iter().any(|f| f.contains("already known")),
+            "added fact line shown even if the same text was already in the file"
+        );
+    }
+
+    #[test]
+    fn memory_write_surfaces_fact_even_after_file_updated() {
+        // Mirrors the real run: the agent writes the memory file (so it already
+        // contains the fact) and then reports the write via a relative arg + a
+        // diff. The memory-fact display must not read the now-updated file to
+        // filter the addition out.
+        let root = std::env::temp_dir().join(format!("few-mem-{}-{}", std::process::id(), "c"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        let mem_path = app.memory.project_path.clone();
+        std::fs::create_dir_all(mem_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mem_path,
+            "# Few memory\n\n- fact: greet.py is a greeting module\n",
+        )
+        .unwrap();
+
+        app.on_agent_event(AgentEvent::Step(StepView {
+            verb: Verb::Wrote,
+            arg: ".few/memory/project.md".into(),
+            detail: Some(Detail::Diff {
+                lines: vec![crate::diffgen::DiffLine {
+                    sign: '+',
+                    text: "- fact: greet.py is a greeting module".into(),
+                }],
+                capped_at: None,
+            }),
+        }));
+
+        let remembered: Vec<String> = app
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Steps(g) => Some(
+                    g.steps
+                        .iter()
+                        .filter_map(|s| match s {
+                            StepItem::Remembered(f) => Some(f.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            remembered.iter().any(|f| f.contains("greet.py")),
+            "memory write must surface as remembered inside the step group even when the file already holds the fact"
+        );
+        assert!(
+            !app.blocks.iter().any(|b| match b {
+                Block::Steps(g) => g.steps.iter().any(|s| {
+                    matches!(s, StepItem::Step(st) if matches!(st.view.verb, Verb::Wrote) && st.view.arg == ".few/memory/project.md")
+                }),
+                _ => false,
+            }),
+            "memory write must not be a generic wrote step"
+        );
+    }
+
+    #[test]
+    fn final_answer_shows_as_visible_block() {
+        let root = std::env::temp_dir().join(format!("few-ans-{}-{}", std::process::id(), "c"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root);
+
+        app.on_agent_event(AgentEvent::AssistantDelta {
+            text: "Готово: создал greet.py и записал факт в память".into(),
+        });
+        app.on_agent_event(AgentEvent::TurnClosed);
+
+        assert!(
+            app.blocks
+                .iter()
+                .any(|b| matches!(b, Block::Assistant(f) if f.contains("Готово"))),
+            "final answer must be a visible Assistant block, not folded away"
+        );
+        assert!(
+            !app.blocks.iter().any(|b| matches!(b, Block::Steps(g) if g
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s, StepItem::Narration { .. })))),
+            "final answer must not be a collapsed Narration inside steps"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_before_final_step_is_promoted_to_visible() {
+        let root = std::env::temp_dir().join(format!("few-ans2-{}-{}", std::process::id(), "c"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root);
+
+        // model writes the answer, then runs a verification step - the answer
+        // prose is folded as a Narration at that step, so Finished must promote
+        // it to a visible top-level answer rather than hiding it
+        app.on_agent_event(AgentEvent::AssistantDelta {
+            text: "Файл уже существует и корректен".into(),
+        });
+        app.on_agent_event(AgentEvent::Step(StepView {
+            verb: Verb::Ran,
+            arg: "python3 -m py_compile greet.py".into(),
+            detail: None,
+        }));
+        app.on_agent_event(AgentEvent::TurnClosed);
+        app.on_agent_event(AgentEvent::Finished(TaskOutcome::Done));
+
+        assert!(
+            app.blocks
+                .iter()
+                .any(|b| matches!(b, Block::Assistant(f) if f.contains("Файл уже существует"))),
+            "answer written before the final step must be promoted to a visible Assistant block"
+        );
+        assert!(
+            !app.blocks.iter().any(|b| matches!(b, Block::Steps(g) if g
+                .steps
+                .iter()
+                .any(|s| matches!(s, StepItem::Narration { text, .. } if text.contains("Файл уже существует"))))),
+            "promoted answer must not remain a collapsed Narration"
         );
     }
 }
