@@ -29,7 +29,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn init() -> anyhow::Result<Self> {
-        let pd = directories::ProjectDirs::from("", "", "keiko")
+        let pd = directories::ProjectDirs::from("", "", "few")
             .ok_or_else(|| anyhow::anyhow!("cannot determine user directories"))?;
         std::fs::create_dir_all(pd.config_dir())?;
         std::fs::create_dir_all(pd.data_dir())?;

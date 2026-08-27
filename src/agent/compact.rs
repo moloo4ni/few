@@ -97,7 +97,7 @@ fn round_starts(convo: &[Msg]) -> Vec<usize> {
 
 fn render_note(steps: &[String]) -> String {
     let mut note = String::from(
-        "[keiko context compacted]\n\
+        "[few context compacted]\n\
          Older steps of this conversation were folded to save context window;\n\
          their outputs are gone. Re-read files or re-run commands if needed:\n",
     );
@@ -191,7 +191,7 @@ mod tests {
         let (out, _) = compact(sample_convo());
         let notes: Vec<&Msg> = out
             .iter()
-            .filter(|m| m.content.starts_with("[keiko context compacted]"))
+            .filter(|m| m.content.starts_with("[few context compacted]"))
             .collect();
         assert_eq!(notes.len(), 1, "exactly one shared note");
         let note = notes[0].content.clone();
@@ -207,7 +207,7 @@ mod tests {
         // note sits right before the tail
         let note_pos = out
             .iter()
-            .position(|m| m.content.starts_with("[keiko"))
+            .position(|m| m.content.starts_with("[few"))
             .unwrap();
         assert_eq!(out[note_pos + 1].content, "task three");
     }

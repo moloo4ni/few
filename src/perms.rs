@@ -83,6 +83,8 @@ pub struct PermEngine {
     sensitive: Gitignore,
     granted: BTreeMap<String, String>,
     session: HashSet<(Capability, String)>,
+    base_write: Policy,
+    base_shell: Policy,
     write_policy: Policy,
     shell_policy: Policy,
 }
@@ -101,6 +103,8 @@ impl PermEngine {
         root: PathBuf,
         extra_sensitive: Vec<String>,
         granted: BTreeMap<String, String>,
+        base_write: Policy,
+        base_shell: Policy,
     ) -> Self {
         let mut lines: Vec<String> = BUILTIN_SENSITIVE.iter().map(|s| s.to_string()).collect();
         lines.extend(extra_sensitive);
@@ -119,27 +123,21 @@ impl PermEngine {
             sensitive: matcher,
             granted,
             session: HashSet::new(),
-            write_policy: Policy::Ask,
-            shell_policy: Policy::Ask,
+            base_write,
+            base_shell,
+            write_policy: base_write,
+            shell_policy: base_shell,
         }
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
         let (w, s) = match mode {
             Mode::Plan => (Policy::Deny, Policy::Deny),
-            Mode::Build => (Policy::Ask, Policy::Ask),
+            Mode::Build => (self.base_write, self.base_shell),
             Mode::Auto => (Policy::Allow, Policy::Allow),
         };
         self.write_policy = w;
         self.shell_policy = s;
-    }
-
-    pub fn mode_policies(mode: Mode) -> (Policy, Policy) {
-        match mode {
-            Mode::Plan => (Policy::Deny, Policy::Deny),
-            Mode::Build => (Policy::Ask, Policy::Ask),
-            Mode::Auto => (Policy::Allow, Policy::Allow),
-        }
     }
 
     pub fn target_key(&self, path: &Path) -> String {
@@ -313,7 +311,13 @@ mod tests {
     use super::*;
 
     fn engine(extra: Vec<String>) -> PermEngine {
-        PermEngine::new(PathBuf::from("/proj"), extra, Default::default())
+        PermEngine::new(
+            PathBuf::from("/proj"),
+            extra,
+            Default::default(),
+            Policy::Ask,
+            Policy::Ask,
+        )
     }
 
     #[test]
