@@ -67,6 +67,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Min(0),
         Constraint::Length(busy_rows),
         Constraint::Length(pal_rows),
+        Constraint::Length(1), // blank line above the input area
         Constraint::Length(input_h),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -128,14 +129,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         render_palette(f, chunks[2], items, app.palette_sel);
     }
 
-    render_input(f, chunks[3], app, input_rows);
+    render_input(f, chunks[4], app, input_rows);
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled("─".repeat(width), theme::dim()))),
-        chunks[4],
+        chunks[5],
     );
 
-    render_status(f, chunks[5], app);
+    render_status(f, chunks[6], app);
 }
 
 fn render_status(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
