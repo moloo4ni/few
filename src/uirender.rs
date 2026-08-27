@@ -2,7 +2,7 @@ use crate::agent::NoticeLevel;
 use crate::app::{label_mode, App};
 use crate::commands::{arg_options, filter_commands, find_command};
 use crate::theme;
-use crate::transcript::{Block, Expand, Hit, PERM_OPTIONS};
+use crate::transcript::{Block, Expand, Hit, PERM_OPTIONS, StepItem};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -420,29 +420,89 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             rows.push((vec![], Hit::Nothing));
         }
         match block {
-            Block::User(text) | Block::Assistant(text) | Block::LiveAssistant(text) => {
+            Block::User(text) => {
                 push_wrapped_text(&mut rows, text, theme::normal(), width, Hit::Nothing);
             }
-            Block::Thought {
-                dur_ms,
-                text,
-                expand,
-            } => {
-                let secs = dur_ms / 1000;
-                let marker = if *expand == Expand::Collapsed {
-                    '>'
-                } else {
-                    'v'
-                };
-                rows.push((
-                    vec![(
-                        format!("{marker} thought {secs}s"),
-                        mark(theme::dim(), focused(bi, usize::MAX)),
-                    )],
-                    Hit::Block(bi),
-                ));
-                if *expand != Expand::Collapsed {
-                    push_indented(&mut rows, text, theme::dim(), width, 2);
+            Block::Steps(group) => {
+                let marker = if group.expanded { 'v' } else { '>' };
+                push_wrapped_text(
+                    &mut rows,
+                    &format!("{marker} {}", group.summary()),
+                    mark(theme::dim(), focused(bi, usize::MAX)),
+                    width,
+                    Hit::Step(bi, usize::MAX),
+                );
+                if group.expanded {
+                    for (si, item) in group.steps.iter().enumerate() {
+                        match item {
+                            StepItem::Step(step) => {
+                                let style = match step.view.verb.word() {
+                                    "failed" | "error" => theme::red(),
+                                    "denied" => theme::amber(),
+                                    _ => theme::dim(),
+                                };
+                                push_wrapped_text(
+                                    &mut rows,
+                                    &format!("  {}", step.headline()),
+                                    mark(style, focused(bi, si)),
+                                    width,
+                                    Hit::Step(bi, si),
+                                );
+                                if step.expand != Expand::Collapsed {
+                                    for dr in step.detail_rows(cap) {
+                                        let dstyle = if dr.starts_with('+') {
+                                            theme::green()
+                                        } else if dr.starts_with('-') {
+                                            theme::red()
+                                        } else {
+                                            theme::dim()
+                                        };
+                                        push_wrapped_text(
+                                            &mut rows,
+                                            &format!("    {dr}"),
+                                            dstyle,
+                                            width,
+                                            Hit::Step(bi, si),
+                                        );
+                                    }
+                                }
+                            }
+                            StepItem::Thought { text, expand } => {
+                                let tm = if *expand == Expand::Collapsed {
+                                    '>'
+                                } else {
+                                    'v'
+                                };
+                                push_wrapped_text(
+                                    &mut rows,
+                                    &format!("  {tm} thought"),
+                                    mark(theme::dim(), focused(bi, si)),
+                                    width,
+                                    Hit::Step(bi, si),
+                                );
+                                if *expand != Expand::Collapsed {
+                                    push_indented(&mut rows, text, theme::dim(), width, 4);
+                                }
+                            }
+                            StepItem::Narration { text, expand } => {
+                                let nm = if *expand == Expand::Collapsed {
+                                    '>'
+                                } else {
+                                    'v'
+                                };
+                                push_wrapped_text(
+                                    &mut rows,
+                                    &format!("  {nm} said"),
+                                    mark(theme::dim(), focused(bi, si)),
+                                    width,
+                                    Hit::Step(bi, si),
+                                );
+                                if *expand != Expand::Collapsed {
+                                    push_indented(&mut rows, text, theme::dim(), width, 4);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Block::Remembered(line) => {
@@ -500,50 +560,6 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                     }
                 }
             },
-            Block::Steps(group) => {
-                let marker = if group.expanded { 'v' } else { '>' };
-                push_wrapped_text(
-                    &mut rows,
-                    &format!("{marker} {}", group.summary()),
-                    mark(theme::dim(), focused(bi, usize::MAX)),
-                    width,
-                    Hit::Step(bi, usize::MAX),
-                );
-                if group.expanded {
-                    for (si, step) in group.steps.iter().enumerate() {
-                        let style = match step.view.verb.word() {
-                            "failed" | "error" => theme::red(),
-                            "denied" => theme::amber(),
-                            _ => theme::dim(),
-                        };
-                        push_wrapped_text(
-                            &mut rows,
-                            &format!("  {}", step.headline()),
-                            mark(style, focused(bi, si)),
-                            width,
-                            Hit::Step(bi, si),
-                        );
-                        if step.expand != Expand::Collapsed {
-                            for dr in step.detail_rows(cap) {
-                                let dstyle = if dr.starts_with('+') {
-                                    theme::green()
-                                } else if dr.starts_with('-') {
-                                    theme::red()
-                                } else {
-                                    theme::dim()
-                                };
-                                push_wrapped_text(
-                                    &mut rows,
-                                    &format!("    {dr}"),
-                                    dstyle,
-                                    width,
-                                    Hit::Step(bi, si),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -600,7 +616,7 @@ mod tests {
     use crate::memory::Memory;
     use crate::perms::{Mode, PermEngine, Policy};
     use crate::providers::openai::OpenAiProvider;
-    use crate::transcript::{PermAskBlock, StepBlock, StepsGroup};
+    use crate::transcript::{PermAskBlock, StepBlock, StepItem, StepsGroup};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -683,30 +699,30 @@ mod tests {
         let mut app = test_app("steps");
         app.blocks.push(Block::Steps(StepsGroup {
             steps: vec![
-                StepBlock {
+                StepItem::Step(StepBlock {
                     view: crate::agent::StepView {
                         verb: crate::agent::Verb::Read,
                         arg: "README.md".into(),
                         detail: None,
                     },
                     expand: Expand::Collapsed,
-                },
-                StepBlock {
+                }),
+                StepItem::Step(StepBlock {
                     view: crate::agent::StepView {
                         verb: crate::agent::Verb::Failed,
                         arg: "cargo test".into(),
                         detail: None,
                     },
                     expand: Expand::Collapsed,
-                },
-                StepBlock {
+                }),
+                StepItem::Step(StepBlock {
                     view: crate::agent::StepView {
                         verb: crate::agent::Verb::Ran,
                         arg: "cargo build".into(),
                         detail: None,
                     },
                     expand: Expand::Collapsed,
-                },
+                }),
             ],
             expanded: false,
             outcome: Some(crate::agent::TaskOutcome::Done),
@@ -718,14 +734,6 @@ mod tests {
             !joined.contains("README.md"),
             "collapsed group must hide step args"
         );
-    }
-
-    fn thought_block(dur_ms: u64) -> Block {
-        Block::Thought {
-            dur_ms,
-            text: "considering options".into(),
-            expand: Expand::Collapsed,
-        }
     }
 
     fn step_with_diff(arg: &str) -> StepBlock {
@@ -748,36 +756,47 @@ mod tests {
     #[test]
     fn expandable_targets_in_visual_order() {
         let mut app = test_app("targets");
-        app.blocks.push(thought_block(1500));
-        let mut group = StepsGroup {
-            steps: vec![step_with_diff("a.txt")],
+        // one turn group: a thought, a diff-capable write step, and a ran
+        // step whose Message detail does not respect Expand
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![
+                StepItem::Thought {
+                    text: "considering options".into(),
+                    expand: Expand::Collapsed,
+                },
+                StepItem::Step(step_with_diff("a.txt")),
+                StepItem::Step(StepBlock {
+                    view: crate::agent::StepView {
+                        verb: crate::agent::Verb::Ran,
+                        arg: "cargo fmt".into(),
+                        detail: Some(crate::agent::Detail::Message("ok".into())),
+                    },
+                    expand: Expand::Collapsed,
+                }),
+            ],
             expanded: false,
             outcome: None,
-        };
-        group.steps.push(StepBlock {
-            view: crate::agent::StepView {
-                verb: crate::agent::Verb::Ran,
-                arg: "cargo fmt".into(),
-                detail: Some(crate::agent::Detail::Message("ok".into())),
-            },
-            expand: Expand::Collapsed,
-        });
-        app.blocks.push(Block::Steps(group));
+        }));
 
-        // thought header, group header, diff-capable step only
+        // group header, thought item, diff-capable step only
         // (Message detail does not respect Expand, so it is not a target)
         assert_eq!(
             app.expandable_targets(),
-            vec![(0, usize::MAX), (1, usize::MAX), (1, 0)]
+            vec![(0, usize::MAX), (0, 0), (0, 1)]
         );
     }
 
     #[test]
     fn focus_moves_wraps_and_space_toggles() {
         let mut app = test_app("focus");
-        app.blocks.push(thought_block(1500));
         app.blocks.push(Block::Steps(StepsGroup {
-            steps: vec![step_with_diff("a.txt")],
+            steps: vec![
+                StepItem::Thought {
+                    text: "considering options".into(),
+                    expand: Expand::Collapsed,
+                },
+                StepItem::Step(step_with_diff("a.txt")),
+            ],
             expanded: false,
             outcome: None,
         }));
@@ -785,21 +804,22 @@ mod tests {
         app.move_focus(true);
         assert_eq!(app.focus, Some((0, usize::MAX)));
         app.move_focus(false);
-        assert_eq!(app.focus, Some((1, 0)), "wraps backwards to last target");
+        assert_eq!(app.focus, Some((0, 1)), "wraps backwards to last target");
 
-        app.focus = Some((1, usize::MAX));
+        app.focus = Some((0, usize::MAX));
         assert!(app.toggle_focused());
-        match &app.blocks[1] {
+        match &app.blocks[0] {
             Block::Steps(g) => assert!(g.expanded, "space on group headline expands it"),
             _ => panic!("expected steps block"),
         }
 
-        app.focus = Some((1, 0));
+        app.focus = Some((0, 1));
         assert!(app.toggle_focused());
-        match &app.blocks[1] {
-            Block::Steps(g) => {
-                assert_eq!(g.steps[0].expand, Expand::Shown);
-            }
+        match &app.blocks[0] {
+            Block::Steps(g) => match &g.steps[1] {
+                StepItem::Step(s) => assert_eq!(s.expand, Expand::Shown),
+                _ => panic!("expected step item"),
+            },
             _ => panic!("expected steps block"),
         }
     }
@@ -864,7 +884,7 @@ mod tests {
         let mut app = test_app("wide-detail");
         let long_out = format!("out-{}", "x".repeat(120));
         app.blocks.push(Block::Steps(StepsGroup {
-            steps: vec![StepBlock {
+            steps: vec![StepItem::Step(StepBlock {
                 view: crate::agent::StepView {
                     verb: crate::agent::Verb::Ran,
                     arg: "cmd".into(),
@@ -875,7 +895,7 @@ mod tests {
                     }),
                 },
                 expand: Expand::Shown,
-            }],
+            })],
             expanded: true,
             outcome: None,
         }));
@@ -933,20 +953,34 @@ mod tests {
     #[test]
     fn mouse_click_on_thought_toggles() {
         let mut app = test_app("thought-click");
-        app.blocks.push(thought_block(1500));
+        // expanded group so the folded thought item is rendered and clickable
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![
+                StepItem::Thought {
+                    text: "considering options".into(),
+                    expand: Expand::Collapsed,
+                },
+                StepItem::Step(step_with_diff("a.txt")),
+            ],
+            expanded: true,
+            outcome: None,
+        }));
         render(&mut app, 60, 12); // builds the hitmap
-        // bottom-anchored: the single block sits at the last transcript row, not row 0
+        // the thought is the first item inside the group (after the header)
         let row = app
             .hitmap
             .iter()
-            .position(|hit| *hit == Hit::Block(0))
+            .position(|hit| *hit == Hit::Step(0, 0))
             .expect("thought hit present");
         app.on_click(row as u16); // click the thought header wherever it landed
         match &app.blocks[0] {
-            Block::Thought { expand, .. } => {
-                assert!(*expand != Expand::Collapsed, "click must unfold thought");
-            }
-            _ => panic!("expected thought block"),
+            Block::Steps(g) => match &g.steps[0] {
+                StepItem::Thought { expand, .. } => {
+                    assert!(*expand != Expand::Collapsed, "click must unfold thought");
+                }
+                _ => panic!("expected thought item"),
+            },
+            _ => panic!("expected steps block"),
         }
     }
 }
