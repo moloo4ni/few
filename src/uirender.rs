@@ -303,7 +303,7 @@ fn push_input_char(rows: &mut Vec<Vec<Seg>>, row_w: &mut usize, c: char, st: Sty
 }
 
 fn placeholder_text() -> &'static str {
-    "ask keiko anything · / commands · shift+enter newline"
+    "ask few anything · / commands · shift+enter newline"
 }
 
 fn render_palette(f: &mut Frame, area: ratatui::layout::Rect, items: &[String], sel: usize) {
@@ -580,27 +580,29 @@ mod tests {
     use crate::app::App;
     use crate::config::Config;
     use crate::memory::Memory;
-    use crate::perms::{Mode, PermEngine};
+    use crate::perms::{Mode, PermEngine, Policy};
     use crate::providers::openai::OpenAiProvider;
     use crate::transcript::{PermAskBlock, StepBlock, StepsGroup};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     fn test_app(tag: &str) -> App {
-        let root = std::env::temp_dir().join(format!("keiko-ui-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("few-ui-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let cfg = Arc::new(Config {
             model: "test-model".into(),
             context_window: 200_000,
             project_root: root.clone(),
-            project_config_path: root.join(".keiko/config.toml"),
+            project_config_path: root.join(".few/config.toml"),
             ..Default::default()
         });
         let perms = Arc::new(Mutex::new(PermEngine::new(
             root.clone(),
             vec![],
             Default::default(),
+            Policy::Ask,
+            Policy::Ask,
         )));
         let memory = Memory::new(&root, &root.join(".data"));
         let provider = OpenAiProvider::new("http://127.0.0.1:9/v1", None, "test-model").unwrap();
@@ -655,7 +657,7 @@ mod tests {
         let sep = char::from_u32(0x2500).unwrap().to_string().repeat(80);
         assert_eq!(rows[8], sep, "thin separator above status bar");
         let joined = rows.join("\n");
-        assert!(joined.contains("ask keiko anything"), "{joined:?}");
+        assert!(joined.contains("ask few anything"), "{joined:?}");
     }
 
     #[test]

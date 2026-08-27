@@ -1,10 +1,10 @@
 [package]
-name = "keiko"
+name = "few"
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-description = "Autonomous terminal coding agent"
-repository = "https://github.com/nikit/keiko"
+description = "A small, fast autonomous terminal coding agent"
+repository = "https://github.com/moloo4ni/few"
 rust-version = "1.85"
 
 [dependencies]

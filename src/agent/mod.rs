@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-const ABORT: &str = "\u{0}__keiko_aborted__";
+const ABORT: &str = "\u{0}__few_aborted__";
 const SOFT_NOTE: &str = "[user pressed Ctrl+C: the current operation was stopped at a safe point]";
 
 #[derive(Debug, Clone)]
@@ -397,7 +397,7 @@ impl<P: Provider> Agent<P> {
                                 let sig = verify::error_signature(&verify_tail);
                                 let exhausted = tracker.record_failure(&sig);
                                 self.push_convo(Msg::user(format!(
-                                    "[keiko verify] `{}` failed:\n\n{}\n\n{}",
+                                    "[few verify] `{}` failed:\n\n{}\n\n{}",
                                     plan.command,
                                     tools::cap_for_model(&verify_tail, 4000),
                                     if exhausted {
@@ -527,7 +527,7 @@ pub fn system_prompt(layers: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perms::Mode;
+    use crate::perms::{Mode, Policy};
     use crate::providers::ToolCall;
     use crate::providers::{ToolDef, Usage};
     use std::path::PathBuf;
@@ -598,7 +598,7 @@ mod tests {
     fn test_cfg(root: &std::path::Path) -> Arc<Config> {
         Arc::new(Config {
             project_root: root.to_path_buf(),
-            project_config_path: root.join(".keiko/config.toml"),
+            project_config_path: root.join(".few/config.toml"),
             retry_threshold: 2,
             ..Default::default()
         })
@@ -609,6 +609,8 @@ mod tests {
             root.to_path_buf(),
             vec![],
             Default::default(),
+            Policy::Ask,
+            Policy::Ask,
         )));
         PermEngine::lock(&perms).set_mode(Mode::Auto);
         let mem = Memory::new(root, &root.join(".data"));
@@ -616,7 +618,7 @@ mod tests {
     }
 
     fn temp_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("keiko-agent-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("few-agent-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -714,7 +716,7 @@ mod tests {
         let notes = agent
             .snapshot_convo()
             .iter()
-            .filter(|m| m.role == Role::User && m.content.contains("[keiko verify]"))
+            .filter(|m| m.role == Role::User && m.content.contains("[few verify]"))
             .count();
         assert_eq!(
             notes, 2,
@@ -787,7 +789,7 @@ mod tests {
         let out = agent.snapshot_convo();
         assert!(
             out.iter()
-                .any(|m| m.content.starts_with("[keiko context compacted]")),
+                .any(|m| m.content.starts_with("[few context compacted]")),
             "compaction note must appear"
         );
         assert!(out.iter().any(|m| m.content == "follow-up 2"));

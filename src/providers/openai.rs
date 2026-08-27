@@ -130,10 +130,10 @@ impl OpenAiProvider {
     }
 
     pub async fn probe_tool_calling(&self) -> ProbeOutcome {
-        let msgs = [Msg::user("Call the keiko_probe tool immediately.")];
+        let msgs = [Msg::user("Call the few_probe tool immediately.")];
         let tools = [ToolDef {
-            name: "keiko_probe",
-            description: "no-op probe used by Keiko at startup",
+            name: "few_probe",
+            description: "no-op probe used by Few at startup",
             parameters: json!({"type": "object", "properties": {}, "required": []}),
         }];
 

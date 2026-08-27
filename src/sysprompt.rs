@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn project_layer_lists_entries() {
-        let dir = std::env::temp_dir().join(format!("keiko-sysprompt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("few-sysprompt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "").unwrap();

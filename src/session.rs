@@ -192,7 +192,7 @@ mod tests {
             .unwrap()
             .as_millis();
         let d =
-            std::env::temp_dir().join(format!("keiko-session-{tag}-{}-{ms}", std::process::id()));
+            std::env::temp_dir().join(format!("few-session-{tag}-{}-{ms}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
