@@ -1,4 +1,4 @@
-use crate::agent::{Agent, AgentEvent, Detail, NoticeLevel, StepView, TaskOutcome};
+use crate::agent::{Agent, AgentEvent, Detail, NoticeLevel, StepView, TaskOutcome, Verb};
 use crate::commands::{find_command, ArgKind};
 use crate::config::Config;
 use crate::inputline::InputState;
@@ -9,7 +9,7 @@ use crate::providers::Provider as _;
 use crate::sysprompt;
 use crate::tools::Ctl;
 
-use crate::transcript::{Block, Expand, Hit, PermAskBlock, StepBlock, StepsGroup, PERM_OPTIONS};
+use crate::transcript::{Block, Expand, Hit, PermAskBlock, StepBlock, StepItem, StepsGroup, PERM_OPTIONS};
 use crate::ui_text::clean;
 use crate::uirender;
 use anyhow::Context as _;
@@ -62,7 +62,7 @@ pub struct App {
     sessions_dir: PathBuf,
     /// session identity, updated by background saves (serialized by the mutex)
     session: Arc<std::sync::Mutex<Option<crate::session::SessionRef>>>,
-    live_text_idx: Option<usize>,
+    live_narration: String,
     live_thought: String,
     /// action currently executing, shown in present tense until its final step arrives
     pub live_step: Option<(String, String)>,
@@ -121,7 +121,7 @@ impl App {
             session: Arc::new(std::sync::Mutex::new(
                 resume.as_ref().and_then(|(r, _)| r.clone()),
             )),
-            live_text_idx: None,
+            live_narration: String::new(),
             live_thought: String::new(),
             live_step: None,
             file_index: Arc::new(Mutex::new(Vec::new())),
@@ -237,12 +237,6 @@ impl App {
         };
         match hit {
             Hit::Nothing => {}
-            Hit::Block(bi) => {
-                // only thought headers are toggleable via Hit::Block
-                if let Some(Block::Thought { expand, .. }) = self.blocks.get_mut(bi) {
-                    *expand = expand.next();
-                }
-            }
             Hit::Step(bi, usize::MAX) => {
                 if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
                     g.expanded = !g.expanded;
@@ -250,8 +244,13 @@ impl App {
             }
             Hit::Step(bi, si) => {
                 if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
-                    if let Some(s) = g.steps.get_mut(si) {
-                        s.expand = s.expand.next();
+                    match g.steps.get_mut(si) {
+                        Some(StepItem::Step(s)) => s.expand = s.expand.next(),
+                        Some(StepItem::Thought { expand, .. })
+                        | Some(StepItem::Narration { expand, .. }) => {
+                            *expand = expand.next();
+                        }
+                        None => {}
                     }
                 }
             }
@@ -260,6 +259,7 @@ impl App {
                     self.resolve_ask(opt);
                 }
             }
+            Hit::Block(_) => {}
         }
     }
 
@@ -269,15 +269,21 @@ impl App {
         let mut out = Vec::new();
         for (bi, block) in self.blocks.iter().enumerate() {
             match block {
-                Block::Thought { .. } => out.push((bi, usize::MAX)),
                 Block::Steps(g) => {
                     out.push((bi, usize::MAX));
-                    for (si, s) in g.steps.iter().enumerate() {
-                        if matches!(
-                            s.view.detail,
-                            Some(Detail::Diff { .. }) | Some(Detail::Output { .. })
-                        ) {
-                            out.push((bi, si));
+                    for (si, item) in g.steps.iter().enumerate() {
+                        match item {
+                            StepItem::Step(step) => {
+                                if matches!(
+                                    step.view.detail,
+                                    Some(Detail::Diff { .. }) | Some(Detail::Output { .. })
+                                ) {
+                                    out.push((bi, si));
+                                }
+                            }
+                            StepItem::Thought { .. } | StepItem::Narration { .. } => {
+                                out.push((bi, si));
+                            }
                         }
                     }
                 }
@@ -317,17 +323,18 @@ impl App {
             return false;
         };
         match self.blocks.get_mut(bi) {
-            Some(Block::Thought { expand, .. }) if si == usize::MAX => {
-                *expand = expand.next();
-                true
-            }
             Some(Block::Steps(g)) if si == usize::MAX => {
                 g.expanded = !g.expanded;
                 true
             }
             Some(Block::Steps(g)) => match g.steps.get_mut(si) {
-                Some(s) => {
+                Some(StepItem::Step(s)) => {
                     s.expand = s.expand.next();
+                    true
+                }
+                Some(StepItem::Thought { expand, .. })
+                | Some(StepItem::Narration { expand, .. }) => {
+                    *expand = expand.next();
                     true
                 }
                 None => false,
@@ -714,49 +721,40 @@ impl App {
             AgentEvent::ThoughtDelta { text } => {
                 self.live_thought.push_str(&text);
             }
-            AgentEvent::ThinkingFinished { dur_ms } => {
+            AgentEvent::ThinkingFinished { .. } => {
                 self.thinking_since = None;
                 let text = clean(&std::mem::take(&mut self.live_thought));
                 if !text.is_empty() {
-                    self.blocks.push(Block::Thought {
-                        dur_ms,
+                    self.flush_narration();
+                    self.push_step_item(StepItem::Thought {
                         text,
                         expand: Expand::Collapsed,
                     });
                 }
             }
             AgentEvent::AssistantDelta { text } => {
-                // per-delta cleaning: a control sequence split across chunk
-                // boundaries could survive, but assistant text is the least
-                // hostile source; complete strings are cleaned fully elsewhere
-                let text = clean(&text);
-                let open = match self.live_text_idx.and_then(|i| self.blocks.get_mut(i)) {
-                    Some(Block::LiveAssistant(existing)) => {
-                        existing.push_str(&text);
-                        true
-                    }
-                    _ => false,
-                };
-                if !open {
-                    self.blocks.push(Block::LiveAssistant(text));
-                    self.live_text_idx = Some(self.blocks.len() - 1);
-                }
+                // accumulate intermediate prose; it is folded into the current
+                // step group as a collapsed Narration item once the turn seals
+                self.live_narration.push_str(&clean(&text));
             }
             AgentEvent::TurnClosed => {
-                self.seal_live_blocks();
+                self.flush_narration();
             }
             AgentEvent::Step(view) => {
                 self.live_step = None;
-                let gi = match self.steps_group_idx {
-                    Some(gi) => gi,
-                    None => self.create_steps_group_and_set(),
-                };
-                if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
-                    g.steps.push(StepBlock {
-                        view: sanitize_step(view),
-                        expand: Expand::Collapsed,
-                    });
+                self.flush_narration();
+                // A memory write is surfaced as `remembered:` entries rather than
+                // a generic file step, so durable facts read back cleanly.
+                if let Some(facts) = memory_facts(&self.memory, &self.cfg.project_root, &view) {
+                    for fact in facts {
+                        self.blocks.push(Block::Remembered(clean(&fact)));
+                    }
+                    return;
                 }
+                self.push_step_item(StepItem::Step(StepBlock {
+                    view: sanitize_step(view),
+                    expand: Expand::Collapsed,
+                }));
             }
             AgentEvent::Remembered { line } => {
                 self.blocks.push(Block::Remembered(clean(&line)));
@@ -768,7 +766,10 @@ impl App {
                 });
             }
             AgentEvent::AssistantText(text) => {
-                self.blocks.push(Block::Assistant(clean(&text)));
+                self.push_step_item(StepItem::Narration {
+                    text: clean(&text),
+                    expand: Expand::Collapsed,
+                });
             }
             AgentEvent::Usage { prompt_tokens, .. } => {
                 if prompt_tokens > 0 {
@@ -792,7 +793,7 @@ impl App {
                 self.live_step = Some((v.0.to_owned(), v.1));
             }
             AgentEvent::Finished(outcome) => {
-                self.seal_live_blocks();
+                self.flush_narration();
                 self.thinking_since = None;
                 self.live_thought.clear();
                 self.live_step = None;
@@ -825,17 +826,24 @@ impl App {
         }
     }
 
-    fn seal_live_blocks(&mut self) {
-        if let Some(i) = self.live_text_idx.take() {
-            let sealed = match self.blocks.get_mut(i) {
-                Some(Block::LiveAssistant(text)) => Some(std::mem::take(text)),
-                _ => None,
-            };
-            if let Some(text) = sealed {
-                self.blocks[i] = Block::Assistant(text);
-            }
+    fn push_step_item(&mut self, item: StepItem) {
+        let gi = match self.steps_group_idx {
+            Some(gi) => gi,
+            None => self.create_steps_group_and_set(),
+        };
+        if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
+            g.steps.push(item);
         }
-        self.thinking_since = None;
+    }
+
+    fn flush_narration(&mut self) {
+        let text = std::mem::take(&mut self.live_narration);
+        if !text.trim().is_empty() {
+            self.push_step_item(StepItem::Narration {
+                text,
+                expand: Expand::Collapsed,
+            });
+        }
     }
 
     fn create_steps_group_and_set(&mut self) -> usize {
@@ -935,6 +943,48 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "build" => Some(Mode::Build),
         "auto" | "auto-approve" => Some(Mode::Auto),
         _ => None,
+    }
+}
+
+
+/// If a step mutates a known memory file, return the newly recorded
+/// `- fact` lines (excluding ones already stored) so they can be shown as
+/// `remembered:` entries instead of a generic write/edit step.
+fn memory_facts(
+    memory: &Memory,
+    root: &std::path::Path,
+    view: &StepView,
+) -> Option<Vec<String>> {
+    match view.verb {
+        Verb::Wrote | Verb::Deleted | Verb::Renamed => {}
+        _ => return None,
+    }
+    let candidate = if std::path::Path::new(&view.arg).is_absolute() {
+        std::path::PathBuf::from(&view.arg)
+    } else {
+        root.join(&view.arg)
+    };
+    let level = memory.path_level(&candidate)?;
+    let existing: std::collections::HashSet<String> =
+        Memory::entries(&memory.read_level(level)).into_iter().collect();
+    let Detail::Diff { lines, .. } = view.detail.as_ref()? else {
+        return None;
+    };
+    let mut facts = Vec::new();
+    for l in lines {
+        if l.sign == '+' {
+            if let Some(fact) = l.text.trim().strip_prefix("- ") {
+                let fact = fact.trim().to_string();
+                if !fact.is_empty() && !existing.contains(&fact) {
+                    facts.push(fact);
+                }
+            }
+        }
+    }
+    if facts.is_empty() {
+        None
+    } else {
+        Some(facts)
     }
 }
 
@@ -1077,5 +1127,132 @@ mod history_escape_tests {
         // a literal backslash survives the roundtrip
         let bs = "path\\to\\file";
         assert_eq!(unescape_history(&escape_history(bs)), bs);
+    }
+}
+
+#[cfg(test)]
+mod memory_step_tests {
+    use super::*;
+    use crate::agent::{AgentEvent, Detail, StepView, Verb};
+    use crate::config::Config;
+    use crate::memory::Memory;
+    use crate::perms::{PermEngine, Policy};
+    use crate::providers::openai::OpenAiProvider;
+    use std::sync::{Arc, Mutex};
+
+    fn app_with(root: std::path::PathBuf) -> App {
+        let cfg = Arc::new(Config {
+            model: "m".into(),
+            context_window: 1000,
+            project_root: root.clone(),
+            project_config_path: root.join(".few/config.toml"),
+            ..Default::default()
+        });
+        let perms = Arc::new(Mutex::new(PermEngine::new(
+            root.clone(),
+            vec![],
+            Default::default(),
+            Policy::Ask,
+            Policy::Ask,
+        )));
+        let memory = Memory::new(&root, &root.join(".data"));
+        let provider = OpenAiProvider::new("http://127.0.0.1:9/v1", None, "m").unwrap();
+        let agent = Arc::new(Agent::new(
+            provider,
+            cfg.clone(),
+            perms,
+            memory.clone(),
+            Default::default(),
+        ));
+        App::new(cfg, agent, memory, root.join("hist"), root.join("sessions"), None)
+    }
+
+    #[test]
+    fn memory_write_becomes_remembered_not_step() {
+        let root = std::env::temp_dir().join(format!("few-mem-{}-{}", std::process::id(), "a"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root);
+        let mem_path = app.memory.project_path.to_string_lossy().to_string();
+
+        app.on_agent_event(AgentEvent::Step(StepView {
+            verb: Verb::Wrote,
+            arg: mem_path,
+            detail: Some(Detail::Diff {
+                lines: vec![crate::diffgen::DiffLine {
+                    sign: '+',
+                    text: "- calc.py adds two numbers".into(),
+                }],
+                capped_at: None,
+            }),
+        }));
+
+        assert!(
+            app.blocks
+                .iter()
+                .any(|b| matches!(b, Block::Remembered(f) if f.contains("adds two numbers"))),
+            "memory write must surface as remembered:"
+        );
+        assert!(
+            !app.blocks.iter().any(|b| matches!(b, Block::Steps(_))),
+            "memory write must not be a generic step"
+        );
+
+        // a non-memory file write stays a normal step
+        app.on_agent_event(AgentEvent::Step(StepView {
+            verb: Verb::Wrote,
+            arg: "src/main.rs".into(),
+            detail: None,
+        }));
+        assert!(
+            app.blocks.iter().any(|b| matches!(b, Block::Steps(_))),
+            "non-memory write stays a step"
+        );
+    }
+
+    #[test]
+    fn memory_write_skips_already_stored_facts() {
+        let root = std::env::temp_dir().join(format!("few-mem-{}-{}", std::process::id(), "b"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        let mem_path = app.memory.project_path.to_string_lossy().to_string();
+        let _ = std::fs::create_dir_all(app.memory.project_path.parent().unwrap());
+        std::fs::write(&app.memory.project_path, "# Few memory\n\n- already known fact\n").unwrap();
+
+        app.on_agent_event(AgentEvent::Step(StepView {
+            verb: Verb::Wrote,
+            arg: mem_path,
+            detail: Some(Detail::Diff {
+                lines: vec![
+                    crate::diffgen::DiffLine {
+                        sign: '+',
+                        text: "- already known fact".into(),
+                    },
+                    crate::diffgen::DiffLine {
+                        sign: '+',
+                        text: "- brand new fact".into(),
+                    },
+                ],
+                capped_at: None,
+            }),
+        }));
+
+        let remembered: Vec<String> = app
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Remembered(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            remembered.iter().any(|f| f.contains("brand new fact")),
+            "new fact shown"
+        );
+        assert!(
+            !remembered.iter().any(|f| f.contains("already known")),
+            "already-stored fact not repeated"
+        );
     }
 }

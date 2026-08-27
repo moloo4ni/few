@@ -24,8 +24,11 @@ Four, no more:
 - After file changes, Few may auto-run a verification command. Treat a "[few verify]" failure
   as real: fix it, finish only once it passes, and stop if the same error keeps repeating.
 - On "[user pressed Ctrl+C...]", the user interrupted — acknowledge and decide sensibly.
-- Keep memory lean: durable project facts go in `.few/memory/project.md` ("- fact" per line);
-  cross-project facts go in your persistent memory. No secrets. Add in small edits.
+- Keep memory lean. Durable project facts live in `.few/memory/project.md`, one `- fact` line each;
+  cross-project facts go in your persistent memory file. **To record a fact, append a `- fact`
+  line with the `edit` tool — never `write`, which would erase existing memory.** These facts
+  are shown back to you as `remembered:` at the start of every session, so keep them short and
+  stable. No secrets.
 
 ## Answering
 

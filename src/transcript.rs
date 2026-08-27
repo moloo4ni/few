@@ -31,8 +31,28 @@ pub struct StepBlock {
     pub expand: Expand,
 }
 
+/// A single entry inside a turn's step group. Concrete tool actions are
+/// `Step`s; the agent's reasoning and intermediate prose are folded in as
+/// `Thought`/`Narration` so the transcript stays compact by default and the
+/// thinking never becomes a separate top-level block.
+pub enum StepItem {
+    Step(StepBlock),
+    Thought { text: String, expand: Expand },
+    Narration { text: String, expand: Expand },
+}
+
+impl StepItem {
+    pub fn is_step(&self) -> bool {
+        matches!(self, StepItem::Step(_))
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, StepItem::Step(s) if s.is_error())
+    }
+}
+
 pub struct StepsGroup {
-    pub steps: Vec<StepBlock>,
+    pub steps: Vec<StepItem>,
     pub expanded: bool,
     pub outcome: Option<TaskOutcome>,
 }
@@ -56,13 +76,6 @@ pub const PERM_OPTIONS: [&str; 4] = [
 
 pub enum Block {
     User(String),
-    Assistant(String),
-    LiveAssistant(String),
-    Thought {
-        dur_ms: u64,
-        text: String,
-        expand: Expand,
-    },
     Remembered(String),
     Notice {
         text: String,
@@ -145,7 +158,7 @@ impl StepsGroup {
     }
 
     pub fn summary(&self) -> String {
-        let n = self.steps.len();
+        let n = self.steps.iter().filter(|s| s.is_step()).count();
         let errs = self.errors();
         let mut line = if errs > 0 {
             format!(
