@@ -137,7 +137,7 @@ impl App {
         }
         // Показываем в интерфейсе, если конфигурация фиктивная или отсутствует
         if cfg.model == "dummy-model" || cfg.provider_base_url.contains("localhost:9999") {
-            app.push_notice("Нужно сконфигурировать модель в .keiko/config.toml или через OPENAI_API_KEY / KEIKO_MODEL".into());
+            app.push_notice("Нужно сконфигурировать модель в .few/config.toml или через OPENAI_API_KEY / FEW_API_KEY".into());
         }
         app
     }
@@ -156,7 +156,7 @@ impl App {
             if self.quit {
                 break;
             }
-            // while $EDITOR owns the terminal, Keiko must not draw anything
+            // while $EDITOR owns the terminal, Few must not draw anything
             if !self.suspended {
                 terminal.draw(|f| uirender::draw(f, self))?;
             }

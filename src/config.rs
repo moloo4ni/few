@@ -216,7 +216,7 @@ impl Default for Config {
 }
 
 pub fn project_config_file(root: &Path) -> PathBuf {
-    root.join(".keiko").join("config.toml")
+    root.join(".few").join("config.toml")
 }
 
 pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> {
@@ -243,7 +243,7 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
                 .clone()
                 .and_then(|name| std::env::var(name).ok())
         })
-        .or_else(|| std::env::var("KEIKO_API_KEY").ok())
+        .or_else(|| std::env::var("FEW_API_KEY").ok())
         .or_else(|| std::env::var("OPENAI_API_KEY").ok());
 
     Ok(Config {
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn persist_grant_appends_and_replaces() {
-        let dir = std::env::temp_dir().join(format!("keiko-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("few-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("config.toml");

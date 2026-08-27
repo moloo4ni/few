@@ -2,16 +2,16 @@
 //!
 //! Skipped by default. Credentials come from environment variables or `.env`
 //! in the repo root (gitignored). Provider is picked automatically from the
-//! first present dedicated key, or forced via KEIKO_LIVE_* variables.
+//! first present dedicated key, or forced via FEW_LIVE_* variables.
 //!
 //!   cargo test --test live -- --ignored --nocapture
 
-use keiko::agent::{Agent, AgentEvent, TaskOutcome};
-use keiko::config::Config;
-use keiko::memory::Memory;
-use keiko::perms::{Mode, PermEngine, Policy};
-use keiko::providers::openai::OpenAiProvider;
-use keiko::tools::Ctl;
+use few::agent::{Agent, AgentEvent, TaskOutcome};
+use few::config::Config;
+use few::memory::Memory;
+use few::perms::{Mode, PermEngine, Policy};
+use few::providers::openai::OpenAiProvider;
+use few::tools::Ctl;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -40,9 +40,9 @@ fn load_dotenv() {
 
 fn live_env() -> Option<(String, Option<String>, String)> {
     load_dotenv();
-    if let Ok(base) = std::env::var("KEIKO_LIVE_BASE_URL") {
-        let model = std::env::var("KEIKO_LIVE_MODEL").expect("KEIKO_LIVE_MODEL");
-        return Some((base, std::env::var("KEIKO_LIVE_API_KEY").ok(), model));
+    if let Ok(base) = std::env::var("FEW_LIVE_BASE_URL") {
+        let model = std::env::var("FEW_LIVE_MODEL").expect("FEW_LIVE_MODEL");
+        return Some((base, std::env::var("FEW_LIVE_API_KEY").ok(), model));
     }
     const PRESETS: &[(&str, &str, &str, &str)] = &[
         (
@@ -64,7 +64,7 @@ fn live_env() -> Option<(String, Option<String>, String)> {
             "openrouter/free",
         ),
     ];
-    let model_override = std::env::var("KEIKO_LIVE_MODEL").ok();
+    let model_override = std::env::var("FEW_LIVE_MODEL").ok();
     for (_, var, url, default_model) in PRESETS {
         if let Ok(key) = std::env::var(var) {
             if !key.trim().is_empty() {
@@ -129,13 +129,13 @@ fn setup(root: &std::path::Path) -> (Arc<Mutex<PermEngine>>, Memory) {
 async fn live_agent_completes_file_task() {
     let Some((base, key, model)) = live_env() else {
         panic!(
-            "no live provider configured: set KEIKO_LIVE_BASE_URL / KEIKO_LIVE_MODEL \
-             (optionally KEIKO_LIVE_API_KEY), or put a dedicated key into .env as \
+            "no live provider configured: set FEW_LIVE_BASE_URL / FEW_LIVE_MODEL \
+             (optionally FEW_LIVE_API_KEY), or put a dedicated key into .env as \
              OPENCODE_API_KEY / MISTRAL_API_KEY / OPENROUTER_API_KEY"
         );
     };
 
-    let root = std::env::temp_dir().join(format!("keiko-live-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("few-live-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
@@ -146,7 +146,7 @@ async fn live_agent_completes_file_task() {
         context_window: 128_000,
         probe_tools: false,
         project_root: root.clone(),
-        project_config_path: root.join(".keiko/config.toml"),
+        project_config_path: root.join(".few/config.toml"),
         ..Default::default()
     });
     let (perms, memory) = setup(&root);
@@ -155,7 +155,7 @@ async fn live_agent_completes_file_task() {
 
     println!("probing tool-calling capability of {model}…");
     match provider.probe_tool_calling().await {
-        keiko::providers::ProbeOutcome::Supported => {}
+        few::providers::ProbeOutcome::Supported => {}
         other => panic!("model must pass the structured tool-calling probe: {other:?}"),
     }
 
@@ -165,7 +165,7 @@ async fn live_agent_completes_file_task() {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<Ctl>();
 
     let task = "In the project directory, create hello.txt containing exactly one line: \
-                hi from keiko. Verify by reading it back, then finish.";
+                hi from few. Verify by reading it back, then finish.";
     let runner = Arc::clone(&agent);
     let handle = tokio::spawn(async move { runner.run(task.to_owned(), ev_tx, ctl_rx).await });
 
@@ -181,14 +181,14 @@ async fn live_agent_completes_file_task() {
     assert!(path.exists(), "hello.txt was not created");
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
-        content.contains("hi from keiko"),
+        content.contains("hi from few"),
         "unexpected content: {content:?}"
     );
     println!("file content ok: {:?}", content.trim());
 
     let convo = agent.snapshot_convo();
     assert!(
-        convo.iter().any(|m| m.role == keiko::providers::Role::Tool),
+        convo.iter().any(|m| m.role == few::providers::Role::Tool),
         "no tool results recorded in the conversation"
     );
 
@@ -202,13 +202,13 @@ async fn live_agent_completes_file_task() {
 async fn live_verify_gives_up_on_repeated_failure() {
     let Some((base, key, model)) = live_env() else {
         panic!(
-            "no live provider configured: set KEIKO_LIVE_BASE_URL / KEIKO_LIVE_MODEL \
-             (optionally KEIKO_LIVE_API_KEY), or put a dedicated key into .env as \
+            "no live provider configured: set FEW_LIVE_BASE_URL / FEW_LIVE_MODEL \
+             (optionally FEW_LIVE_API_KEY), or put a dedicated key into .env as \
              OPENCODE_API_KEY / MISTRAL_API_KEY / OPENROUTER_API_KEY"
         );
     };
 
-    let root = std::env::temp_dir().join(format!("keiko-live-v{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("few-live-v{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
@@ -225,7 +225,7 @@ async fn live_verify_gives_up_on_repeated_failure() {
         probe_tools: false,
         verify_command: Some(fail_cmd.to_owned()),
         project_root: root.clone(),
-        project_config_path: root.join(".keiko/config.toml"),
+        project_config_path: root.join(".few/config.toml"),
         ..Default::default()
     });
     let (perms, memory) = setup(&root);
@@ -263,7 +263,7 @@ async fn live_verify_gives_up_on_repeated_failure() {
     let injections = agent
         .snapshot_convo()
         .iter()
-        .filter(|m| m.role == keiko::providers::Role::User && m.content.contains("[keiko verify]"))
+        .filter(|m| m.role == few::providers::Role::User && m.content.contains("[few verify]"))
         .count();
     assert!(
         injections >= 2,

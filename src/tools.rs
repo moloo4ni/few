@@ -113,7 +113,7 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ToolError> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_owned());
-    let tmp = dir.join(format!(".{name}.keiko-tmp-{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.few-tmp-{}", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ToolError(format!("cannot write {}: {e}", tmp.display())));
@@ -561,7 +561,7 @@ mod tests {
     use super::*;
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("keiko-tools-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("few-tools-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -578,7 +578,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains("keiko-tmp"))
+            .filter(|e| e.file_name().to_string_lossy().contains("few-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files must be cleaned up");
         let _ = std::fs::remove_dir_all(&root);
@@ -634,11 +634,11 @@ mod tests {
     #[test]
     fn memory_lines_extracted() {
         let root = tmpdir("mem");
-        let mem = root.join(".keiko/memory/project.md");
+        let mem = root.join(".few/memory/project.md");
         let out = exec_write(
             &root,
             std::slice::from_ref(&mem),
-            ".keiko/memory/project.md",
+            ".few/memory/project.md",
             "- fact one\n- fact two\n",
             false,
         )

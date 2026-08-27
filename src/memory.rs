@@ -22,7 +22,7 @@ pub struct Memory {
     pub persistent_path: PathBuf,
 }
 
-const HEADER: &str = "# Keiko memory\n\nOne fact per line, `- fact`. Read at session start.\n";
+const HEADER: &str = "# Few memory\n\nOne fact per line, `- fact`. Read at session start.\n";
 
 fn display_path(p: &Path) -> String {
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
@@ -39,7 +39,7 @@ impl Memory {
     pub fn new(project_root: &Path, data_dir: &Path) -> Self {
         Self {
             project_path: project_root
-                .join(".keiko")
+                .join(".few")
                 .join("memory")
                 .join("project.md"),
             persistent_path: data_dir.join("memory.md"),
@@ -113,7 +113,7 @@ impl Memory {
     }
 
     pub fn display_project_path(&self) -> String {
-        ".keiko/memory/project.md".to_owned()
+        ".few/memory/project.md".to_owned()
     }
 
     pub fn display_persistent_path(&self) -> String {

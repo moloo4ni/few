@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn detect_cargo() {
-        let dir = std::env::temp_dir().join("keiko-verify-test");
+        let dir = std::env::temp_dir().join("few-verify-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(resolve_verify(None, &dir), None);
@@ -171,8 +171,8 @@ mod tests {
     #[test]
     fn signature_skips_build_noise() {
         // cargo prints progress lines before the actual failure; the old
-        // first-line heuristic would have keyed on "Compiling keiko v0.1.0"
-        let output = "\n   Compiling keiko v0.1.0\n    Finished test [unoptimized]\n".to_owned()
+        // first-line heuristic would have keyed on "Compiling few v0.1.0"
+        let output = "\n   Compiling few v0.1.0\n    Finished test [unoptimized]\n".to_owned()
             + "error[E0308]: mismatched types\nsome detail\n";
         let s = error_signature(&output);
         assert!(s.contains("error[E0308]"), "got {s:?}");

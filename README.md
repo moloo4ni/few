@@ -1,4 +1,4 @@
-# Keiko
+# Few
 
 An autonomous terminal agent: analyzes the task, explores the project, runs tools,
 edits files, executes commands, verifies results, and carries the work to completion -
@@ -30,7 +30,7 @@ but the contract is not frozen yet and details will change.
 - **Native structured tool-calling only**: a model without it gets an explicit refusal at
   startup; prompt-based fallback is rejected on principle.
 - **Memory** - human-readable markdown files outside the working directory (XDG layout);
-  project memory lives in `.keiko/memory/project.md`.
+  project memory lives in `.few/memory/project.md`.
 - **TUI** (`ratatui` + `crossterm`): no panels or fills - text, indentation and two contrast
   levels only; signal colors are standard ANSI; collapsible step summaries, click-to-expand
   diffs, permission prompts inline in the log, an escalating Ctrl+C ladder.
@@ -52,19 +52,19 @@ TLS ships as the default `tls` feature (`reqwest` + `rustls`). Alternatives: an 
 build (`--no-default-features`) or the OS-native backend
 (`--no-default-features --features tls-native`) for toolchains without a C compiler.
 
-At startup Keiko checks that the selected model answers with native tool calls; otherwise it
+At startup Few checks that the selected model answers with native tool calls; otherwise it
 exits with an explicit error - switch models rather than hoping text parsing will work.
 
 ## Configuration
 
-Global config: `~/.config/keiko/config.toml`; per-project: `<project>/.keiko/config.toml`
+Global config: `~/.config/few/config.toml`; per-project: `<project>/.few/config.toml`
 (overrides global). Minimum to start:
 
 ```toml
 [provider]
 base_url = "http://127.0.0.1:11434/v1"   # ollama or any OpenAI-compatible server
 model = "qwen3:8b"
-api_key_env = "OPENAI_API_KEY"           # optional; KEIKO_API_KEY / OPENAI_API_KEY also read
+api_key_env = "OPENAI_API_KEY"           # optional; FEW_API_KEY / OPENAI_API_KEY also read
 compact_threshold = 0.75                 # fold old rounds at 75% of context_window
 ```
 
@@ -87,7 +87,7 @@ extra = ["*.secret"]                     # appended to the built-in list
 
 State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
 `~/.local/state` where available) and never inside a project directory - except explicitly
-project-local things (`.keiko/`).
+project-local things (`.few/`).
 
 ## Repository layout
 

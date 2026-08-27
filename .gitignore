@@ -1,9 +1,9 @@
 /target
 *.snap.new
 
-# keiko reference docs
-/keiko-concept.md
-/keiko-ux-spec.md
+# few reference docs
+/few-concept.md
+/few-ux-spec.md
 
 # env
 /.env
