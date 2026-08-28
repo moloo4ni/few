@@ -10,7 +10,8 @@ architecture and interface.
 ## Status
 
 Early development. The core works (agent loop, tools, permissions, TUI, provider),
-but the contract is not frozen yet and details will change.
+and its contract evolves deliberately; the current canonical contract is in the
+[GitHub Wiki](#wiki).
 
 ## Design in brief
 
@@ -20,9 +21,10 @@ but the contract is not frozen yet and details will change.
 - **Four tools, no more**: `read`, `write`, `edit`, `shell`. Search and git are plain
   `rg`/`find`/`git` invoked through `shell`; no abstraction where Unix already solves
   the problem.
-- **Capability-based permissions**: reads inside the project are silent, writes and shell
-  default to `ask`, network defaults to `deny`; a built-in non-removable sensitive-file list;
-  `always allow` decisions persist to that project's config.
+- **Capability-based permissions**: reads inside the project are silent; writes and shell
+  default to `ask`; a built-in non-removable sensitive-file list; `always allow` decisions
+  persist to that project's config. There is no separate network capability: a networked
+  command is controlled by `shell`, while provider HTTP is outside the permission engine.
 - **Modes** - `plan` / `build` / `auto-approve` - presets of one permission matrix.
 - **Verify before done**: after file changes a verification command runs automatically
   (ecosystem auto-detect or `[verify] command`); three identical failures in a row and the
@@ -92,6 +94,15 @@ max_steps = 0                            # step ceiling; 0 = deliberate unlimite
 
 [permissions.sensitive]
 extra = ["*.secret"]                     # appended to the built-in list
+
+[permissions.filesystem.write]
+# default = "ask"                         # base write policy in build mode
+
+[permissions.shell]
+# default = "ask"                         # base shell policy in build mode
+
+[permissions.granted]
+# "Cargo.toml" = "write"                 # persistent per-project grant
 ```
 
 State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
@@ -112,12 +123,29 @@ src/
 prompts/base.md base layer of the system prompt (compiled into the binary)
 ```
 
-Development: `cargo test`, `cargo clippy --all-targets`, `cargo fmt`.
+Before considering a change complete, run:
+
+```sh
+cargo fmt
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+git diff --check
+```
+
+For a release-size/build check, also run `cargo build --release`.
 
 ## Wiki
 
-Project documentation lives on the [GitHub Wiki](https://github.com/moloo4ni/few/wiki):
-overview, configuration, commands, and architecture.
+Project documentation lives on the [GitHub Wiki](https://github.com/moloo4ni/few/wiki).
+Before changing agent behavior or the TUI, read the canonical
+[Project principles](https://github.com/moloo4ni/few/wiki/Project-principles)
+and [UX specification](https://github.com/moloo4ni/few/wiki/UX-specification).
+They take priority over the implementation when they disagree, unless a
+maintainer explicitly changes the contract.
+
+For development checks, UI testing expectations, and the project's minimalism
+rules, see [Contributing](https://github.com/moloo4ni/few/wiki/Contributing).
 
 ## License
 
