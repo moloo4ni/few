@@ -556,16 +556,6 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                                     push_indented(&mut rows, text, theme::dim(), width, 4);
                                 }
                             }
-                            StepItem::Remembered(text) => {
-                                push_indented_hit(
-                                    &mut rows,
-                                    &format!("remembered: {text}"),
-                                    mark(theme::blue_dim(), focused(bi, si)),
-                                    width,
-                                    2,
-                                    Hit::Step(bi, si),
-                                );
-                            }
                         }
                     }
                 }
@@ -577,6 +567,15 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                     NoticeLevel::Warn => theme::amber(),
                 };
                 push_wrapped_text(&mut rows, text, style, width, Hit::Nothing);
+            }
+            Block::Remembered(text) => {
+                push_wrapped_text(
+                    &mut rows,
+                    &format!("remembered: {text}"),
+                    theme::blue_dim(),
+                    width,
+                    Hit::Nothing,
+                );
             }
             Block::MemoryView { text } => {
                 for l in text.lines() {
@@ -612,9 +611,8 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                         } else {
                             theme::normal()
                         };
-                        let marker = if oi == ask.selected { ">" } else { " " };
                         rows.push((
-                            vec![(format!("  {marker} {} {opt}", oi + 1), style)],
+                            vec![(format!("  {} {opt}", oi + 1), style)],
                             Hit::PermOption(bi, oi),
                         ));
                     }
@@ -1115,6 +1113,27 @@ mod tests {
     }
 
     #[test]
+    fn selected_permission_option_uses_color_without_marker() {
+        let mut app = test_app("permission-marker");
+        app.blocks.push(Block::PermAsk(PermAskBlock {
+            id: 1,
+            verb: "write".into(),
+            target: "src/main.rs".into(),
+            cap_label: "filesystem.write".into(),
+            sensitive: false,
+            selected: 1,
+            resolved: None,
+        }));
+
+        let option_rows: Vec<_> = build_rows(&app, 80)
+            .into_iter()
+            .filter(|(_, hit)| matches!(hit, Hit::PermOption(_, _)))
+            .collect();
+        assert_eq!(option_rows[1].0[0].0, "  2 allow for this session");
+        assert_eq!(option_rows[1].0[0].1, theme::amber());
+    }
+
+    #[test]
     fn mouse_click_on_thought_toggles() {
         let mut app = test_app("thought-click");
         // expanded group so the folded thought item is rendered and clickable
@@ -1146,5 +1165,46 @@ mod tests {
             },
             _ => panic!("expected steps block"),
         }
+    }
+
+    #[test]
+    fn repeated_mouse_click_reveals_full_diff_before_collapsing() {
+        let mut app = test_app("diff-click");
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![StepItem::Step(step_with_diff("a.txt"))],
+            expanded: true,
+            outcome: None,
+        }));
+        render(&mut app, 60, 12);
+        let row = app
+            .hitmap
+            .iter()
+            .position(|hit| *hit == Hit::Step(0, 0))
+            .expect("diff step hit present");
+
+        app.on_click(row as u16);
+        app.on_click(row as u16);
+        match &app.blocks[0] {
+            Block::Steps(g) => match &g.steps[0] {
+                StepItem::Step(step) => assert_eq!(step.expand, Expand::Full),
+                _ => panic!("expected step item"),
+            },
+            _ => panic!("expected steps block"),
+        }
+    }
+
+    #[test]
+    fn remembered_stays_visible_when_steps_are_collapsed() {
+        let mut app = test_app("remembered");
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![StepItem::Step(step_with_diff("a.txt"))],
+            expanded: false,
+            outcome: Some(crate::agent::TaskOutcome::Done),
+        }));
+        app.blocks.push(Block::Remembered("uses Fish".into()));
+
+        let joined = render(&mut app, 60, 12).join("\n");
+        assert!(joined.contains("> 1 steps"), "{joined:?}");
+        assert!(joined.contains("remembered: uses Fish"), "{joined:?}");
     }
 }
