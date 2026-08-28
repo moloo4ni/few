@@ -16,14 +16,6 @@ impl Expand {
             Expand::Full => Expand::Collapsed,
         }
     }
-
-    pub fn toggle(self) -> Self {
-        if self == Expand::Collapsed {
-            Expand::Shown
-        } else {
-            Expand::Collapsed
-        }
-    }
 }
 
 pub struct StepBlock {
@@ -37,22 +29,13 @@ pub struct StepBlock {
 /// thinking never becomes a separate top-level block.
 pub enum StepItem {
     Step(StepBlock),
-    Thought {
-        text: String,
-        expand: Expand,
-    },
-    Narration {
-        text: String,
-        expand: Expand,
-    },
-    /// A memory write surfaces as a remembered fact inside the step group
-    /// (it is a step, counted in the summary, not a floating top-level block).
-    Remembered(String),
+    Thought { text: String, expand: Expand },
+    Narration { text: String, expand: Expand },
 }
 
 impl StepItem {
     pub fn is_step(&self) -> bool {
-        matches!(self, StepItem::Step(_) | StepItem::Remembered(_))
+        matches!(self, StepItem::Step(_))
     }
 
     pub fn is_error(&self) -> bool {
@@ -88,6 +71,7 @@ pub enum Block {
     Assistant(String),
     Notice { text: String, level: NoticeLevel },
     Steps(StepsGroup),
+    Remembered(String),
     PermAsk(PermAskBlock),
     MemoryView { text: String },
 }

@@ -285,24 +285,20 @@ impl App {
             }
             Hit::Step(bi, si) => {
                 let t = (bi, si);
-                // only focus (and toggle) rows that actually respond to a click;
-                // a no-op row like `remembered:` or a detail-less step must not
-                // look clickable after the click either
+                // Only focus and expand rows that actually respond to a click.
                 if !self.expandable_targets().contains(&t) {
                     return;
                 }
                 self.focus = Some(t);
                 if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
                     match g.steps.get_mut(si) {
-                        // toggle expands/collapses in a single click (a second
-                        // click collapses again) rather than cycling through a
-                        // separate "full" state that would need two clicks to close
-                        Some(StepItem::Step(s)) => s.expand = s.expand.toggle(),
+                        // A repeated click reveals the full diff/output before
+                        // collapsing again, matching keyboard expansion.
+                        Some(StepItem::Step(s)) => s.expand = s.expand.next(),
                         Some(StepItem::Thought { expand, .. })
                         | Some(StepItem::Narration { expand, .. }) => {
-                            *expand = expand.toggle();
+                            *expand = expand.next();
                         }
-                        Some(StepItem::Remembered(_)) => {}
                         None => {}
                     }
                 }
@@ -336,7 +332,6 @@ impl App {
                         StepItem::Thought { .. } | StepItem::Narration { .. } => {
                             out.push((bi, si));
                         }
-                        StepItem::Remembered(_) => {}
                     }
                 }
             }
@@ -388,7 +383,6 @@ impl App {
                     *expand = expand.next();
                     true
                 }
-                Some(StepItem::Remembered(_)) => false,
                 None => false,
             },
             _ => false,
@@ -832,11 +826,11 @@ impl App {
             AgentEvent::Step(view) => {
                 self.live_step = None;
                 self.flush_narration(false);
-                // A memory write is surfaced as `remembered:` entries rather than
-                // a generic file step, so durable facts read back cleanly.
+                // A memory write surfaces outside the step group, so a completed
+                // task cannot hide a durable fact behind its collapsed summary.
                 if let Some(facts) = memory_facts(&self.memory, &self.cfg.project_root, &view) {
                     for fact in facts {
-                        self.push_step_item(StepItem::Remembered(clean(&fact)));
+                        self.blocks.push(Block::Remembered(clean(&fact)));
                     }
                     return;
                 }
@@ -1307,29 +1301,19 @@ mod memory_step_tests {
             }),
         }));
 
-        // The memory write surfaces as a `remembered:` step INSIDE the step
-        // group (counted in the summary), not as a floating top-level block and
-        // not as a generic wrote step.
+        // The memory write surfaces as a top-level `remembered:` block, not as
+        // a generic wrote step or part of a collapsible steps summary.
         let remembered: Vec<String> = app
             .blocks
             .iter()
             .filter_map(|b| match b {
-                Block::Steps(g) => Some(
-                    g.steps
-                        .iter()
-                        .filter_map(|s| match s {
-                            StepItem::Remembered(f) => Some(f.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                Block::Remembered(f) => Some(f.clone()),
                 _ => None,
             })
-            .flatten()
             .collect();
         assert!(
             remembered.iter().any(|f| f.contains("adds two numbers")),
-            "memory write must surface as remembered inside the step group"
+            "memory write must surface as a visible top-level remembered block"
         );
         assert!(
             !app.blocks.iter().any(|b| match b {
@@ -1392,18 +1376,9 @@ mod memory_step_tests {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                Block::Steps(g) => Some(
-                    g.steps
-                        .iter()
-                        .filter_map(|s| match s {
-                            StepItem::Remembered(f) => Some(f.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                Block::Remembered(f) => Some(f.clone()),
                 _ => None,
             })
-            .flatten()
             .collect();
         // Every added `- fact` line is surfaced immediately as `remembered:`
         // (the diff already carries only what changed, so we never filter by
@@ -1452,22 +1427,13 @@ mod memory_step_tests {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                Block::Steps(g) => Some(
-                    g.steps
-                        .iter()
-                        .filter_map(|s| match s {
-                            StepItem::Remembered(f) => Some(f.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                Block::Remembered(f) => Some(f.clone()),
                 _ => None,
             })
-            .flatten()
             .collect();
         assert!(
             remembered.iter().any(|f| f.contains("greet.py")),
-            "memory write must surface as remembered inside the step group even when the file already holds the fact"
+            "memory write must surface as top-level remembered even when the file already holds the fact"
         );
         assert!(
             !app.blocks.iter().any(|b| match b {
