@@ -8,16 +8,79 @@ use few::providers::openai::OpenAiProvider;
 use few::sysprompt;
 use few::tui;
 
+use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
+
+#[derive(Debug, PartialEq, Eq)]
+enum Startup {
+    Run { continue_last: bool },
+    Help,
+    Version,
+}
+
+const HELP: &str = concat!(
+    "Few ",
+    env!("CARGO_PKG_VERSION"),
+    "\n\n",
+    "Usage: few [OPTIONS]\n\n",
+    "Options:\n",
+    "  -c, --continue  Resume the latest session for this project\n",
+    "  -h, --help      Print help\n",
+    "  -V, --version   Print version\n",
+);
+
+fn parse_startup(args: impl IntoIterator<Item = OsString>) -> Result<Startup, String> {
+    let mut continue_last = false;
+    let mut terminal = None;
+    for arg in args {
+        let Some(arg) = arg.to_str() else {
+            return Err("startup arguments must be valid UTF-8".into());
+        };
+        match arg {
+            "-c" | "--continue" => continue_last = true,
+            "-h" | "--help" => set_terminal(&mut terminal, Startup::Help)?,
+            "-V" | "--version" => set_terminal(&mut terminal, Startup::Version)?,
+            other => return Err(format!("unknown argument '{other}'")),
+        }
+    }
+    Ok(terminal.unwrap_or(Startup::Run { continue_last }))
+}
+
+fn set_terminal(slot: &mut Option<Startup>, action: Startup) -> Result<(), String> {
+    match slot {
+        Some(current) if *current != action => {
+            Err("--help and --version cannot be used together".into())
+        }
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(action);
+            Ok(())
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("few {}", env!("CARGO_PKG_VERSION"));
-        return;
-    }
-    if let Err(e) = run().await {
+    let startup = match parse_startup(std::env::args_os().skip(1)) {
+        Ok(startup) => startup,
+        Err(e) => {
+            eprintln!("few: {e}\n\nTry 'few --help' for usage.");
+            std::process::exit(2);
+        }
+    };
+    let continue_last = match startup {
+        Startup::Help => {
+            print!("{HELP}");
+            return;
+        }
+        Startup::Version => {
+            println!("few {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Startup::Run { continue_last } => continue_last,
+    };
+
+    if let Err(e) = run(continue_last).await {
         eprintln!("\nfew: {e:#}\n");
         // Wait for Enter so the window does not close immediately (especially under kitty/sway).
         use std::io::{self, Write};
@@ -29,10 +92,7 @@ async fn main() {
     }
 }
 
-async fn run() -> anyhow::Result<()> {
-    let continue_last = std::env::args()
-        .skip(1)
-        .any(|a| a == "--continue" || a == "-c");
+async fn run(continue_last: bool) -> anyhow::Result<()> {
     let root = std::env::current_dir()?;
     let paths = few::paths::Paths::init()?;
     let cfg = Arc::new(config::load(&paths, &root)?);
@@ -115,4 +175,51 @@ async fn run() -> anyhow::Result<()> {
     let result = app.run_app(&mut terminal).await;
     tui::restore(terminal);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Startup, String> {
+        parse_startup(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn startup_options_parse_without_running_the_app() {
+        assert_eq!(
+            parse(&[]),
+            Ok(Startup::Run {
+                continue_last: false
+            })
+        );
+        assert_eq!(
+            parse(&["-c"]),
+            Ok(Startup::Run {
+                continue_last: true
+            })
+        );
+        assert_eq!(
+            parse(&["--continue"]),
+            Ok(Startup::Run {
+                continue_last: true
+            })
+        );
+        assert_eq!(parse(&["--help"]), Ok(Startup::Help));
+        assert_eq!(parse(&["-h"]), Ok(Startup::Help));
+        assert_eq!(parse(&["--version"]), Ok(Startup::Version));
+        assert_eq!(parse(&["-V"]), Ok(Startup::Version));
+    }
+
+    #[test]
+    fn unknown_and_conflicting_options_are_rejected() {
+        assert_eq!(
+            parse(&["--definitely-invalid"]),
+            Err("unknown argument '--definitely-invalid'".into())
+        );
+        assert_eq!(
+            parse(&["--help", "--version"]),
+            Err("--help and --version cannot be used together".into())
+        );
+    }
 }
