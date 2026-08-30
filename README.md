@@ -139,7 +139,7 @@ Useful sections:
 
 [loop]
 retry_threshold = 3                      # repeats of one error signature before giving up
-max_steps = 0                            # step ceiling; 0 = deliberate unlimited
+max_steps = 0                            # tool/verify step ceiling; 0 = deliberate unlimited
 
 [permissions.sensitive]
 extra = ["*.secret"]                     # appended to the built-in list

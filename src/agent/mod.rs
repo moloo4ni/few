@@ -303,7 +303,7 @@ impl<P: Provider> Agent<P> {
         let mut verify_tail;
         let tool_defs = tools::defs();
 
-        let outcome = loop {
+        let outcome = 'agent: loop {
             self.maybe_compact(&ctx.ev);
             let notes = ctx.take_boundary_notes();
             if !notes.is_empty() {
@@ -397,6 +397,10 @@ impl<P: Provider> Agent<P> {
                     if reply.tool_calls.is_empty() {
                         if ctx.wrote_since_user {
                             if let Some(plan) = verify_plan.as_ref().filter(|_| verify_enabled) {
+                                if ctx.step_limit_reached() {
+                                    ctx.report_step_limit();
+                                    break 'agent TaskOutcome::GaveUpSteps;
+                                }
                                 let verify_outcome = self.run_verify(plan, &mut ctx).await;
                                 ctx.steps += 1;
                                 match verify_outcome {
@@ -452,22 +456,24 @@ impl<P: Provider> Agent<P> {
                         break TaskOutcome::Done;
                     }
 
-                    if self.cfg.max_steps > 0 && ctx.steps >= self.cfg.max_steps {
-                        for tc in &reply.tool_calls {
+                    let mut calls = reply.tool_calls.into_iter();
+                    while let Some(tc) = calls.next() {
+                        if ctx.step_limit_reached() {
                             self.push_convo(Msg::tool_result(
                                 &tc.id,
                                 &tc.name,
-                                "step limit reached",
+                                "step limit reached; tool call was not executed",
                             ));
+                            for pending in calls {
+                                self.push_convo(Msg::tool_result(
+                                    &pending.id,
+                                    &pending.name,
+                                    "step limit reached; tool call was not executed",
+                                ));
+                            }
+                            ctx.report_step_limit();
+                            break 'agent TaskOutcome::GaveUpSteps;
                         }
-                        let _ = ctx.ev.send(AgentEvent::Notice {
-                            text: "gave up (step limit)".into(),
-                            level: NoticeLevel::Warn,
-                        });
-                        break TaskOutcome::GaveUpSteps;
-                    }
-
-                    for tc in reply.tool_calls {
                         let errored = self.execute_call(tc, &mut ctx).await;
                         ctx.steps += 1;
                         if errored {
@@ -507,6 +513,17 @@ struct RunCtx<'a> {
 }
 
 impl RunCtx<'_> {
+    fn step_limit_reached(&self) -> bool {
+        self.cfg.max_steps > 0 && self.steps >= self.cfg.max_steps
+    }
+
+    fn report_step_limit(&self) {
+        let _ = self.ev.send(AgentEvent::Notice {
+            text: "gave up (step limit)".into(),
+            level: NoticeLevel::Warn,
+        });
+    }
+
     fn absorb(&mut self, c: Ctl) {
         match c {
             Ctl::HardAbort => self.hard_abort = true,
@@ -625,6 +642,15 @@ mod tests {
         })
     }
 
+    fn reply_calls(calls: Vec<ToolCall>) -> Result<Reply, ProviderError> {
+        Ok(Reply {
+            content: String::new(),
+            reasoning: None,
+            tool_calls: calls,
+            usage: Usage::default(),
+        })
+    }
+
     fn test_cfg(root: &std::path::Path) -> Arc<Config> {
         Arc::new(Config {
             project_root: root.to_path_buf(),
@@ -720,6 +746,98 @@ mod tests {
         );
         assert!(agent.snapshot_convo().iter().any(|m| m.role == Role::Tool));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn step_limit_is_checked_before_each_tool_call() {
+        let root = temp_root("step-limit-batch");
+        let (perms, mem) = setup(&root);
+        let cfg = Config {
+            max_steps: 1,
+            ..(*test_cfg(&root)).clone()
+        };
+        let prov = Scripted::new(vec![reply_calls(vec![
+            ToolCall::parse(
+                "t1".into(),
+                "write".into(),
+                r#"{"path":"first.txt","content":"first"}"#.into(),
+            ),
+            ToolCall::parse(
+                "t2".into(),
+                "write".into(),
+                r#"{"path":"second.txt","content":"second"}"#.into(),
+            ),
+        ])]);
+        let agent = Agent::new(prov, Arc::new(cfg), perms, mem, Default::default());
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+
+        let outcome = agent.run("write both files".into(), ev_tx, ctl_rx).await;
+
+        assert_eq!(outcome, TaskOutcome::GaveUpSteps);
+        assert!(root.join("first.txt").is_file());
+        assert!(!root.join("second.txt").exists());
+        let tool_results: Vec<_> = agent
+            .snapshot_convo()
+            .into_iter()
+            .filter(|message| message.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_results.len(), 2, "every tool call must stay paired");
+        assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("t1"));
+        assert_eq!(tool_results[1].tool_call_id.as_deref(), Some("t2"));
+        assert!(tool_results[1].content.contains("was not executed"));
+
+        let events: Vec<_> = std::iter::from_fn(|| ev_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Notice { text, .. } if text == "gave up (step limit)"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Finished(TaskOutcome::GaveUpSteps)))
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn automatic_verify_obeys_the_step_limit_boundary() {
+        for (max_steps, verify_runs, expected) in [
+            (1, false, TaskOutcome::GaveUpSteps),
+            (2, true, TaskOutcome::Done),
+        ] {
+            let root = temp_root(&format!("verify-step-limit-{max_steps}"));
+            let marker = root.join("verify-ran");
+            let (perms, mem) = setup(&root);
+            let cfg = Config {
+                max_steps,
+                verify_command: Some(if cfg!(unix) {
+                    format!("touch {}", marker.display())
+                } else {
+                    format!("type nul > {}", marker.display())
+                }),
+                ..(*test_cfg(&root)).clone()
+            };
+            let prov = Scripted::new(vec![
+                reply_call("write", r#"{"path":"result.txt","content":"done"}"#),
+                reply_text("done"),
+            ]);
+            let agent = Agent::new(prov, Arc::new(cfg), perms, mem, Default::default());
+            let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+            let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+
+            assert_eq!(
+                agent.run("write and verify".into(), ev_tx, ctl_rx).await,
+                expected
+            );
+            assert_eq!(marker.exists(), verify_runs);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[tokio::test]
