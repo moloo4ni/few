@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(default)]
     pub provider: ProviderCfg,
@@ -22,6 +23,7 @@ pub struct FileConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderCfg {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
@@ -34,22 +36,26 @@ pub struct ProviderCfg {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShellCfg {
     pub program: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifyCfg {
     pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoopCfg {
     pub max_steps: Option<u32>,
     pub retry_threshold: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsCfg {
     pub tool_result_chars: Option<usize>,
     pub shell_output_bytes: Option<usize>,
@@ -57,37 +63,37 @@ pub struct LimitsCfg {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermsCfg {
     #[serde(default)]
     pub filesystem: FsPermsCfg,
     #[serde(default)]
     pub shell: DefaultPolicyCfg,
     #[serde(default)]
-    pub network: DefaultPolicyCfg,
-    #[serde(default)]
     pub sensitive: SensitiveCfg,
     #[serde(default)]
     pub granted: BTreeMap<String, String>,
 }
 
-/// `[permissions.filesystem]`: `read` is the read policy, `write` is the
-/// default write policy (overridden by the active mode for plan/auto).
+/// `[permissions.filesystem]`: only the build-mode write default is
+/// configurable. Read policy is fixed by project detection and sensitivity.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FsPermsCfg {
-    #[serde(default)]
-    pub read: Option<String>,
     #[serde(default)]
     pub write: DefaultPolicyCfg,
 }
 
 /// A capability default policy, e.g. `[permissions.shell] default = "ask"`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DefaultPolicyCfg {
     #[serde(default)]
     pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SensitiveCfg {
     #[serde(default)]
     pub extra: Vec<String>,
@@ -123,11 +129,9 @@ impl FileConfig {
                 diff_lines: b.diff_lines.or(a.diff_lines),
             }),
             permissions: merge_opt(self.permissions, over.permissions, |mut a, b| {
-                a.filesystem.read = b.filesystem.read.or(a.filesystem.read);
                 a.filesystem.write.default =
                     b.filesystem.write.default.or(a.filesystem.write.default);
                 a.shell.default = b.shell.default.or(a.shell.default);
-                a.network.default = b.network.default.or(a.network.default);
                 a.sensitive.extra.extend(b.sensitive.extra);
                 for (k, v) in b.granted {
                     a.granted.insert(k, v);
@@ -183,8 +187,6 @@ pub struct Config {
     pub perm_write_default: Policy,
     /// base default policy for shell execution
     pub perm_shell_default: Policy,
-    /// base default policy for the network axis
-    pub perm_network_default: Policy,
     pub project_root: PathBuf,
     pub project_config_path: PathBuf,
     pub project_detected: bool,
@@ -211,7 +213,6 @@ impl Default for Config {
             granted: Default::default(),
             perm_write_default: Policy::Ask,
             perm_shell_default: Policy::Ask,
-            perm_network_default: Policy::Deny,
             project_root: PathBuf::new(),
             project_config_path: PathBuf::new(),
             project_detected: false,
@@ -303,13 +304,6 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
             .as_deref()
             .and_then(parse_policy)
             .unwrap_or(Policy::Ask),
-        perm_network_default: merged
-            .permissions
-            .network
-            .default
-            .as_deref()
-            .and_then(parse_policy)
-            .unwrap_or(Policy::Deny),
         project_root: root.to_path_buf(),
         project_config_path: pcfg,
         project_detected: project_detected(root),
@@ -318,10 +312,78 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
 
 fn read_toml(path: &Path) -> anyhow::Result<Option<FileConfig>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(toml::from_str(&text)?)),
+        Ok(text) => {
+            let config: FileConfig = toml::from_str(&text)
+                .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))?;
+            validate_permissions(&config, path)?;
+            Ok(Some(config))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
     }
+}
+
+fn validate_permissions(config: &FileConfig, path: &Path) -> anyhow::Result<()> {
+    for (field, value) in [
+        (
+            "permissions.filesystem.write.default",
+            config.permissions.filesystem.write.default.as_deref(),
+        ),
+        (
+            "permissions.shell.default",
+            config.permissions.shell.default.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            if parse_policy(value).is_none() {
+                anyhow::bail!(
+                    "invalid {field} in {}: expected allow, ask, or deny; got {value:?}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    for (key, value) in &config.permissions.granted {
+        let valid = if key.starts_with("shell::") {
+            matches!(value.as_str(), "execute" | "all")
+        } else {
+            matches!(value.as_str(), "read" | "write" | "all")
+        };
+        if !valid {
+            anyhow::bail!(
+                "invalid permissions.granted value in {}: {key:?} = {value:?}",
+                path.display()
+            );
+        }
+    }
+
+    let mut patterns =
+        ignore::gitignore::GitignoreBuilder::new(path.parent().unwrap_or_else(|| Path::new(".")));
+    patterns.allow_unclosed_class(false);
+    for pattern in &config.permissions.sensitive.extra {
+        if pattern.trim_end().is_empty() || pattern.starts_with('#') || pattern.starts_with('!') {
+            anyhow::bail!(
+                "invalid permissions.sensitive.extra pattern in {}: {pattern:?}: expected an additive, non-empty gitignore pattern",
+                path.display()
+            );
+        }
+        patterns
+            .add_line(Some(path.to_path_buf()), pattern)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid permissions.sensitive.extra pattern in {}: {pattern:?}: {error}",
+                    path.display()
+                )
+            })?;
+    }
+    patterns.build().map_err(|error| {
+        anyhow::anyhow!(
+            "invalid permissions.sensitive.extra in {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 pub fn persist_grant(path: &Path, key: &str, cap: &str) -> anyhow::Result<()> {
@@ -477,13 +539,13 @@ mod tests {
         )
         .unwrap();
         let p: FileConfig = toml::from_str(
-            "[permissions.granted]\n\"b\" = \"execute\"\n\"a\" = \"execute\"\n[permissions.sensitive]\nextra = [\"y*\"]\n",
+            "[permissions.granted]\n\"b\" = \"write\"\n\"a\" = \"all\"\n[permissions.sensitive]\nextra = [\"y*\"]\n",
         )
         .unwrap();
         let m = g.merge(p);
         assert_eq!(
             m.permissions.granted.get("a").map(String::as_str),
-            Some("execute")
+            Some("all")
         );
         assert_eq!(m.permissions.granted.len(), 2);
         assert_eq!(m.permissions.sensitive.extra, vec!["x*", "y*"]);
@@ -544,9 +606,9 @@ mod tests {
         assert!(t.matches("\".env\"").count() == 1);
         assert!(t.contains("\"Cargo.toml\" = \"write\""));
 
-        persist_grant(&file, ".env", "execute").unwrap();
+        persist_grant(&file, ".env", "read").unwrap();
         let t = std::fs::read_to_string(&file).unwrap();
-        assert!(t.contains("\".env\" = \"execute\""));
+        assert!(t.contains("\".env\" = \"read\""));
         assert!(t.matches("[permissions.granted]").count() == 1);
         assert!(!t.contains("\".env\" = \"write\""));
 
@@ -614,17 +676,11 @@ mod tests {
     #[test]
     fn spec_example_parses() {
         let src = r#"
-[permissions.filesystem]
-read = "project"
-
 [permissions.filesystem.write]
 default = "ask"
 
 [permissions.shell]
 default = "ask"
-
-[permissions.network]
-default = "deny"
 
 [permissions.sensitive]
 extra = ["*.txt"]
@@ -641,13 +697,59 @@ extra = ["*.txt"]
             Some("write")
         );
         assert_eq!(cfg.permissions.sensitive.extra, vec!["*.txt"]);
-        assert_eq!(cfg.permissions.filesystem.read.as_deref(), Some("project"));
         assert_eq!(
             cfg.permissions.filesystem.write.default.as_deref(),
             Some("ask")
         );
         assert_eq!(cfg.permissions.shell.default.as_deref(), Some("ask"));
-        assert_eq!(cfg.permissions.network.default.as_deref(), Some("deny"));
+    }
+
+    #[test]
+    fn permission_config_rejects_unsupported_and_invalid_values() {
+        let dir = std::env::temp_dir().join(format!("few-config-invalid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        let invalid = [
+            ("[permissions.filesystem]\nread = \"deny\"\n", "read"),
+            ("[permissions.network]\ndefault = \"deny\"\n", "network"),
+            ("[permissions.shell]\ndefualt = \"deny\"\n", "defualt"),
+            (
+                "[permissions.shell]\ndefault = \"sometimes\"\n",
+                "permissions.shell.default",
+            ),
+            (
+                "[permissions.granted]\n\"file.txt\" = \"execute\"\n",
+                "permissions.granted",
+            ),
+            (
+                "[permissions.granted]\n\"shell::cargo test\" = \"write\"\n",
+                "permissions.granted",
+            ),
+            (
+                "[permissions.sensitive]\nextra = [\"[\"]\n",
+                "permissions.sensitive.extra",
+            ),
+            (
+                "[permissions.sensitive]\nextra = [\"!*.env\"]\n",
+                "permissions.sensitive.extra",
+            ),
+            (
+                "[permissions.sensitive]\nextra = [\"# ignored\"]\n",
+                "permissions.sensitive.extra",
+            ),
+            (
+                "[permissions.sensitive]\nextra = [\"\"]\n",
+                "permissions.sensitive.extra",
+            ),
+        ];
+        for (source, field) in invalid {
+            std::fs::write(&file, source).unwrap();
+            let error = read_toml(&file).unwrap_err().to_string();
+            assert!(error.contains(&file.display().to_string()), "{error}");
+            assert!(error.contains(field), "{error}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
