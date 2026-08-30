@@ -34,8 +34,9 @@ and its contract evolves deliberately; the current canonical contract is in the
 - **Memory** - human-readable markdown files outside the working directory (XDG layout);
   project memory lives in `.few/memory/project.md`.
 - **TUI** (`ratatui` + `crossterm`): no panels or fills - text, indentation and two contrast
-  levels only; signal colors are standard ANSI; collapsible step summaries, click-to-expand
-  diffs, permission prompts inline in the log, an escalating Ctrl+C ladder.
+  levels only; signal colors are standard ANSI; Markdown-rendered assistant prose with
+  lightweight syntax highlighting; collapsible step summaries, click-to-expand diffs,
+  permission prompts inline in the log, an escalating Ctrl+C ladder.
 
 ## Build & run
 

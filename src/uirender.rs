@@ -1,6 +1,7 @@
 use crate::agent::NoticeLevel;
 use crate::app::{label_mode, App};
 use crate::commands::{arg_options, filter_commands, find_command};
+use crate::markdown::{self, MarkdownLine};
 use crate::theme;
 use crate::transcript::{Block, Expand, Hit, ResumedItem, StepItem, PERM_OPTIONS};
 use ratatui::layout::{Constraint, Layout};
@@ -474,7 +475,7 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                 push_user_prompt(&mut rows, text, theme::normal(), width);
             }
             Block::Assistant(text) => {
-                push_wrapped_text(&mut rows, text, theme::normal(), width, Hit::Nothing);
+                push_markdown_text(&mut rows, text, width, Hit::Nothing, 0);
             }
             Block::Resumed(resumed) => {
                 let marker = if resumed.expanded { 'v' } else { '>' };
@@ -492,7 +493,7 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                                 push_nested_user_prompt(&mut rows, text, theme::normal(), width, 2)
                             }
                             ResumedItem::Assistant(text) => {
-                                push_indented(&mut rows, text, theme::normal(), width, 2)
+                                push_markdown_text(&mut rows, text, width, Hit::Nothing, 2)
                             }
                             ResumedItem::Step(text) => {
                                 push_indented(&mut rows, text, theme::dim(), width, 2)
@@ -675,6 +676,155 @@ fn push_wrapped_text(
     }
 }
 
+/// Render model prose with the small Markdown subset understood by Few.
+/// Prose wraps by words; code-fence lines preserve their whitespace and wrap
+/// only at terminal columns. Code gets a two-space nesting indent so source
+/// remains legible without a panel or background.
+fn push_markdown_text(
+    rows: &mut Vec<(Vec<Seg>, Hit)>,
+    text: &str,
+    width: usize,
+    hit: Hit,
+    indent: usize,
+) {
+    for line in markdown::parse(text) {
+        match line {
+            MarkdownLine::Blank => rows.push((vec![], Hit::Nothing)),
+            MarkdownLine::Prose { prefix, content } => {
+                let inner = width.saturating_sub(indent).max(1);
+                let prefix_width = segments_width(&prefix);
+                let content_width = inner.saturating_sub(prefix_width).max(1);
+                for (i, segs) in wrap_markdown_words(&content, content_width)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut row = Vec::new();
+                    push_seg(&mut row, " ".repeat(indent), theme::normal());
+                    if i == 0 {
+                        for (text, style) in &prefix {
+                            push_seg(&mut row, text.clone(), *style);
+                        }
+                    } else {
+                        push_seg(&mut row, " ".repeat(prefix_width), theme::normal());
+                    }
+                    row.extend(segs);
+                    rows.push((row, hit));
+                }
+            }
+            MarkdownLine::Code(segments) => {
+                let code_indent = indent + 2;
+                let inner = width.saturating_sub(code_indent).max(1);
+                for segs in wrap_markdown_code(&segments, inner) {
+                    let mut row = Vec::new();
+                    push_seg(&mut row, " ".repeat(code_indent), theme::dim());
+                    row.extend(segs);
+                    rows.push((row, hit));
+                }
+            }
+        }
+    }
+}
+
+fn wrap_markdown_words(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
+    struct Word {
+        space_before: bool,
+        segments: Vec<Seg>,
+    }
+
+    let mut words = Vec::new();
+    let mut current: Vec<Seg> = Vec::new();
+    let mut pending_space = false;
+    let mut current_space = false;
+    for (text, style) in segs {
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                if !current.is_empty() {
+                    words.push(Word {
+                        space_before: current_space,
+                        segments: std::mem::take(&mut current),
+                    });
+                }
+                pending_space = true;
+            } else {
+                if current.is_empty() {
+                    current_space = pending_space;
+                    pending_space = false;
+                }
+                push_seg(&mut current, ch.to_string(), *style);
+            }
+        }
+    }
+    if !current.is_empty() {
+        words.push(Word {
+            space_before: current_space,
+            segments: current,
+        });
+    }
+
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Seg>> = vec![Vec::new()];
+    let mut row_width = 0usize;
+    for word in words {
+        let word_width = segments_width(&word.segments);
+        let separator = usize::from(word.space_before && row_width > 0);
+        if row_width > 0 && row_width + separator + word_width > width {
+            rows.push(Vec::new());
+            row_width = 0;
+        }
+        if word.space_before && row_width > 0 {
+            push_seg(rows.last_mut().unwrap(), " ".into(), theme::normal());
+            row_width += 1;
+        }
+        for (text, style) in word.segments {
+            for ch in text.chars() {
+                let char_width = ch.width().unwrap_or(0);
+                if row_width > 0 && row_width + char_width > width {
+                    rows.push(Vec::new());
+                    row_width = 0;
+                }
+                push_seg(rows.last_mut().unwrap(), ch.to_string(), style);
+                row_width += char_width;
+            }
+        }
+    }
+    rows
+}
+
+fn wrap_markdown_code(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Seg>> = vec![Vec::new()];
+    let mut row_width = 0usize;
+    for (text, style) in segs {
+        for ch in text.chars() {
+            let char_width = ch.width().unwrap_or(0);
+            if row_width > 0 && row_width + char_width > width {
+                rows.push(Vec::new());
+                row_width = 0;
+            }
+            push_seg(rows.last_mut().unwrap(), ch.to_string(), *style);
+            row_width += char_width;
+        }
+    }
+    rows
+}
+
+fn segments_width(segs: &[Seg]) -> usize {
+    segs.iter()
+        .flat_map(|(text, _)| text.chars())
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum()
+}
+
+fn push_seg(row: &mut Vec<Seg>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    match row.last_mut() {
+        Some((last, previous)) if *previous == style => last.push_str(&text),
+        _ => row.push((text, style)),
+    }
+}
+
 fn push_indented(
     rows: &mut Vec<(Vec<Seg>, Hit)>,
     text: &str,
@@ -840,6 +990,56 @@ mod tests {
         assert_eq!(rows[8], sep, "thin separator above status bar");
         let joined = rows.join("\n");
         assert!(joined.contains("ask few anything"), "{joined:?}");
+    }
+
+    #[test]
+    fn assistant_markdown_preserves_structure_and_highlights_code() {
+        let mut app = test_app("assistant-markdown");
+        app.blocks.push(Block::Assistant(
+            "# Result\n\nUse `cargo test`, then **inspect** it.\n\n- first item with enough text to wrap cleanly\n- second item\n\n> quoted note\n\n```rust\nfn main() {\n    let count = 42;\n    println!(\"done\"); // status\n}\n```"
+                .into(),
+        ));
+
+        let built = build_rows(&app, 44);
+        let joined = built
+            .iter()
+            .map(|(row, _)| {
+                row.iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Result"), "{joined:?}");
+        assert!(
+            joined.contains("Use cargo test, then inspect it."),
+            "{joined:?}"
+        );
+        assert!(joined.contains("- first item"), "{joined:?}");
+        assert!(joined.contains("> quoted note"), "{joined:?}");
+        assert!(joined.contains("  fn main()"), "{joined:?}");
+        assert!(!joined.contains("```"), "fence markers must not render");
+        assert!(!joined.contains("**"), "emphasis markers must not render");
+
+        let segments: Vec<&Seg> = built.iter().flat_map(|(row, _)| row.iter()).collect();
+        assert!(segments.iter().any(|(text, style)| {
+            text == "Result" && style.add_modifier.contains(ratatui::style::Modifier::BOLD)
+        }));
+        for inline_word in ["cargo", "test"] {
+            assert!(segments.iter().any(|(text, style)| {
+                text == inline_word && style.fg == Some(ratatui::style::Color::Blue)
+            }));
+        }
+        assert!(segments.iter().any(|(text, style)| {
+            text == "fn"
+                && style.fg == Some(ratatui::style::Color::Blue)
+                && style.add_modifier.contains(ratatui::style::Modifier::BOLD)
+        }));
+        assert!(segments.iter().any(|(text, style)| {
+            text.contains("// status") && style.add_modifier.contains(ratatui::style::Modifier::DIM)
+        }));
+
+        insta::assert_snapshot!("assistant_markdown", render(&mut app, 60, 24).join("\n"));
     }
 
     #[test]

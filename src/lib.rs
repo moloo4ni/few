@@ -5,6 +5,7 @@ pub mod config;
 pub mod diffgen;
 pub mod envinfo;
 pub mod inputline;
+mod markdown;
 pub mod memory;
 pub mod paths;
 pub mod perms;
