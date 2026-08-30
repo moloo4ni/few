@@ -189,6 +189,11 @@ git diff --check
 
 For a release-size/build check, also run `cargo build --release`.
 
+The `CI` workflow runs these source checks for every branch push and pull
+request, checks the supported TLS feature combinations, and runs the test suite
+inside a native FreeBSD 14.4 VM. Windows remains best-effort and is not a
+first-version CI target.
+
 ## Wiki
 
 Project documentation lives on the [GitHub Wiki](https://github.com/moloo4ni/few/wiki).
