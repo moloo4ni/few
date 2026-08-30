@@ -189,6 +189,8 @@ impl PermEngine {
     /// An "always allow" decision covers the exact command plus anything that
     /// extends it with further arguments (`cargo test` also grants
     /// `cargo test --release`), so users are not re-prompted for every flag.
+    /// Prefix reuse is deliberately conservative because commands are passed
+    /// to a shell: control syntax must never inherit an argument-only grant.
     fn shell_prefix_granted(&self, key: &str) -> bool {
         const PREFIX: &str = "shell::";
         let Some(cmd) = key.strip_prefix(PREFIX) else {
@@ -207,6 +209,8 @@ impl PermEngine {
             if cmd.len() > stored.len()
                 && cmd.starts_with(stored)
                 && cmd.as_bytes()[stored.len()] == b' '
+                && plain_shell_fragment(stored)
+                && plain_shell_fragment(&cmd[stored.len() + 1..])
             {
                 return true;
             }
@@ -321,6 +325,17 @@ impl PermEngine {
     pub fn display_target(&self, path: &Path) -> String {
         self.target_key(path)
     }
+}
+
+/// Return true only for text that cannot introduce another shell command,
+/// redirect I/O, or perform command substitution. False positives here merely
+/// cause another permission prompt, which is safer than trying to parse every
+/// supported user shell.
+fn plain_shell_fragment(text: &str) -> bool {
+    !text.chars().any(|c| {
+        matches!(c, ';' | '&' | '|' | '<' | '>' | '`' | '$' | '(' | ')')
+            || (c.is_control() && c != '\t')
+    })
 }
 
 /// Resolve lexical `..` and any existing symlink prefix without requiring the
@@ -517,12 +532,45 @@ mod tests {
         let mut e = engine(vec![]);
         let key = PermEngine::shell_key("cargo test");
         e.apply_grant(Capability::ShellExec, &key, Grant::Always);
+        let compound = "cargo test && cargo fmt --check";
+        e.apply_grant(
+            Capability::ShellExec,
+            &PermEngine::shell_key(compound),
+            Grant::Always,
+        );
 
         let check = |cmd: &str| e.check(Capability::ShellExec, Some(Path::new(cmd)));
         assert_eq!(check("cargo test"), Check::Allowed);
         assert_eq!(check("cargo test --release"), Check::Allowed);
+        assert_eq!(
+            check("cargo test --features 'one,two' -- --nocapture"),
+            Check::Allowed
+        );
         assert_ne!(check("cargo tests"), Check::Allowed, "word boundary");
         assert_ne!(check("rm -rf /"), Check::Allowed);
+
+        for cmd in [
+            "cargo test && touch /tmp/unexpected",
+            "cargo test ; touch /tmp/unexpected",
+            "cargo test | tee /tmp/output",
+            "cargo test > /tmp/output",
+            "cargo test $(touch /tmp/unexpected)",
+            "cargo test `touch /tmp/unexpected`",
+            "cargo test\ntouch /tmp/unexpected",
+        ] {
+            assert_eq!(
+                check(cmd),
+                Check::Ask { sensitive: false },
+                "shell syntax must not inherit an argument-only grant: {cmd:?}"
+            );
+        }
+
+        assert_eq!(check(compound), Check::Allowed, "exact grants still apply");
+        assert_eq!(
+            check("cargo test && cargo fmt --check --all"),
+            Check::Ask { sensitive: false },
+            "a compound exact grant must not become a reusable prefix"
+        );
     }
 
     #[test]
