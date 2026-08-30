@@ -1,6 +1,6 @@
-pub mod compact;
-pub mod exec;
-pub mod verify;
+mod compact;
+mod exec;
+mod verify;
 
 use crate::config::Config;
 use crate::diffgen::DiffLine;
@@ -15,8 +15,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-const ABORT: &str = "\u{0}__few_aborted__";
 const SOFT_NOTE: &str = "[user pressed Ctrl+C: the current operation was stopped at a safe point]";
+
+enum TurnError {
+    Aborted,
+    Provider(ProviderError),
+}
 
 #[derive(Debug, Clone)]
 pub enum Verb {
@@ -124,7 +128,6 @@ pub enum AgentEvent {
         text: String,
         level: NoticeLevel,
     },
-    AssistantText(String),
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -291,7 +294,6 @@ impl<P: Provider> Agent<P> {
             perm_answers: HashMap::new(),
             ask_seq: 0,
             steps: 0,
-            errors: 0,
             wrote_since_user: false,
         };
 
@@ -334,12 +336,12 @@ impl<P: Provider> Agent<P> {
                 },
             ));
 
-            let reply: Result<Reply, ProviderError> = loop {
+            let reply: Result<Reply, TurnError> = loop {
                 tokio::select! {
-                    r = &mut reply_fut => break r,
+                    r = &mut reply_fut => break r.map_err(TurnError::Provider),
                     c = ctx.ctl_rx.recv() => match c {
-                        None => break Err(ProviderError::Http(ABORT.into())),
-                        Some(Ctl::HardAbort) => break Err(ProviderError::Http(ABORT.into())),
+                        None => break Err(TurnError::Aborted),
+                        Some(Ctl::HardAbort) => break Err(TurnError::Aborted),
                         Some(other) => ctx.absorb(other),
                     }
                 }
@@ -356,7 +358,7 @@ impl<P: Provider> Agent<P> {
             let _ = ctx.ev.send(AgentEvent::TurnClosed);
 
             match reply {
-                Err(e) if e.to_string() == ABORT => {
+                Err(TurnError::Aborted) => {
                     let _ = ctx.ev.send(AgentEvent::Notice {
                         text: "^C task aborted".into(),
                         level: NoticeLevel::Warn,
@@ -364,7 +366,7 @@ impl<P: Provider> Agent<P> {
                     let _ = ctx.ev.send(AgentEvent::Finished(TaskOutcome::Aborted));
                     return TaskOutcome::Aborted;
                 }
-                Err(ProviderError::NoToolSupport(m)) => {
+                Err(TurnError::Provider(ProviderError::NoToolSupport(m))) => {
                     let _ = ctx.ev.send(AgentEvent::Notice {
                         text: format!(
                             "model lacks native structured tool-calling, refusing to continue: {m}"
@@ -373,7 +375,7 @@ impl<P: Provider> Agent<P> {
                     });
                     break TaskOutcome::ProviderError(m);
                 }
-                Err(ProviderError::Http(m)) => {
+                Err(TurnError::Provider(ProviderError::Http(m))) => {
                     let _ = ctx.ev.send(AgentEvent::Notice {
                         text: format!("provider error: {m}"),
                         level: NoticeLevel::Error,
@@ -428,7 +430,6 @@ impl<P: Provider> Agent<P> {
                                     }
                                     exec::VerifyOutcome::Failed(tail) => verify_tail = tail,
                                 }
-                                ctx.errors += 1;
                                 let sig = verify::error_signature(&verify_tail);
                                 let exhausted = tracker.record_failure(&sig);
                                 self.push_convo(Msg::user(format!(
@@ -475,11 +476,8 @@ impl<P: Provider> Agent<P> {
                             ctx.report_step_limit();
                             break 'agent TaskOutcome::GaveUpSteps;
                         }
-                        let errored = self.execute_call(tc, &mut ctx).await;
+                        self.execute_call(tc, &mut ctx).await;
                         ctx.steps += 1;
-                        if errored {
-                            ctx.errors += 1;
-                        }
                         if ctx.hard_abort {
                             let _ = ctx.ev.send(AgentEvent::Notice {
                                 text: "^C task aborted".into(),
@@ -509,7 +507,6 @@ struct RunCtx<'a> {
     perm_answers: HashMap<u64, Option<Grant>>,
     ask_seq: u64,
     steps: u32,
-    errors: u32,
     wrote_since_user: bool,
 }
 
@@ -584,6 +581,10 @@ mod tests {
         replies: Mutex<Vec<Result<Reply, ProviderError>>>,
     }
 
+    struct PendingProvider {
+        started: mpsc::UnboundedSender<()>,
+    }
+
     impl Scripted {
         fn new(replies: Vec<Result<Reply, ProviderError>>) -> Self {
             Self {
@@ -622,6 +623,25 @@ mod tests {
                 }
             }
             reply
+        }
+    }
+
+    impl Provider for PendingProvider {
+        fn model_name(&self) -> String {
+            "pending".to_owned()
+        }
+
+        async fn complete_streaming<F>(
+            &self,
+            _messages: &[Msg],
+            _tools: &[ToolDef],
+            _on_delta: F,
+        ) -> Result<Reply, ProviderError>
+        where
+            F: FnMut(StreamDelta) + Send,
+        {
+            let _ = self.started.send(());
+            std::future::pending().await
         }
     }
 
@@ -681,6 +701,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[tokio::test]
+    async fn hard_abort_during_provider_turn_has_an_aborted_outcome() {
+        let root = temp_root("provider-abort");
+        let (perms, mem) = setup(&root);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let agent = Agent::new(
+            PendingProvider {
+                started: started_tx,
+            },
+            test_cfg(&root),
+            perms,
+            mem,
+            Default::default(),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let run = agent.run("stop while waiting".into(), event_tx, control_rx);
+        tokio::pin!(run);
+
+        tokio::select! {
+            started = started_rx.recv() => assert_eq!(started, Some(())),
+            outcome = &mut run => panic!("provider turn ended before abort: {outcome:?}"),
+        }
+        control_tx.send(Ctl::HardAbort).unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), &mut run)
+            .await
+            .expect("hard abort must cancel a pending provider turn");
+
+        assert_eq!(outcome, TaskOutcome::Aborted);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Finished(TaskOutcome::Aborted))));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice { text, .. } if text.starts_with("provider error:")
+        )));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

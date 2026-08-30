@@ -90,7 +90,7 @@ impl<P: Provider> Agent<P> {
         }
     }
 
-    pub(super) async fn execute_call(&self, tc: ToolCall, ctx: &mut RunCtx<'_>) -> bool {
+    pub(super) async fn execute_call(&self, tc: ToolCall, ctx: &mut RunCtx<'_>) {
         match tc.name.as_str() {
             "read" => self.exec_read(&tc, ctx).await,
             "write" => self.exec_write(&tc, ctx).await,
@@ -104,7 +104,6 @@ impl<P: Provider> Agent<P> {
                     detail: Some(Detail::Message(msg.clone())),
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, msg));
-                true
             }
         }
     }
@@ -195,9 +194,10 @@ impl<P: Provider> Agent<P> {
         }
     }
 
-    pub(super) async fn exec_read(&self, tc: &ToolCall, ctx: &mut RunCtx<'_>) -> bool {
+    pub(super) async fn exec_read(&self, tc: &ToolCall, ctx: &mut RunCtx<'_>) {
         let Some(path_arg) = str_arg(&tc.arguments, "path") else {
-            return self.arg_error(tc, ctx, "read requires \"path\"");
+            self.arg_error(tc, ctx, "read requires \"path\"");
+            return;
         };
         let abs = resolve_path(&ctx.cfg.project_root, &path_arg);
         match self
@@ -210,7 +210,7 @@ impl<P: Provider> Agent<P> {
                     arg: path_arg.clone(),
                 }));
             }
-            GateResult::Aborted => return false,
+            GateResult::Aborted => return,
             GateResult::Denied(msg) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
                     verb: Verb::Denied,
@@ -218,7 +218,7 @@ impl<P: Provider> Agent<P> {
                     detail: Some(Detail::Message(msg.clone())),
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, msg));
-                return true;
+                return;
             }
         }
         match tools::exec_read(&ctx.cfg.project_root, &path_arg) {
@@ -234,7 +234,6 @@ impl<P: Provider> Agent<P> {
                     tools::cap_for_model(&out.for_model, ctx.cfg.tool_result_chars)
                 };
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, body));
-                false
             }
             Err(e) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
@@ -243,14 +242,14 @@ impl<P: Provider> Agent<P> {
                     detail: Some(Detail::Message(e.0.clone())),
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, e.0));
-                true
             }
         }
     }
 
-    pub(super) async fn exec_write(&self, tc: &ToolCall, ctx: &mut RunCtx<'_>) -> bool {
+    pub(super) async fn exec_write(&self, tc: &ToolCall, ctx: &mut RunCtx<'_>) {
         let Some(path_arg) = str_arg(&tc.arguments, "path") else {
-            return self.arg_error(tc, ctx, "write requires \"path\" and \"content\"");
+            self.arg_error(tc, ctx, "write requires \"path\" and \"content\"");
+            return;
         };
         let delete = tc
             .arguments
@@ -269,11 +268,12 @@ impl<P: Provider> Agent<P> {
                 .and_then(|v| v.as_str())
                 .is_none()
         {
-            return self.arg_error(
+            self.arg_error(
                 tc,
                 ctx,
                 "write requires \"content\" as a string - pass delete=true together with empty content to delete a file",
             );
+            return;
         }
         let abs = resolve_path(&ctx.cfg.project_root, &path_arg);
         match self
@@ -286,7 +286,7 @@ impl<P: Provider> Agent<P> {
                     arg: path_arg.clone(),
                 }));
             }
-            GateResult::Aborted => return false,
+            GateResult::Aborted => return,
             GateResult::Denied(msg) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
                     verb: Verb::Denied,
@@ -294,7 +294,7 @@ impl<P: Provider> Agent<P> {
                     detail: Some(Detail::Message(msg.clone())),
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, msg));
-                return true;
+                return;
             }
         }
         match tools::exec_write(&ctx.cfg.project_root, &path_arg, content, delete) {
@@ -322,7 +322,6 @@ impl<P: Provider> Agent<P> {
                     detail,
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, out.for_model));
-                false
             }
             Err(e) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
@@ -331,18 +330,18 @@ impl<P: Provider> Agent<P> {
                     detail: Some(Detail::Message(e.0.clone())),
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, e.0));
-                true
             }
         }
     }
 
-    pub(super) async fn exec_edit(&self, tc: &ToolCall, ctx: &mut RunCtx<'_>) -> bool {
+    pub(super) async fn exec_edit(&self, tc: &ToolCall, ctx: &mut RunCtx<'_>) {
         let (Some(path_arg), Some(old_str), Some(new_str)) = (
             str_arg(&tc.arguments, "path"),
             str_arg(&tc.arguments, "old_str"),
             str_arg(&tc.arguments, "new_str"),
         ) else {
-            return self.arg_error(tc, ctx, "edit requires \"path\", \"old_str\", \"new_str\"");
+            self.arg_error(tc, ctx, "edit requires \"path\", \"old_str\", \"new_str\"");
+            return;
         };
         let abs = resolve_path(&ctx.cfg.project_root, &path_arg);
         match self
@@ -355,7 +354,7 @@ impl<P: Provider> Agent<P> {
                     arg: path_arg.clone(),
                 }));
             }
-            GateResult::Aborted => return false,
+            GateResult::Aborted => return,
             GateResult::Denied(msg) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
                     verb: Verb::Denied,
@@ -363,7 +362,7 @@ impl<P: Provider> Agent<P> {
                     detail: Some(Detail::Message(msg.clone())),
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, msg));
-                return true;
+                return;
             }
         }
         match tools::exec_edit(&ctx.cfg.project_root, &path_arg, &old_str, &new_str) {
@@ -383,7 +382,6 @@ impl<P: Provider> Agent<P> {
                     detail,
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, out.for_model));
-                false
             }
             Err(e) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
@@ -392,14 +390,14 @@ impl<P: Provider> Agent<P> {
                     detail: Some(Detail::Message(e.0.clone())),
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, e.0));
-                true
             }
         }
     }
 
-    pub(super) async fn exec_shell(&self, tc: &ToolCall, ctx: &mut RunCtx<'_>) -> bool {
+    pub(super) async fn exec_shell(&self, tc: &ToolCall, ctx: &mut RunCtx<'_>) {
         let Some(command) = str_arg(&tc.arguments, "command") else {
-            return self.arg_error(tc, ctx, "shell requires \"command\"");
+            self.arg_error(tc, ctx, "shell requires \"command\"");
+            return;
         };
         match self
             .gate(
@@ -416,7 +414,7 @@ impl<P: Provider> Agent<P> {
                     arg: command.clone(),
                 }));
             }
-            GateResult::Aborted => return false,
+            GateResult::Aborted => return,
             GateResult::Denied(msg) => {
                 let _ = ctx.ev.send(AgentEvent::Step(StepView {
                     verb: Verb::Denied,
@@ -424,7 +422,7 @@ impl<P: Provider> Agent<P> {
                     detail: Some(Detail::Message(msg.clone())),
                 }));
                 self.push_convo(Msg::tool_result(&tc.id, &tc.name, msg));
-                return true;
+                return;
             }
         }
 
@@ -494,17 +492,15 @@ impl<P: Provider> Agent<P> {
             &tc.name,
             tools::cap_for_model(&model_text, ctx.cfg.tool_result_chars),
         ));
-        !run.success
     }
 
-    fn arg_error(&self, tc: &ToolCall, ctx: &RunCtx<'_>, msg: &str) -> bool {
+    fn arg_error(&self, tc: &ToolCall, ctx: &RunCtx<'_>, msg: &str) {
         let _ = ctx.ev.send(AgentEvent::Step(StepView {
             verb: Verb::Errored,
             arg: tc.name.clone(),
             detail: Some(Detail::Message(msg.to_owned())),
         }));
         self.push_convo(Msg::tool_result(&tc.id, &tc.name, msg.to_owned()));
-        true
     }
 }
 

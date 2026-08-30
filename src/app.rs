@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 const ESCALATION_WINDOW: Duration = Duration::from_millis(1200);
 
 /// Internal application messages, separate from agent events.
-pub enum AppMsg {
+enum AppMsg {
     /// $EDITOR session finished - resume drawing
     EditorDone,
 }
@@ -40,33 +40,33 @@ struct SessionSaveRequest {
 }
 
 pub struct App {
-    pub blocks: Vec<Block>,
-    pub steps_group_idx: Option<usize>,
-    pub active_ask: Option<usize>,
-    pub input: InputState,
-    pub scroll_from_end: usize,
+    pub(crate) blocks: Vec<Block>,
+    pub(crate) steps_group_idx: Option<usize>,
+    pub(crate) active_ask: Option<usize>,
+    pub(crate) input: InputState,
+    pub(crate) scroll_from_end: usize,
     /// transcript row count at the previous frame - keeps manual scroll
     /// anchored while new content arrives
-    pub scroll_total_seen: usize,
-    pub running: bool,
-    pub started_at: Option<Instant>,
-    pub thinking_since: Option<Instant>,
-    pub mode: Mode,
-    pub model_name: String,
-    pub ctx_used: u64,
-    pub ctx_window: u64,
-    pub escalation: Option<Instant>,
-    pub quit: bool,
-    pub hitmap: Vec<Hit>,
+    pub(crate) scroll_total_seen: usize,
+    pub(crate) running: bool,
+    pub(crate) started_at: Option<Instant>,
+    pub(crate) thinking_since: Option<Instant>,
+    pub(crate) mode: Mode,
+    pub(crate) model_name: String,
+    pub(crate) ctx_used: u64,
+    pub(crate) ctx_window: u64,
+    pub(crate) escalation: Option<Instant>,
+    pub(crate) quit: bool,
+    pub(crate) hitmap: Vec<Hit>,
     /// keyboard focus over expandable transcript elements: (block_idx, step_idx)
     /// (step_idx == usize::MAX means a group/thought header)
-    pub focus: Option<(usize, usize)>,
-    pub transcript_area: ratatui::layout::Rect,
-    pub palette_sel: usize,
-    pub models_cache: Vec<String>,
-    pub cfg: Arc<Config>,
-    pub agent: Arc<Agent<OpenAiProvider>>,
-    pub memory: Memory,
+    pub(crate) focus: Option<(usize, usize)>,
+    pub(crate) transcript_area: ratatui::layout::Rect,
+    pub(crate) palette_sel: usize,
+    pub(crate) models_cache: Vec<String>,
+    pub(crate) cfg: Arc<Config>,
+    pub(crate) agent: Arc<Agent<OpenAiProvider>>,
+    pub(crate) memory: Memory,
     history_path: PathBuf,
     history_error_reported: bool,
     /// Ordered background persistence. The worker owns the current session
@@ -83,7 +83,7 @@ pub struct App {
     /// call - gates promotion of a folded Narration to a visible answer
     final_turn_had_post_prose: bool,
     /// action currently executing, shown in present tense until its final step arrives
-    pub live_step: Option<(String, String)>,
+    pub(crate) live_step: Option<(String, String)>,
     file_index: Arc<Mutex<Vec<String>>>,
     ctl_tx: Option<mpsc::UnboundedSender<Ctl>>,
     app_tx: mpsc::UnboundedSender<AppMsg>,
@@ -306,7 +306,7 @@ impl App {
         }
     }
 
-    pub fn on_click(&mut self, row: u16) {
+    pub(crate) fn on_click(&mut self, row: u16) {
         let rel = row.saturating_sub(self.transcript_area.y) as usize;
         let Some(hit) = self.hitmap.get(rel).copied() else {
             return;
@@ -357,7 +357,7 @@ impl App {
 
     /// Expandable transcript elements in visual order. A step is listed when
     /// its detail actually respects Expand (diffs and captured output).
-    pub fn expandable_targets(&self) -> Vec<(usize, usize)> {
+    pub(crate) fn expandable_targets(&self) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         for (bi, block) in self.blocks.iter().enumerate() {
             match block {
@@ -386,7 +386,7 @@ impl App {
         out
     }
 
-    pub fn move_focus(&mut self, forward: bool) {
+    pub(crate) fn move_focus(&mut self, forward: bool) {
         let targets = self.expandable_targets();
         if targets.is_empty() {
             return;
@@ -411,7 +411,7 @@ impl App {
         self.focus = Some(targets[next]);
     }
 
-    pub fn toggle_focused(&mut self) -> bool {
+    pub(crate) fn toggle_focused(&mut self) -> bool {
         let Some((bi, si)) = self.focus else {
             return false;
         };
@@ -924,10 +924,6 @@ impl App {
                     level,
                 });
             }
-            AgentEvent::AssistantText(text) => {
-                // the concluding answer is shown verbatim, not folded into steps
-                self.blocks.push(Block::Assistant(clean(&text)));
-            }
             AgentEvent::Usage { prompt_tokens, .. } => {
                 if prompt_tokens > 0 {
                     self.ctx_used = prompt_tokens;
@@ -1256,7 +1252,7 @@ fn sanitize_step_start(view: crate::agent::StepStartView) -> (&'static str, Stri
     (view.verb.doing(), clean(&view.arg))
 }
 
-pub fn label_mode(m: Mode) -> &'static str {
+pub(crate) fn label_mode(m: Mode) -> &'static str {
     match m {
         Mode::Plan => "plan",
         Mode::Build => "build",

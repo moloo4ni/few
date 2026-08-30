@@ -1,5 +1,4 @@
 use crate::agent::{Detail, NoticeLevel, StepView, TaskOutcome, Verb};
-use ratatui::style::Style;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expand {
@@ -203,9 +202,4 @@ pub enum Hit {
     Block(usize),
     Step(usize, usize),
     PermOption(usize, usize),
-}
-
-pub struct RenderedRows {
-    pub spans: Vec<Vec<(String, Style)>>,
-    pub hits: Vec<Hit>,
 }
