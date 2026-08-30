@@ -1361,10 +1361,31 @@ fn run_editor_blocking(path: &PathBuf) -> anyhow::Result<()> {
             }
         });
 
-    crate::tui::suspend()?;
-    let result = std::process::Command::new(editor).arg(path).status();
-    crate::tui::resume()?;
-    result.context("editor could not be started").map(|_| ())
+    run_suspended(
+        crate::tui::suspend,
+        || {
+            std::process::Command::new(editor)
+                .arg(path)
+                .status()
+                .context("editor could not be started")
+                .map(|_| ())
+        },
+        crate::tui::resume,
+    )
+}
+
+fn run_suspended(
+    suspend: impl FnOnce() -> anyhow::Result<()>,
+    operation: impl FnOnce() -> anyhow::Result<()>,
+    resume: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if let Err(error) = suspend() {
+        let _ = resume();
+        return Err(error);
+    }
+    let operation_result = operation();
+    let resume_result = resume();
+    operation_result.and(resume_result)
 }
 
 #[cfg(test)]
@@ -1380,6 +1401,53 @@ mod history_escape_tests {
         // a literal backslash survives the roundtrip
         let bs = "path\\to\\file";
         assert_eq!(unescape_history(&escape_history(bs)), bs);
+    }
+
+    #[test]
+    fn suspended_operation_always_resumes_and_preserves_its_error() {
+        let resumed = std::cell::Cell::new(false);
+        let error = run_suspended(
+            || Ok(()),
+            || anyhow::bail!("editor failed first"),
+            || {
+                resumed.set(true);
+                anyhow::bail!("resume also failed")
+            },
+        )
+        .unwrap_err();
+
+        assert!(resumed.get());
+        assert_eq!(error.to_string(), "editor failed first");
+    }
+
+    #[test]
+    fn suspended_operation_reports_resume_failure_after_success() {
+        let error =
+            run_suspended(|| Ok(()), || Ok(()), || anyhow::bail!("resume failed")).unwrap_err();
+
+        assert_eq!(error.to_string(), "resume failed");
+    }
+
+    #[test]
+    fn suspended_operation_recovers_from_partial_suspend_failure() {
+        let operated = std::cell::Cell::new(false);
+        let resumed = std::cell::Cell::new(false);
+        let error = run_suspended(
+            || anyhow::bail!("suspend failed"),
+            || {
+                operated.set(true);
+                Ok(())
+            },
+            || {
+                resumed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!operated.get());
+        assert!(resumed.get());
+        assert_eq!(error.to_string(), "suspend failed");
     }
 
     #[test]
