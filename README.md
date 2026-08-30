@@ -59,6 +59,29 @@ Few reads `<project>/.few/config.toml` (per-project, overrides global) and
 automatically after each completed task as JSON under the user's data directory
 (`sessions/`), never inside the project.
 
+### Verified providers and models
+
+Live compatibility is exercised with the ignored tests in `tests/live.rs`.
+Results below describe observed API behavior, not a permanent provider guarantee.
+
+| Provider | Model | Streaming | Native tools | Live result |
+|---|---|---:|---:|---|
+| Mistral | `codestral-2508` | yes | yes | file task, repeated verify failure, session resume, and context compaction passed |
+| OpenRouter | `dots-studio/dots-3-note-preview:free` | yes | yes | file task passed; further runs reached the account's free daily limit |
+| OpenRouter | `thinkingmachines/inkling:free` | not tested | not tested | HTTP 403: restricted to approved agentic harnesses |
+| OpenRouter | `thinkingmachines/inkling-small:free` | not tested | not tested | HTTP 403: restricted to approved agentic harnesses |
+| OpenCode Zen | `mimo-v2.5-free` | not tested | not tested | provider free-usage limit reached during the startup probe |
+
+Run the live suite with an explicit provider to avoid ambiguity when `.env`
+contains several keys:
+
+```sh
+FEW_LIVE_BASE_URL=https://api.mistral.ai/v1 \
+FEW_LIVE_API_KEY="$MISTRAL_API_KEY" \
+FEW_LIVE_MODEL=codestral-2508 \
+cargo test --test live -- --ignored --nocapture
+```
+
 TLS ships as the default `tls` feature (`reqwest` + `rustls`). Alternatives: an HTTP-only
 build (`--no-default-features`) or the OS-native backend
 (`--no-default-features --features tls-native`) for toolchains without a C compiler.
