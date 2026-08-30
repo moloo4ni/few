@@ -1,5 +1,6 @@
 use crate::diffgen::{self, DiffLine};
 use serde_json::json;
+use std::path::Path;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -347,6 +348,7 @@ async fn drain(
 
 pub async fn run_shell(
     override_prog: Option<&str>,
+    cwd: &Path,
     command: &str,
     byte_cap: usize,
     ctl_rx: &mut mpsc::UnboundedReceiver<Ctl>,
@@ -355,6 +357,7 @@ pub async fn run_shell(
     let (prog, extra_args) = shell_program(override_prog);
     let mut cmd = tokio::process::Command::new(prog);
     cmd.args(extra_args).arg(command);
+    cmd.current_dir(cwd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -625,10 +628,18 @@ mod tests {
         let mut rx = rx;
         let mut stash = Vec::new();
         let prog = if cfg!(windows) { None } else { Some("/bin/sh") };
-        let run = run_shell(prog, "echo hello", 1000, &mut rx, &mut stash).await;
+        let root = tmpdir("shell");
+        let command = if cfg!(windows) {
+            "echo hello>cwd-marker"
+        } else {
+            "echo hello; touch cwd-marker"
+        };
+        let run = run_shell(prog, &root, command, 1000, &mut rx, &mut stash).await;
         if cfg!(unix) {
             assert!(run.success);
             assert!(run.capture.stdout.contains("hello"));
         }
+        assert!(root.join("cwd-marker").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
