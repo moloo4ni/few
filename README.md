@@ -52,6 +52,7 @@ Run **from inside the project directory** you want Few to work in:
 cd /path/to/your/project
 /path/to/few/target/release/few        # start a fresh session
 /path/to/few/target/release/few -c     # resume the last session for this project
+/path/to/few/target/release/few --help # show all startup options
 ```
 
 Few recognizes a project from a bounded set of root markers such as `.git`,
