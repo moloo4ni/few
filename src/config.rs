@@ -246,6 +246,10 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
     let global = read_toml(&paths.global_config_file())?.unwrap_or_default();
     let pcfg = project_config_file(root);
     let project = read_toml(&pcfg)?.unwrap_or_default();
+    // Authorization is deliberately per-project. Global defaults still merge
+    // normally, but a global grant must never authorize the same relative path
+    // or shell command in unrelated repositories.
+    let project_grants = project.permissions.granted.clone();
     let merged = global.merge(project);
 
     let model = merged.provider.model.clone().ok_or_else(|| {
@@ -283,7 +287,7 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
         shell_output_bytes: merged.limits.shell_output_bytes.unwrap_or(262_144),
         diff_lines: merged.limits.diff_lines.unwrap_or(400),
         sensitive_extra: merged.permissions.sensitive.extra.clone(),
-        granted: merged.permissions.granted.clone(),
+        granted: project_grants,
         perm_write_default: merged
             .permissions
             .filesystem
@@ -483,6 +487,45 @@ mod tests {
         );
         assert_eq!(m.permissions.granted.len(), 2);
         assert_eq!(m.permissions.sensitive.extra, vec!["x*", "y*"]);
+    }
+
+    #[test]
+    fn load_keeps_grants_strictly_project_scoped() {
+        let dir = std::env::temp_dir().join(format!("few-grant-scope-{}", std::process::id()));
+        let root = dir.join("project");
+        let config_dir = dir.join("config");
+        let data_dir = dir.join("data");
+        let cache_dir = dir.join("cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(root.join(".few")).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[provider]\nmodel = \"m\"\n[permissions.granted]\n\"global.txt\" = \"write\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".few/config.toml"),
+            "[permissions.granted]\n\"local.txt\" = \"write\"\n",
+        )
+        .unwrap();
+        let paths = crate::paths::Paths {
+            config_dir,
+            data_dir,
+            cache_dir,
+            state_dir: None,
+        };
+
+        let cfg = load(&paths, &root).unwrap();
+        assert_eq!(cfg.granted.len(), 1);
+        assert_eq!(
+            cfg.granted.get("local.txt").map(String::as_str),
+            Some("write")
+        );
+        assert!(!cfg.granted.contains_key("global.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
