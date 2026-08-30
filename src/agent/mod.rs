@@ -221,7 +221,7 @@ impl<P: Provider> Agent<P> {
     }
 
     pub fn refresh_memory_layer(&self) {
-        let rendered = self.memory.render_for_prompt();
+        let rendered = self.memory.render_for_prompt(self.cfg.project_detected);
         *self.sys_memory.lock().unwrap() = if rendered.is_empty() {
             String::new()
         } else {
@@ -592,6 +592,7 @@ mod tests {
         Arc::new(Config {
             project_root: root.to_path_buf(),
             project_config_path: root.join(".few/config.toml"),
+            project_detected: true,
             retry_threshold: 2,
             ..Default::default()
         })
@@ -604,6 +605,7 @@ mod tests {
             Default::default(),
             Policy::Ask,
             Policy::Ask,
+            true,
         )));
         PermEngine::lock(&perms).set_mode(Mode::Auto);
         let mem = Memory::new(root, &root.join(".data"));

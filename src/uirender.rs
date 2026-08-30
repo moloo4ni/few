@@ -775,6 +775,7 @@ mod tests {
             context_window: 200_000,
             project_root: root.clone(),
             project_config_path: root.join(".few/config.toml"),
+            project_detected: true,
             ..Default::default()
         });
         let perms = Arc::new(Mutex::new(PermEngine::new(
@@ -783,6 +784,7 @@ mod tests {
             Default::default(),
             Policy::Ask,
             Policy::Ask,
+            true,
         )));
         let memory = Memory::new(&root, &root.join(".data"));
         let provider = OpenAiProvider::new("http://127.0.0.1:9/v1", None, "test-model").unwrap();

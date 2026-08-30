@@ -185,6 +185,7 @@ pub struct Config {
     pub perm_network_default: Policy,
     pub project_root: PathBuf,
     pub project_config_path: PathBuf,
+    pub project_detected: bool,
 }
 
 impl Default for Config {
@@ -211,8 +212,28 @@ impl Default for Config {
             perm_network_default: Policy::Deny,
             project_root: PathBuf::new(),
             project_config_path: PathBuf::new(),
+            project_detected: false,
         }
     }
+}
+
+const PROJECT_MARKERS: &[&str] = &[
+    ".git",
+    "Cargo.toml",
+    "go.mod",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "Gemfile",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+];
+
+pub fn project_detected(root: &Path) -> bool {
+    PROJECT_MARKERS
+        .iter()
+        .any(|marker| root.join(marker).exists())
 }
 
 pub fn project_config_file(root: &Path) -> PathBuf {
@@ -285,6 +306,7 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
             .unwrap_or(Policy::Deny),
         project_root: root.to_path_buf(),
         project_config_path: pcfg,
+        project_detected: project_detected(root),
     })
 }
 
@@ -487,5 +509,26 @@ extra = ["*.txt"]
         );
         assert_eq!(cfg.permissions.shell.default.as_deref(), Some("ask"));
         assert_eq!(cfg.permissions.network.default.as_deref(), Some("deny"));
+    }
+
+    #[test]
+    fn project_detection_uses_bounded_markers() {
+        let dir = std::env::temp_dir().join(format!("few-project-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a project marker").unwrap();
+        assert!(!project_detected(&dir));
+
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        assert!(project_detected(&dir));
+        std::fs::remove_file(dir.join("Cargo.toml")).unwrap();
+
+        std::fs::create_dir_all(dir.join(".few")).unwrap();
+        std::fs::write(dir.join(".few/config.toml"), "").unwrap();
+        assert!(
+            !project_detected(&dir),
+            "Few state must not raise the directory's trust level"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

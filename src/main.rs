@@ -39,7 +39,7 @@ async fn run() -> anyhow::Result<()> {
 
     let env = EnvInfo::discover(cfg.shell_program.as_deref());
     let memory = Memory::new(&root, &paths.data_dir);
-    memory.ensure_files()?;
+    memory.ensure_startup_files(cfg.project_detected)?;
 
     let perms = Arc::new(Mutex::new(PermEngine::new(
         root.clone(),
@@ -47,6 +47,7 @@ async fn run() -> anyhow::Result<()> {
         cfg.granted.clone(),
         cfg.perm_write_default,
         cfg.perm_shell_default,
+        cfg.project_detected,
     )));
     PermEngine::lock(&perms).set_mode(Mode::Build);
 
@@ -68,8 +69,8 @@ async fn run() -> anyhow::Result<()> {
 
     let layers = [
         sysprompt::BASE.to_owned(),
-        sysprompt::env_layer(&env),
-        sysprompt::project_layer(&root),
+        sysprompt::env_layer(&env, &root, cfg.project_detected),
+        sysprompt::project_layer(&root, cfg.project_detected),
         String::new(),
         sysprompt::mode_directive(Mode::Build),
     ];
