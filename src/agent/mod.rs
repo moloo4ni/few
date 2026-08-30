@@ -220,13 +220,14 @@ impl<P: Provider> Agent<P> {
         *self.sys_mode.lock().unwrap() = directive;
     }
 
-    pub fn refresh_memory_layer(&self) {
-        let rendered = self.memory.render_for_prompt(self.cfg.project_detected);
+    pub fn refresh_memory_layer(&self) -> Vec<String> {
+        let (rendered, warnings) = self.memory.render_for_prompt(self.cfg.project_detected);
         *self.sys_memory.lock().unwrap() = if rendered.is_empty() {
             String::new()
         } else {
             format!("## Memory\n\n{rendered}")
         };
+        warnings
     }
 
     pub fn snapshot_convo(&self) -> Vec<Msg> {

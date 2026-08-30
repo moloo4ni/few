@@ -363,7 +363,10 @@ async fn live_session_resume_restores_provider_context() {
         first.snapshot_convo(),
     )
     .unwrap();
-    let (_, saved) = session::load_latest(&sessions, &root).unwrap().unwrap();
+    let (_, saved) = session::load_latest(&sessions, &root)
+        .unwrap()
+        .session
+        .unwrap();
     let restored_count = saved.messages.len();
 
     let (perms, memory) = setup(&root);

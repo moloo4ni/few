@@ -74,8 +74,12 @@ impl Memory {
         }
     }
 
-    pub fn read_level(&self, level: MemLevel) -> String {
-        std::fs::read_to_string(self.level_path(level)).unwrap_or_default()
+    pub fn read_level(&self, level: MemLevel) -> std::io::Result<String> {
+        match std::fs::read_to_string(self.level_path(level)) {
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn entries(level_text: &str) -> Vec<String> {
@@ -87,13 +91,20 @@ impl Memory {
             .collect()
     }
 
-    pub fn render_for_prompt(&self, include_project: bool) -> String {
+    pub fn render_for_prompt(&self, include_project: bool) -> (String, Vec<String>) {
         let mut out = String::new();
+        let mut warnings = Vec::new();
         for level in [MemLevel::Project, MemLevel::Persistent] {
             if level == MemLevel::Project && !include_project {
                 continue;
             }
-            let text = self.read_level(level);
+            let text = match self.read_level(level) {
+                Ok(text) => text,
+                Err(error) => {
+                    warnings.push(format!("could not read {} memory: {error}", level.label()));
+                    continue;
+                }
+            };
             let facts = Self::entries(&text);
             if facts.is_empty() {
                 continue;
@@ -108,7 +119,7 @@ impl Memory {
             }
             out.push('\n');
         }
-        out.trim_end().to_owned()
+        (out.trim_end().to_owned(), warnings)
     }
 
     pub fn display_project_path(&self) -> String {
@@ -158,12 +169,55 @@ mod tests {
         std::fs::write(&memory.project_path, "- private project fact\n").unwrap();
         std::fs::write(&memory.persistent_path, "- persistent fact\n").unwrap();
 
-        let rendered = memory.render_for_prompt(false);
+        let (rendered, warnings) = memory.render_for_prompt(false);
+        assert!(warnings.is_empty());
         assert!(!rendered.contains("private project fact"));
         assert!(rendered.contains("persistent fact"));
-        assert!(memory
-            .render_for_prompt(true)
-            .contains("private project fact"));
+        let (rendered, warnings) = memory.render_for_prompt(true);
+        assert!(warnings.is_empty());
+        assert!(rendered.contains("private project fact"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_memory_is_empty_but_read_errors_are_reported() {
+        let dir = std::env::temp_dir().join(format!("few-memory-errors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let memory = Memory::new(&dir.join("project"), &dir.join("data"));
+
+        assert_eq!(memory.read_level(MemLevel::Persistent).unwrap(), "");
+        std::fs::create_dir_all(&memory.persistent_path).unwrap();
+        let (rendered, warnings) = memory.render_for_prompt(false);
+        assert!(rendered.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("persistent memory"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_memory_is_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("few-memory-denied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let memory = Memory::new(&dir.join("project"), &dir.join("data"));
+        memory.ensure_file(MemLevel::Persistent).unwrap();
+        std::fs::set_permissions(
+            &memory.persistent_path,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let (_, warnings) = memory.render_for_prompt(false);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("persistent memory"));
+        std::fs::set_permissions(
+            &memory.persistent_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
