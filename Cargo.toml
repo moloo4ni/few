@@ -1,6 +1,6 @@
 [package]
 name = "few"
-version = "0.1.0-pre.2"
+version = "0.1.0-pre.3"
 edition = "2021"
 license = "MPL-2.0"
 description = "A small, fast autonomous terminal coding agent"
