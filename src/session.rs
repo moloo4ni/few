@@ -141,7 +141,12 @@ pub fn load_latest(
 
 fn list_session_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -278,6 +283,18 @@ mod tests {
         std::fs::create_dir_all(&stranger).unwrap();
         assert!(load_latest(&dir, &stranger).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_sessions_directory_is_empty_history() {
+        let base = temp_dir("missing");
+        let sessions = base.join("not-created-yet");
+        let root = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(load_latest(&sessions, &root).unwrap().is_none());
+        assert!(!sessions.exists(), "loading must not create state");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
