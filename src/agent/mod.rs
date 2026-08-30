@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::diffgen::DiffLine;
 use crate::memory::Memory;
 use crate::perms::{Grant, PermEngine};
-use crate::providers::{Msg, Provider, ProviderError, Reply, Role, StreamDelta};
+use crate::providers::{Msg, Provider, ProviderError, Reply, Role, StreamDelta, ToolCall, ToolDef};
 use crate::tools::{self, Ctl};
 use std::collections::HashMap;
 
@@ -20,6 +20,11 @@ const SOFT_NOTE: &str = "[user pressed Ctrl+C: the current operation was stopped
 enum TurnError {
     Aborted,
     Provider(ProviderError),
+}
+
+enum LoopAction {
+    Continue,
+    Finish(TaskOutcome),
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +282,199 @@ impl<P: Provider> Agent<P> {
         out
     }
 
+    fn prepare_turn(&self, ctx: &mut RunCtx<'_>) -> LoopAction {
+        self.maybe_compact(&ctx.ev);
+        let notes = ctx.take_boundary_notes();
+        if ctx.hard_abort {
+            ctx.report_abort();
+            return LoopAction::Finish(TaskOutcome::Aborted);
+        }
+        if !notes.is_empty() {
+            self.push_convo(Msg::user(notes));
+            ctx.wrote_since_user = false;
+        }
+        LoopAction::Continue
+    }
+
+    async fn request_turn(
+        &self,
+        tool_defs: &[ToolDef],
+        ctx: &mut RunCtx<'_>,
+    ) -> Result<Reply, TurnError> {
+        let messages = self.messages_with_system();
+        let thinking = Arc::new(AtomicBool::new(false));
+        let thinking_since = Arc::new(Mutex::new(None::<std::time::Instant>));
+        let event_sink = ctx.ev.clone();
+        let thinking_sink = Arc::clone(&thinking);
+        let since_sink = Arc::clone(&thinking_since);
+        let mut reply = Box::pin(self.provider.complete_streaming(
+            &messages,
+            tool_defs,
+            move |delta| match delta {
+                StreamDelta::Reasoning(text) => {
+                    if !thinking_sink.swap(true, Ordering::Relaxed) {
+                        *since_sink.lock().unwrap() = Some(std::time::Instant::now());
+                        let _ = event_sink.send(AgentEvent::ThinkingStarted);
+                    }
+                    let _ = event_sink.send(AgentEvent::ThoughtDelta { text });
+                }
+                StreamDelta::Text(text) => {
+                    let _ = event_sink.send(AgentEvent::AssistantDelta { text });
+                }
+            },
+        ));
+
+        let result = loop {
+            tokio::select! {
+                result = &mut reply => break result.map_err(TurnError::Provider),
+                control = ctx.ctl_rx.recv() => match control {
+                    None | Some(Ctl::HardAbort) => break Err(TurnError::Aborted),
+                    Some(other) => ctx.absorb(other),
+                }
+            }
+        };
+
+        if thinking.load(Ordering::Relaxed) {
+            let dur_ms = thinking_since
+                .lock()
+                .unwrap()
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let _ = ctx.ev.send(AgentEvent::ThinkingFinished { dur_ms });
+        }
+        let _ = ctx.ev.send(AgentEvent::TurnClosed);
+        result
+    }
+
+    fn record_reply(&self, reply: &Reply, ctx: &RunCtx<'_>) {
+        let _ = ctx.ev.send(AgentEvent::Usage {
+            prompt_tokens: reply.usage.prompt_tokens,
+            completion_tokens: reply.usage.completion_tokens,
+        });
+        self.last_prompt_tokens
+            .store(reply.usage.prompt_tokens, Ordering::Relaxed);
+        self.push_convo(Msg {
+            role: Role::Assistant,
+            content: reply.content.clone(),
+            tool_calls: reply.tool_calls.clone(),
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
+    fn report_provider_error(&self, error: ProviderError, ctx: &RunCtx<'_>) -> TaskOutcome {
+        match error {
+            ProviderError::NoToolSupport(message) => {
+                let _ = ctx.ev.send(AgentEvent::Notice {
+                    text: format!(
+                        "model lacks native structured tool-calling, refusing to continue: {message}"
+                    ),
+                    level: NoticeLevel::Error,
+                });
+                TaskOutcome::ProviderError(message)
+            }
+            ProviderError::Http(message) => {
+                let _ = ctx.ev.send(AgentEvent::Notice {
+                    text: format!("provider error: {message}"),
+                    level: NoticeLevel::Error,
+                });
+                TaskOutcome::ProviderError(message)
+            }
+        }
+    }
+
+    async fn finish_text_turn(
+        &self,
+        verify_plan: Option<&verify::VerifyPlan>,
+        verify_enabled: &mut bool,
+        tracker: &mut verify::RetryTracker,
+        ctx: &mut RunCtx<'_>,
+    ) -> LoopAction {
+        if !ctx.wrote_since_user {
+            return LoopAction::Finish(TaskOutcome::Done);
+        }
+        let Some(plan) = verify_plan.filter(|_| *verify_enabled) else {
+            return LoopAction::Finish(TaskOutcome::Done);
+        };
+        if ctx.step_limit_reached() {
+            ctx.report_step_limit();
+            return LoopAction::Finish(TaskOutcome::GaveUpSteps);
+        }
+
+        let verify_outcome = self.run_verify(plan, ctx).await;
+        ctx.steps += 1;
+        match verify_outcome {
+            exec::VerifyOutcome::Passed => {
+                tracker.reset();
+                LoopAction::Finish(TaskOutcome::Done)
+            }
+            exec::VerifyOutcome::Aborted => {
+                ctx.report_abort();
+                LoopAction::Finish(TaskOutcome::Aborted)
+            }
+            exec::VerifyOutcome::Denied(message) => {
+                *verify_enabled = false;
+                self.push_convo(Msg::user(format!(
+                    "[few verify] `{}` was not run:\n\n{}\n\nVerification was denied. Do not claim it passed; explain the unverified result without requesting the same command again.",
+                    plan.command, message
+                )));
+                LoopAction::Continue
+            }
+            exec::VerifyOutcome::Failed(tail) => {
+                let signature = verify::error_signature(&tail);
+                let exhausted = tracker.record_failure(&signature);
+                self.push_convo(Msg::user(format!(
+                    "[few verify] `{}` failed:\n\n{}\n\n{}",
+                    plan.command,
+                    tools::cap_for_model(&tail, 4000),
+                    if exhausted {
+                        "The same failure repeated too many times. Stop and explain the situation."
+                    } else {
+                        "Fix the problem. Finish only when verification passes."
+                    }
+                )));
+                if exhausted {
+                    let _ = ctx.ev.send(AgentEvent::Notice {
+                        text: format!("gave up (repeated error, {} attempts)", tracker.count()),
+                        level: NoticeLevel::Warn,
+                    });
+                    LoopAction::Finish(TaskOutcome::GaveUpRepeated)
+                } else {
+                    LoopAction::Continue
+                }
+            }
+        }
+    }
+
+    async fn execute_calls(&self, calls: Vec<ToolCall>, ctx: &mut RunCtx<'_>) -> LoopAction {
+        let mut calls = calls.into_iter();
+        while let Some(call) = calls.next() {
+            if ctx.step_limit_reached() {
+                self.push_convo(Msg::tool_result(
+                    &call.id,
+                    &call.name,
+                    "step limit reached; tool call was not executed",
+                ));
+                for pending in calls {
+                    self.push_convo(Msg::tool_result(
+                        &pending.id,
+                        &pending.name,
+                        "step limit reached; tool call was not executed",
+                    ));
+                }
+                ctx.report_step_limit();
+                return LoopAction::Finish(TaskOutcome::GaveUpSteps);
+            }
+            self.execute_call(call, ctx).await;
+            ctx.steps += 1;
+            if ctx.hard_abort {
+                ctx.report_abort();
+                return LoopAction::Finish(TaskOutcome::Aborted);
+            }
+        }
+        LoopAction::Continue
+    }
+
     pub async fn run(
         &self,
         task_text: String,
@@ -303,191 +501,36 @@ impl<P: Provider> Agent<P> {
             verify::resolve_verify(self.cfg.verify_command.as_deref(), &self.cfg.project_root);
         let mut verify_enabled = verify_plan.is_some();
         let mut tracker = verify::RetryTracker::new(self.cfg.retry_threshold);
-        let mut verify_tail;
         let tool_defs = tools::defs();
 
-        let outcome = 'agent: loop {
-            self.maybe_compact(&ctx.ev);
-            let notes = ctx.take_boundary_notes();
-            if !notes.is_empty() {
-                self.push_convo(Msg::user(notes));
-                ctx.wrote_since_user = false;
+        let outcome = loop {
+            if let LoopAction::Finish(outcome) = self.prepare_turn(&mut ctx) {
+                break outcome;
             }
-
-            let msgs = self.messages_with_system();
-            let think_flag = Arc::new(AtomicBool::new(false));
-            let think_first = Arc::new(Mutex::new(None::<std::time::Instant>));
-            let ev_sink = ctx.ev.clone();
-            let (flag_sink, first_sink) = (Arc::clone(&think_flag), Arc::clone(&think_first));
-            let mut reply_fut = Box::pin(self.provider.complete_streaming(
-                &msgs,
-                &tool_defs,
-                move |delta| match delta {
-                    StreamDelta::Reasoning(text) => {
-                        if !flag_sink.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            *first_sink.lock().unwrap() = Some(std::time::Instant::now());
-                            let _ = ev_sink.send(AgentEvent::ThinkingStarted);
-                        }
-                        let _ = ev_sink.send(AgentEvent::ThoughtDelta { text });
-                    }
-                    StreamDelta::Text(text) => {
-                        let _ = ev_sink.send(AgentEvent::AssistantDelta { text });
-                    }
-                },
-            ));
-
-            let reply: Result<Reply, TurnError> = loop {
-                tokio::select! {
-                    r = &mut reply_fut => break r.map_err(TurnError::Provider),
-                    c = ctx.ctl_rx.recv() => match c {
-                        None => break Err(TurnError::Aborted),
-                        Some(Ctl::HardAbort) => break Err(TurnError::Aborted),
-                        Some(other) => ctx.absorb(other),
-                    }
-                }
-            };
-
-            if think_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                let dur_ms = think_first
-                    .lock()
-                    .unwrap()
-                    .map(|t| t.elapsed().as_millis() as u64)
-                    .unwrap_or(0);
-                let _ = ctx.ev.send(AgentEvent::ThinkingFinished { dur_ms });
-            }
-            let _ = ctx.ev.send(AgentEvent::TurnClosed);
-
-            match reply {
+            let reply = match self.request_turn(&tool_defs, &mut ctx).await {
                 Err(TurnError::Aborted) => {
-                    let _ = ctx.ev.send(AgentEvent::Notice {
-                        text: "^C task aborted".into(),
-                        level: NoticeLevel::Warn,
-                    });
-                    let _ = ctx.ev.send(AgentEvent::Finished(TaskOutcome::Aborted));
-                    return TaskOutcome::Aborted;
+                    ctx.report_abort();
+                    break TaskOutcome::Aborted;
                 }
-                Err(TurnError::Provider(ProviderError::NoToolSupport(m))) => {
-                    let _ = ctx.ev.send(AgentEvent::Notice {
-                        text: format!(
-                            "model lacks native structured tool-calling, refusing to continue: {m}"
-                        ),
-                        level: NoticeLevel::Error,
-                    });
-                    break TaskOutcome::ProviderError(m);
-                }
-                Err(TurnError::Provider(ProviderError::Http(m))) => {
-                    let _ = ctx.ev.send(AgentEvent::Notice {
-                        text: format!("provider error: {m}"),
-                        level: NoticeLevel::Error,
-                    });
-                    break TaskOutcome::ProviderError(m);
-                }
-                Ok(reply) => {
-                    let _ = ctx.ev.send(AgentEvent::Usage {
-                        prompt_tokens: reply.usage.prompt_tokens,
-                        completion_tokens: reply.usage.completion_tokens,
-                    });
-                    self.last_prompt_tokens
-                        .store(reply.usage.prompt_tokens, Ordering::Relaxed);
-                    self.push_convo(Msg {
-                        role: Role::Assistant,
-                        content: reply.content.clone(),
-                        tool_calls: reply.tool_calls.clone(),
-                        tool_call_id: None,
-                        name: None,
-                    });
+                Err(TurnError::Provider(error)) => break self.report_provider_error(error, &ctx),
+                Ok(reply) => reply,
+            };
+            self.record_reply(&reply, &ctx);
 
-                    if reply.tool_calls.is_empty() {
-                        if ctx.wrote_since_user {
-                            if let Some(plan) = verify_plan.as_ref().filter(|_| verify_enabled) {
-                                if ctx.step_limit_reached() {
-                                    ctx.report_step_limit();
-                                    break 'agent TaskOutcome::GaveUpSteps;
-                                }
-                                let verify_outcome = self.run_verify(plan, &mut ctx).await;
-                                ctx.steps += 1;
-                                match verify_outcome {
-                                    exec::VerifyOutcome::Passed => {
-                                        tracker.reset();
-                                        break TaskOutcome::Done;
-                                    }
-                                    exec::VerifyOutcome::Aborted => {
-                                        let _ = ctx.ev.send(AgentEvent::Notice {
-                                            text: "^C task aborted".into(),
-                                            level: NoticeLevel::Warn,
-                                        });
-                                        let _ =
-                                            ctx.ev.send(AgentEvent::Finished(TaskOutcome::Aborted));
-                                        return TaskOutcome::Aborted;
-                                    }
-                                    exec::VerifyOutcome::Denied(msg) => {
-                                        verify_enabled = false;
-                                        self.push_convo(Msg::user(format!(
-                                            "[few verify] `{}` was not run:\n\n{}\n\nVerification was denied. Do not claim it passed; explain the unverified result without requesting the same command again.",
-                                            plan.command, msg
-                                        )));
-                                        continue;
-                                    }
-                                    exec::VerifyOutcome::Failed(tail) => verify_tail = tail,
-                                }
-                                let sig = verify::error_signature(&verify_tail);
-                                let exhausted = tracker.record_failure(&sig);
-                                self.push_convo(Msg::user(format!(
-                                    "[few verify] `{}` failed:\n\n{}\n\n{}",
-                                    plan.command,
-                                    tools::cap_for_model(&verify_tail, 4000),
-                                    if exhausted {
-                                        "The same failure repeated too many times. Stop and explain the situation."
-                                    } else {
-                                        "Fix the problem. Finish only when verification passes."
-                                    }
-                                )));
-                                if exhausted {
-                                    let _ = ctx.ev.send(AgentEvent::Notice {
-                                        text: format!(
-                                            "gave up (repeated error, {} attempts)",
-                                            tracker.count()
-                                        ),
-                                        level: NoticeLevel::Warn,
-                                    });
-                                    break TaskOutcome::GaveUpRepeated;
-                                }
-                                continue;
-                            }
-                        }
-                        break TaskOutcome::Done;
-                    }
-
-                    let mut calls = reply.tool_calls.into_iter();
-                    while let Some(tc) = calls.next() {
-                        if ctx.step_limit_reached() {
-                            self.push_convo(Msg::tool_result(
-                                &tc.id,
-                                &tc.name,
-                                "step limit reached; tool call was not executed",
-                            ));
-                            for pending in calls {
-                                self.push_convo(Msg::tool_result(
-                                    &pending.id,
-                                    &pending.name,
-                                    "step limit reached; tool call was not executed",
-                                ));
-                            }
-                            ctx.report_step_limit();
-                            break 'agent TaskOutcome::GaveUpSteps;
-                        }
-                        self.execute_call(tc, &mut ctx).await;
-                        ctx.steps += 1;
-                        if ctx.hard_abort {
-                            let _ = ctx.ev.send(AgentEvent::Notice {
-                                text: "^C task aborted".into(),
-                                level: NoticeLevel::Warn,
-                            });
-                            let _ = ctx.ev.send(AgentEvent::Finished(TaskOutcome::Aborted));
-                            return TaskOutcome::Aborted;
-                        }
-                    }
-                }
+            let action = if reply.tool_calls.is_empty() {
+                self.finish_text_turn(
+                    verify_plan.as_ref(),
+                    &mut verify_enabled,
+                    &mut tracker,
+                    &mut ctx,
+                )
+                .await
+            } else {
+                self.execute_calls(reply.tool_calls, &mut ctx).await
+            };
+            match action {
+                LoopAction::Continue => continue,
+                LoopAction::Finish(outcome) => break outcome,
             }
         };
 
@@ -518,6 +561,13 @@ impl RunCtx<'_> {
     fn report_step_limit(&self) {
         let _ = self.ev.send(AgentEvent::Notice {
             text: "gave up (step limit)".into(),
+            level: NoticeLevel::Warn,
+        });
+    }
+
+    fn report_abort(&self) {
+        let _ = self.ev.send(AgentEvent::Notice {
+            text: "^C task aborted".into(),
             level: NoticeLevel::Warn,
         });
     }
@@ -741,6 +791,48 @@ mod tests {
             event,
             AgentEvent::Notice { text, .. } if text.starts_with("provider error:")
         )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queued_hard_abort_stops_before_the_next_provider_turn() {
+        let root = temp_root("queued-provider-abort");
+        let (perms, mem) = setup(&root);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let agent = Agent::new(
+            PendingProvider {
+                started: started_tx,
+            },
+            test_cfg(&root),
+            perms,
+            mem,
+            Default::default(),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        control_tx.send(Ctl::HardAbort).unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            agent.run("stop before request".into(), event_tx, control_rx),
+        )
+        .await
+        .expect("queued hard abort must not wait for the provider");
+
+        assert_eq!(outcome, TaskOutcome::Aborted);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "provider must not be called"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Finished(TaskOutcome::Aborted)))
+                .count(),
+            1,
+            "run owns exactly one terminal event"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
