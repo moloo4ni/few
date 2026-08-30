@@ -703,6 +703,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_shell_grant_is_used_by_agent_path() {
+        let root = temp_root("shell-grant");
+        let command = "echo granted";
+        let mut granted = std::collections::BTreeMap::new();
+        granted.insert(PermEngine::shell_key(command), "execute".into());
+        let perms = Arc::new(Mutex::new(PermEngine::new(
+            root.clone(),
+            vec![],
+            granted,
+            Policy::Ask,
+            Policy::Ask,
+            true,
+        )));
+        let mem = Memory::new(&root, &root.join(".data"));
+        let prov = Scripted::new(vec![
+            reply_call("shell", &format!(r#"{{"command":"{command}"}}"#)),
+            reply_text("done"),
+        ]);
+        let agent = Agent::new(prov, test_cfg(&root), perms, mem, Default::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_ttx, trx) = mpsc::unbounded_channel();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.run("run the granted command".into(), tx, trx),
+        )
+        .await
+        .expect("a persisted grant must avoid waiting for permission");
+        assert_eq!(outcome, TaskOutcome::Done);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, AgentEvent::PermAsk(_))),
+            "the production shell path must recognize the persisted grant"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn verify_failure_feeds_back_then_gives_up() {
         let root = temp_root("v");
         let (perms, mem) = setup(&root);
