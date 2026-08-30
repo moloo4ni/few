@@ -173,11 +173,11 @@ impl<P: Provider> Agent<P> {
                             };
                             (engine.apply_grant(cap, &key, g), key)
                         };
-                        if persist.0 {
+                        if let Some(value) = persist.0 {
                             if let Err(e) = crate::config::persist_grant(
                                 &ctx.cfg.project_config_path,
                                 &persist.1,
-                                cap.short(),
+                                &value,
                             ) {
                                 let _ = ctx.ev.send(AgentEvent::Notice {
                                     text: format!(
