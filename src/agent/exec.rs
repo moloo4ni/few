@@ -28,6 +28,7 @@ impl<P: Provider> Agent<P> {
         let mut stash = std::mem::take(&mut ctx.stash);
         let run = tools::run_shell(
             ctx.cfg.shell_program.as_deref(),
+            &ctx.cfg.project_root,
             &plan.command,
             ctx.cfg.shell_output_bytes,
             &mut ctx.ctl_rx,
@@ -397,6 +398,7 @@ impl<P: Provider> Agent<P> {
         let mut stash = std::mem::take(&mut ctx.stash);
         let run = tools::run_shell(
             ctx.cfg.shell_program.as_deref(),
+            &ctx.cfg.project_root,
             &command,
             ctx.cfg.shell_output_bytes,
             &mut ctx.ctl_rx,

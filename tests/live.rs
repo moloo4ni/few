@@ -81,7 +81,10 @@ fn live_env() -> Option<(String, Option<String>, String)> {
     None
 }
 
-async fn drain_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
+async fn drain_events(
+    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
+    ctl_tx: mpsc::UnboundedSender<Ctl>,
+) {
     while let Some(ev) = rx.recv().await {
         match ev {
             AgentEvent::Step(s) => println!("step · {} {}", s.verb.word(), s.arg),
@@ -102,7 +105,14 @@ async fn drain_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
                 completion_tokens,
             } => println!("usage · prompt={prompt_tokens} completion={completion_tokens}"),
             AgentEvent::PermAsk(v) => {
-                println!("perm ask · {} {} [{}]", v.verb, v.target, v.cap_label)
+                println!(
+                    "perm ask · {} {} [{}] -> denied",
+                    v.verb, v.target, v.cap_label
+                );
+                let _ = ctl_tx.send(Ctl::PermChoice {
+                    id: v.id,
+                    grant: None,
+                });
             }
             AgentEvent::Finished(o) => println!("finished · {o:?}"),
         }
@@ -168,7 +178,7 @@ async fn live_agent_completes_file_task() {
     let runner = Arc::clone(&agent);
     let handle = tokio::spawn(async move { runner.run(task.to_owned(), ev_tx, ctl_rx).await });
 
-    let collector = tokio::spawn(drain_events(ev_rx));
+    let collector = tokio::spawn(drain_events(ev_rx, ctl_tx));
 
     let outcome = tokio::time::timeout(Duration::from_secs(240), handle)
         .await
@@ -192,7 +202,6 @@ async fn live_agent_completes_file_task() {
     );
 
     drop(collector);
-    let _ = ctl_tx;
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -239,14 +248,18 @@ async fn live_verify_gives_up_on_repeated_failure() {
     let handle = tokio::spawn(async move {
         runner
             .run(
-                "Create note.txt containing the word ok.".to_owned(),
+                "Create note.txt containing the word ok. The configured verification command is \
+                 intentionally guaranteed to fail. After each verification failure, overwrite \
+                 note.txt with ok again and finish immediately; do not investigate the command \
+                 or project. Few must stop the repeated failures at its retry threshold."
+                    .to_owned(),
                 ev_tx,
                 ctl_rx,
             )
             .await
     });
 
-    let collector = tokio::spawn(drain_events(ev_rx));
+    let collector = tokio::spawn(drain_events(ev_rx, ctl_tx));
 
     let outcome = tokio::time::timeout(Duration::from_secs(300), handle)
         .await
@@ -270,6 +283,5 @@ async fn live_verify_gives_up_on_repeated_failure() {
     );
 
     drop(collector);
-    let _ = ctl_tx;
     let _ = std::fs::remove_dir_all(&root);
 }
