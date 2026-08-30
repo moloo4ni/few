@@ -83,7 +83,7 @@ jobs:
           mkdir -p "dist/${archive}"
           cp "target/${{ matrix.target }}/release/few" README.md LICENSE "dist/${archive}/"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: few-${{ matrix.target }}
           path: dist/few-*-${{ matrix.target }}.tar.gz
@@ -94,7 +94,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: few-*
           path: dist
@@ -104,7 +104,7 @@ jobs:
           cd dist
           sha256sum few-*.tar.gz | sort -k2 > SHA256SUMS
           sha256sum --check SHA256SUMS
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: few-release-bundle
           path: dist/*
@@ -118,7 +118,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: few-release-bundle
           path: dist
