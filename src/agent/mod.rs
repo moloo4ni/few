@@ -298,6 +298,7 @@ impl<P: Provider> Agent<P> {
 
         let verify_plan =
             verify::resolve_verify(self.cfg.verify_command.as_deref(), &self.cfg.project_root);
+        let mut verify_enabled = verify_plan.is_some();
         let mut tracker = verify::RetryTracker::new(self.cfg.retry_threshold);
         let mut verify_tail;
         let tool_defs = tools::defs();
@@ -395,13 +396,32 @@ impl<P: Provider> Agent<P> {
 
                     if reply.tool_calls.is_empty() {
                         if ctx.wrote_since_user {
-                            if let Some(plan) = &verify_plan {
-                                let (ok, tail) = self.run_verify(plan, &mut ctx).await;
-                                verify_tail = tail;
+                            if let Some(plan) = verify_plan.as_ref().filter(|_| verify_enabled) {
+                                let verify_outcome = self.run_verify(plan, &mut ctx).await;
                                 ctx.steps += 1;
-                                if ok {
-                                    tracker.reset();
-                                    break TaskOutcome::Done;
+                                match verify_outcome {
+                                    exec::VerifyOutcome::Passed => {
+                                        tracker.reset();
+                                        break TaskOutcome::Done;
+                                    }
+                                    exec::VerifyOutcome::Aborted => {
+                                        let _ = ctx.ev.send(AgentEvent::Notice {
+                                            text: "^C task aborted".into(),
+                                            level: NoticeLevel::Warn,
+                                        });
+                                        let _ =
+                                            ctx.ev.send(AgentEvent::Finished(TaskOutcome::Aborted));
+                                        return TaskOutcome::Aborted;
+                                    }
+                                    exec::VerifyOutcome::Denied(msg) => {
+                                        verify_enabled = false;
+                                        self.push_convo(Msg::user(format!(
+                                            "[few verify] `{}` was not run:\n\n{}\n\nVerification was denied. Do not claim it passed; explain the unverified result without requesting the same command again.",
+                                            plan.command, msg
+                                        )));
+                                        continue;
+                                    }
+                                    exec::VerifyOutcome::Failed(tail) => verify_tail = tail,
                                 }
                                 ctx.errors += 1;
                                 let sig = verify::error_signature(&verify_tail);
@@ -771,6 +791,138 @@ mod tests {
             notes, 2,
             "failure injected each cycle; give-up on second identical signature"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn configured_verify_requires_shell_permission() {
+        let root = temp_root("verify-permission");
+        let marker = root.join("verify-ran");
+        let command = format!("touch {}", marker.display());
+        let perms = Arc::new(Mutex::new(PermEngine::new(
+            root.clone(),
+            vec![],
+            Default::default(),
+            Policy::Allow,
+            Policy::Ask,
+            true,
+        )));
+        let mem = Memory::new(&root, &root.join(".data"));
+        let cfg = Config {
+            verify_command: Some(command.clone()),
+            ..(*test_cfg(&root)).clone()
+        };
+        let prov = Scripted::new(vec![
+            reply_call("write", r#"{"path":"f.txt","content":"x"}"#),
+            reply_text("done"),
+            reply_text("verification was denied"),
+        ]);
+        let agent = Agent::new(prov, Arc::new(cfg), perms, mem, Default::default());
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let run = agent.run("do it".into(), ev_tx, ctl_rx);
+        tokio::pin!(run);
+        let mut permission_prompts = 0;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut run => break outcome,
+                Some(event) = ev_rx.recv() => {
+                    if let AgentEvent::PermAsk(ask) = event {
+                        permission_prompts += 1;
+                        assert_eq!(ask.target, command);
+                        ctl_tx.send(Ctl::PermChoice { id: ask.id, grant: None }).unwrap();
+                    }
+                }
+            }
+        };
+
+        assert_eq!(outcome, TaskOutcome::Done);
+        assert_eq!(permission_prompts, 1, "denied verify must not re-prompt");
+        assert!(!marker.exists(), "denied verify command must not execute");
+        assert!(agent.snapshot_convo().iter().any(|message| {
+            message.role == Role::User
+                && message.content.contains("[few verify]")
+                && message.content.contains("was not run")
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn configured_verify_honors_shell_grant() {
+        let root = temp_root("verify-grant");
+        let marker = root.join("verify-ran");
+        let command = format!("touch {}", marker.display());
+        let mut granted = std::collections::BTreeMap::new();
+        granted.insert(PermEngine::shell_key(&command), "execute".into());
+        let perms = Arc::new(Mutex::new(PermEngine::new(
+            root.clone(),
+            vec![],
+            granted,
+            Policy::Allow,
+            Policy::Ask,
+            true,
+        )));
+        let mem = Memory::new(&root, &root.join(".data"));
+        let cfg = Config {
+            verify_command: Some(command),
+            ..(*test_cfg(&root)).clone()
+        };
+        let prov = Scripted::new(vec![
+            reply_call("write", r#"{"path":"f.txt","content":"x"}"#),
+            reply_text("done"),
+        ]);
+        let agent = Agent::new(prov, Arc::new(cfg), perms, mem, Default::default());
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            agent.run("do it".into(), ev_tx, ctl_rx).await,
+            TaskOutcome::Done
+        );
+        assert!(marker.exists(), "granted verify command must execute");
+        assert!(!std::iter::from_fn(|| ev_rx.try_recv().ok())
+            .any(|event| matches!(event, AgentEvent::PermAsk(_))));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn auto_detected_verify_requires_shell_permission() {
+        let root = temp_root("verify-auto-permission");
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        let perms = Arc::new(Mutex::new(PermEngine::new(
+            root.clone(),
+            vec![],
+            Default::default(),
+            Policy::Allow,
+            Policy::Ask,
+            true,
+        )));
+        let mem = Memory::new(&root, &root.join(".data"));
+        let prov = Scripted::new(vec![
+            reply_call("write", r#"{"path":"f.txt","content":"x"}"#),
+            reply_text("done"),
+            reply_text("verification was denied"),
+        ]);
+        let agent = Agent::new(prov, test_cfg(&root), perms, mem, Default::default());
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let run = agent.run("do it".into(), ev_tx, ctl_rx);
+        tokio::pin!(run);
+        let mut permission_prompts = 0;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut run => break outcome,
+                Some(event) = ev_rx.recv() => {
+                    if let AgentEvent::PermAsk(ask) = event {
+                        permission_prompts += 1;
+                        assert_eq!(ask.target, "cargo test");
+                        ctl_tx.send(Ctl::PermChoice { id: ask.id, grant: None }).unwrap();
+                    }
+                }
+            }
+        };
+
+        assert_eq!(outcome, TaskOutcome::Done);
+        assert_eq!(permission_prompts, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

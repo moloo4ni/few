@@ -28,7 +28,8 @@ and its contract evolves deliberately; the current canonical contract is in the
 - **Modes** - `plan` / `build` / `auto-approve` - presets of one permission matrix.
 - **Verify before done**: after file changes a verification command runs automatically
   (ecosystem auto-detect or `[verify] command`); three identical failures in a row and the
-  agent gives up honestly instead of hammering.
+  agent gives up honestly instead of hammering. Verify uses the ordinary `shell.execute`
+  permission path; a denial is reported to the model and is not repeatedly requested.
 - **Native structured tool-calling only**: a model without it gets an explicit refusal at
   startup; prompt-based fallback is rejected on principle.
 - **Memory** - human-readable markdown files outside the working directory (XDG layout);

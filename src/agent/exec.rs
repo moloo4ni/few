@@ -13,12 +13,41 @@ use crate::providers::{Msg, Provider, ToolCall};
 use crate::tools::{self, Ctl};
 use std::path::{Path, PathBuf};
 
+pub(super) enum VerifyOutcome {
+    Passed,
+    Failed(String),
+    Denied(String),
+    Aborted,
+}
+
 impl<P: Provider> Agent<P> {
     pub(super) async fn run_verify(
         &self,
         plan: &VerifyPlan,
         ctx: &mut RunCtx<'_>,
-    ) -> (bool, String) {
+    ) -> VerifyOutcome {
+        match self
+            .gate(
+                ctx,
+                Capability::ShellExec,
+                Some(Path::new(&plan.command)),
+                plan.command.clone(),
+            )
+            .await
+        {
+            GateResult::Proceed => {}
+            GateResult::Aborted => return VerifyOutcome::Aborted,
+            GateResult::Denied(_msg) if ctx.hard_abort => return VerifyOutcome::Aborted,
+            GateResult::Denied(msg) => {
+                let _ = ctx.ev.send(AgentEvent::Step(StepView {
+                    verb: Verb::Denied,
+                    arg: plan.command.clone(),
+                    detail: Some(Detail::Message(msg.clone())),
+                }));
+                return VerifyOutcome::Denied(msg);
+            }
+        }
+
         // verify is surfaced as an ordinary `ran` step (emitted just below); a
         // separate notice line would only duplicate it, so we skip it here
         let _ = ctx.ev.send(AgentEvent::StepStarted(StepStartView {
@@ -54,7 +83,11 @@ impl<P: Provider> Agent<P> {
                 truncated: run.capture.truncated_from.is_some(),
             }),
         }));
-        (run.success, tail)
+        if run.success {
+            VerifyOutcome::Passed
+        } else {
+            VerifyOutcome::Failed(tail)
+        }
     }
 
     pub(super) async fn execute_call(&self, tc: ToolCall, ctx: &mut RunCtx<'_>) -> bool {
