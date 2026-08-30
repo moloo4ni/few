@@ -2,7 +2,7 @@ use crate::agent::NoticeLevel;
 use crate::app::{label_mode, App};
 use crate::commands::{arg_options, filter_commands, find_command};
 use crate::theme;
-use crate::transcript::{Block, Expand, Hit, StepItem, PERM_OPTIONS};
+use crate::transcript::{Block, Expand, Hit, ResumedItem, StepItem, PERM_OPTIONS};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -476,6 +476,31 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             Block::Assistant(text) => {
                 push_wrapped_text(&mut rows, text, theme::normal(), width, Hit::Nothing);
             }
+            Block::Resumed(resumed) => {
+                let marker = if resumed.expanded { 'v' } else { '>' };
+                push_wrapped_text(
+                    &mut rows,
+                    &format!("{marker} {}", resumed.label),
+                    mark(theme::dim(), focused(bi, usize::MAX)),
+                    width,
+                    Hit::Block(bi),
+                );
+                if resumed.expanded {
+                    for item in &resumed.items {
+                        match item {
+                            ResumedItem::User(text) => {
+                                push_nested_user_prompt(&mut rows, text, theme::normal(), width, 2)
+                            }
+                            ResumedItem::Assistant(text) => {
+                                push_indented(&mut rows, text, theme::normal(), width, 2)
+                            }
+                            ResumedItem::Step(text) => {
+                                push_indented(&mut rows, text, theme::dim(), width, 2)
+                            }
+                        }
+                    }
+                }
+            }
             Block::Steps(group) => {
                 let marker = if group.expanded { 'v' } else { '>' };
                 push_wrapped_text(
@@ -705,6 +730,26 @@ fn push_user_prompt(rows: &mut Vec<(Vec<Seg>, Hit)>, text: &str, style: Style, w
     }
 }
 
+fn push_nested_user_prompt(
+    rows: &mut Vec<(Vec<Seg>, Hit)>,
+    text: &str,
+    style: Style,
+    width: usize,
+    indent: usize,
+) {
+    let prefix = indent + 2;
+    let inner = width.saturating_sub(prefix).max(1);
+    let wrapped = wrap_segments(&[(text.to_owned(), style)], inner);
+    for (i, segs) in wrapped.iter().enumerate() {
+        let mut row = vec![(
+            format!("{}{}", " ".repeat(indent), if i == 0 { "> " } else { "  " }),
+            style,
+        )];
+        row.extend(segs.iter().cloned());
+        rows.push((row, Hit::Nothing));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,7 +760,9 @@ mod tests {
     use crate::memory::Memory;
     use crate::perms::{Mode, PermEngine, Policy};
     use crate::providers::openai::OpenAiProvider;
-    use crate::transcript::{PermAskBlock, StepBlock, StepItem, StepsGroup};
+    use crate::transcript::{
+        PermAskBlock, ResumedItem, ResumedSession, StepBlock, StepItem, StepsGroup,
+    };
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -1165,10 +1212,20 @@ mod tests {
             },
             _ => panic!("expected steps block"),
         }
+        app.on_click(row as u16);
+        match &app.blocks[0] {
+            Block::Steps(g) => match &g.steps[0] {
+                StepItem::Thought { expand, .. } => {
+                    assert_eq!(*expand, Expand::Collapsed, "second click must fold thought");
+                }
+                _ => panic!("expected thought item"),
+            },
+            _ => panic!("expected steps block"),
+        }
     }
 
     #[test]
-    fn repeated_mouse_click_reveals_full_diff_before_collapsing() {
+    fn short_diff_collapses_on_second_click() {
         let mut app = test_app("diff-click");
         app.blocks.push(Block::Steps(StepsGroup {
             steps: vec![StepItem::Step(step_with_diff("a.txt"))],
@@ -1186,11 +1243,96 @@ mod tests {
         app.on_click(row as u16);
         match &app.blocks[0] {
             Block::Steps(g) => match &g.steps[0] {
+                StepItem::Step(step) => assert_eq!(step.expand, Expand::Collapsed),
+                _ => panic!("expected step item"),
+            },
+            _ => panic!("expected steps block"),
+        }
+    }
+
+    #[test]
+    fn truncated_diff_reveals_full_before_collapsing() {
+        let mut app = test_app("long-diff-click");
+        let mut step = step_with_diff("a.txt");
+        if let Some(crate::agent::Detail::Diff { lines, capped_at }) = &mut step.view.detail {
+            lines.push(crate::diffgen::DiffLine {
+                sign: '+',
+                text: "hidden line".into(),
+            });
+            *capped_at = Some(1);
+        }
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![StepItem::Step(step)],
+            expanded: true,
+            outcome: None,
+        }));
+        render(&mut app, 60, 12);
+        let row = app
+            .hitmap
+            .iter()
+            .position(|hit| *hit == Hit::Step(0, 0))
+            .unwrap();
+
+        app.on_click(row as u16);
+        app.on_click(row as u16);
+        match &app.blocks[0] {
+            Block::Steps(g) => match &g.steps[0] {
                 StepItem::Step(step) => assert_eq!(step.expand, Expand::Full),
                 _ => panic!("expected step item"),
             },
             _ => panic!("expected steps block"),
         }
+        app.on_click(row as u16);
+        match &app.blocks[0] {
+            Block::Steps(g) => match &g.steps[0] {
+                StepItem::Step(step) => assert_eq!(step.expand, Expand::Collapsed),
+                _ => panic!("expected step item"),
+            },
+            _ => panic!("expected steps block"),
+        }
+    }
+
+    #[test]
+    fn resumed_session_is_collapsed_then_reveals_history() {
+        let mut app = test_app("resume-block");
+        app.blocks.push(Block::Resumed(ResumedSession {
+            label: "resumed session · 4 messages restored".into(),
+            items: vec![
+                ResumedItem::User("Create hello.py".into()),
+                ResumedItem::Step("wrote hello.py".into()),
+                ResumedItem::Assistant("Done.".into()),
+            ],
+            expanded: false,
+        }));
+
+        let collapsed = build_rows(&app, 60)
+            .into_iter()
+            .map(|(row, _)| row.into_iter().map(|(s, _)| s).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed.contains("> resumed session · 4 messages restored"));
+        assert!(!collapsed.contains("Create hello.py"));
+
+        render(&mut app, 60, 14);
+        let row = app
+            .hitmap
+            .iter()
+            .position(|hit| *hit == Hit::Block(0))
+            .unwrap();
+        app.on_click(row as u16);
+        let expanded = build_rows(&app, 60)
+            .into_iter()
+            .map(|(row, _)| row.into_iter().map(|(s, _)| s).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded.contains("v resumed session · 4 messages restored"));
+        assert!(expanded.contains("  > Create hello.py"));
+        assert!(expanded.contains("  wrote hello.py"));
+        assert!(expanded.contains("  Done."));
+        insta::assert_snapshot!(
+            "resumed_session_expanded",
+            render(&mut app, 60, 14).join("\n")
+        );
     }
 
     #[test]

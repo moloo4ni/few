@@ -1,0 +1,18 @@
+---
+source: src/uirender.rs
+expression: "render(&mut app, 60, 14).join(\"\\n\")"
+---
+
+
+
+
+
+
+v resumed session · 4 messages restored
+  > Create hello.py
+  wrote hello.py
+  Done.
+
+> ask few anything · /commands · shift+enter newline
+────────────────────────────────────────────────────────────
+model: sonnet-5    mode: build    ctx: 12.4k / 200k (6%)

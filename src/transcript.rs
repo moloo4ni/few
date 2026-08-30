@@ -9,11 +9,10 @@ pub enum Expand {
 }
 
 impl Expand {
-    pub fn next(self) -> Self {
+    pub fn next_binary(self) -> Self {
         match self {
             Expand::Collapsed => Expand::Shown,
-            Expand::Shown => Expand::Full,
-            Expand::Full => Expand::Collapsed,
+            Expand::Shown | Expand::Full => Expand::Collapsed,
         }
     }
 }
@@ -49,6 +48,18 @@ pub struct StepsGroup {
     pub outcome: Option<TaskOutcome>,
 }
 
+pub enum ResumedItem {
+    User(String),
+    Assistant(String),
+    Step(String),
+}
+
+pub struct ResumedSession {
+    pub label: String,
+    pub items: Vec<ResumedItem>,
+    pub expanded: bool,
+}
+
 pub struct PermAskBlock {
     pub id: u64,
     pub verb: String,
@@ -74,9 +85,28 @@ pub enum Block {
     Remembered(String),
     PermAsk(PermAskBlock),
     MemoryView { text: String },
+    Resumed(ResumedSession),
 }
 
 impl StepBlock {
+    pub fn next_expand(&self, cap: usize) -> Expand {
+        match self.expand {
+            Expand::Collapsed => Expand::Shown,
+            Expand::Shown if self.has_hidden_rows(cap) => Expand::Full,
+            Expand::Shown | Expand::Full => Expand::Collapsed,
+        }
+    }
+
+    fn has_hidden_rows(&self, cap: usize) -> bool {
+        match &self.view.detail {
+            Some(Detail::Diff { lines, capped_at }) => {
+                lines.len() > capped_at.unwrap_or(cap).min(cap)
+            }
+            Some(Detail::Output { text, .. }) => text.lines().count() > cap,
+            _ => false,
+        }
+    }
+
     fn is_error(&self) -> bool {
         matches!(self.view.verb, Verb::Failed | Verb::Errored)
     }
