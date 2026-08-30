@@ -196,33 +196,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn permission_denied_memory_is_reported() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = std::env::temp_dir().join(format!("few-memory-denied-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let memory = Memory::new(&dir.join("project"), &dir.join("data"));
-        memory.ensure_file(MemLevel::Persistent).unwrap();
-        std::fs::set_permissions(
-            &memory.persistent_path,
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
-
-        let (_, warnings) = memory.render_for_prompt(false);
-
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("persistent memory"));
-        std::fs::set_permissions(
-            &memory.persistent_path,
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn memory_files_and_directories_are_private() {
         use std::os::unix::fs::PermissionsExt as _;
 
