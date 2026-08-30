@@ -101,14 +101,15 @@ impl OpenAiProvider {
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
             asm.push_bytes(&bytes, &mut on_delta);
-            if let Some(err) = asm.error.take() {
-                return Err(ProviderError::Http(err));
+            if let Some(error) = &asm.error {
+                return Err(ProviderError::Http(error.clone()));
             }
             if asm.done {
                 break;
             }
         }
-        Ok(asm.finish())
+        asm.finish_input(&mut on_delta);
+        asm.into_reply()
     }
 
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -193,7 +194,8 @@ struct ToolCallAcc {
 
 #[derive(Default)]
 struct StreamAssembler {
-    buf: String,
+    buf: Vec<u8>,
+    event_data: Vec<u8>,
     done: bool,
     error: Option<String>,
     content: String,
@@ -204,25 +206,69 @@ struct StreamAssembler {
 
 impl StreamAssembler {
     fn push_bytes(&mut self, bytes: &[u8], on_delta: &mut impl FnMut(StreamDelta)) {
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
-        while let Some(pos) = self.buf.find('\n') {
-            let line: String = self.buf.drain(..=pos).collect();
-            let line = line.trim();
-            if self.handle_line(line, on_delta).is_err() {
+        self.buf.extend_from_slice(bytes);
+        while let Some(pos) = self.buf.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if self.handle_line(&line, on_delta).is_err() {
                 return;
             }
         }
     }
 
+    fn finish_input(&mut self, on_delta: &mut impl FnMut(StreamDelta)) {
+        if self.error.is_some() || self.done {
+            return;
+        }
+        if !self.buf.is_empty() {
+            let mut line = std::mem::take(&mut self.buf);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if self.handle_line(&line, on_delta).is_err() {
+                return;
+            }
+        }
+        if !self.event_data.is_empty() {
+            let _ = self.dispatch_event(on_delta);
+        }
+    }
+
     fn handle_line(
         &mut self,
-        line: &str,
+        line: &[u8],
         on_delta: &mut impl FnMut(StreamDelta),
     ) -> Result<(), ()> {
-        let Some(data) = line.strip_prefix("data:") else {
+        if line.is_empty() {
+            return self.dispatch_event(on_delta);
+        }
+        if line.starts_with(b":") {
+            return Ok(());
+        }
+        let Some(mut data) = line.strip_prefix(b"data:") else {
             return Ok(());
         };
-        let data = data.trim();
+        if data.first() == Some(&b' ') {
+            data = &data[1..];
+        }
+        self.event_data.extend_from_slice(data);
+        self.event_data.push(b'\n');
+        Ok(())
+    }
+
+    fn dispatch_event(&mut self, on_delta: &mut impl FnMut(StreamDelta)) -> Result<(), ()> {
+        if self.event_data.is_empty() {
+            return Ok(());
+        }
+        self.event_data.pop();
+        let event_data = std::mem::take(&mut self.event_data);
+        let data = match std::str::from_utf8(&event_data) {
+            Ok(data) => data.trim(),
+            Err(error) => return self.fail(format!("invalid UTF-8 in SSE data: {error}")),
+        };
         if data == "[DONE]" {
             self.done = true;
             return Ok(());
@@ -230,12 +276,12 @@ impl StreamAssembler {
         if data.is_empty() {
             return Ok(());
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return Ok(());
+        let v = match serde_json::from_str::<Value>(data) {
+            Ok(value) => value,
+            Err(error) => return self.fail(format!("malformed SSE data: {error}")),
         };
         if let Some(errmsg) = extract_error(&v) {
-            self.error = Some(errmsg);
-            return Err(());
+            return self.fail(errmsg);
         }
         if let Some(u) = v.get("usage") {
             if let Ok(parsed) = serde_json::from_value::<Usage>(u.clone()) {
@@ -287,24 +333,49 @@ impl StreamAssembler {
         Ok(())
     }
 
-    fn finish(self) -> Reply {
-        let tool_calls = self
-            .calls
-            .into_iter()
-            .map(|(idx, acc)| {
-                let id = acc
-                    .id
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| format!("call_{idx}"));
-                let args = if acc.args.is_empty() {
-                    "{}".to_owned()
-                } else {
-                    acc.args
-                };
-                ToolCall::parse(id, acc.name, args)
-            })
-            .collect();
-        Reply {
+    fn fail(&mut self, error: String) -> Result<(), ()> {
+        self.error = Some(error);
+        Err(())
+    }
+
+    fn into_reply(self) -> Result<Reply, ProviderError> {
+        if let Some(error) = self.error {
+            return Err(ProviderError::Http(error));
+        }
+        if !self.done {
+            return Err(ProviderError::Http(
+                "provider stream ended before data: [DONE]".into(),
+            ));
+        }
+        let mut tool_calls = Vec::with_capacity(self.calls.len());
+        for (idx, acc) in self.calls {
+            if acc.name.is_empty() {
+                return Err(ProviderError::Http(format!(
+                    "incomplete tool call at index {idx}: missing function name"
+                )));
+            }
+            let id = acc
+                .id
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("call_{idx}"));
+            let arguments_text = if acc.args.is_empty() {
+                "{}".to_owned()
+            } else {
+                acc.args
+            };
+            let arguments = serde_json::from_str(&arguments_text).map_err(|error| {
+                ProviderError::Http(format!(
+                    "incomplete tool call at index {idx}: invalid arguments: {error}"
+                ))
+            })?;
+            tool_calls.push(ToolCall {
+                id,
+                name: acc.name,
+                arguments_text,
+                arguments,
+            });
+        }
+        Ok(Reply {
             content: self.content,
             reasoning: if self.reasoning.is_empty() {
                 None
@@ -313,7 +384,7 @@ impl StreamAssembler {
             },
             tool_calls,
             usage: self.usage,
-        }
+        })
     }
 }
 
@@ -445,6 +516,18 @@ mod tests {
         (asm, out.into_inner())
     }
 
+    fn feed_chunks(chunks: &[&[u8]]) -> (StreamAssembler, Vec<String>) {
+        let mut asm = StreamAssembler::default();
+        let out = RefCell::new(Vec::new());
+        for chunk in chunks {
+            asm.push_bytes(chunk, &mut |delta| match delta {
+                StreamDelta::Text(text) => out.borrow_mut().push(format!("text:{text}")),
+                StreamDelta::Reasoning(text) => out.borrow_mut().push(format!("think:{text}")),
+            });
+        }
+        (asm, out.into_inner())
+    }
+
     #[test]
     fn sse_streams_text_and_reasoning_and_usage() {
         let sse = concat!(
@@ -455,7 +538,7 @@ mod tests {
         );
         let (asm, deltas) = feed(sse);
         assert_eq!(deltas, vec!["text:Hel", "text:lo", "think:why"]);
-        let reply = asm.finish();
+        let reply = asm.into_reply().unwrap();
         assert_eq!(reply.content, "Hello");
         assert_eq!(reply.reasoning.as_deref(), Some("why"));
         assert_eq!(reply.usage.prompt_tokens, 11);
@@ -471,7 +554,7 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (asm, _) = feed(sse);
-        let reply = asm.finish();
+        let reply = asm.into_reply().unwrap();
         assert_eq!(reply.tool_calls.len(), 2);
         let first = &reply.tool_calls[0];
         assert_eq!(first.id, "tc1");
@@ -495,11 +578,75 @@ mod tests {
     }
 
     #[test]
-    fn sse_tolerates_garbage_lines() {
-        let sse = ": keep-alive\n\nevent: ping\ndata: not json\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+    fn sse_tolerates_comments_and_unknown_fields() {
+        let sse = ": keep-alive\n\nevent: ping\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
         let (asm, deltas) = feed(sse);
         assert_eq!(deltas, vec!["text:ok"]);
-        assert_eq!(asm.finish().content, "ok");
+        assert_eq!(asm.into_reply().unwrap().content, "ok");
+    }
+
+    #[test]
+    fn sse_preserves_unicode_and_json_split_across_http_chunks() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"привет\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let bytes = sse.as_bytes();
+        let unicode_split = bytes.iter().position(|byte| *byte == 0xd0).unwrap() + 1;
+        let json_split = bytes
+            .windows(b"content".len())
+            .position(|window| window == b"content")
+            .unwrap()
+            + 3;
+        let (asm, deltas) = feed_chunks(&[
+            &bytes[..json_split],
+            &bytes[json_split..unicode_split],
+            &bytes[unicode_split..],
+        ]);
+
+        assert_eq!(deltas, vec!["text:привет"]);
+        assert_eq!(asm.into_reply().unwrap().content, "привет");
+    }
+
+    #[test]
+    fn sse_accepts_final_done_line_without_newline() {
+        let mut asm = StreamAssembler::default();
+        let mut deltas = Vec::new();
+        asm.push_bytes(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]",
+            &mut |delta| deltas.push(delta),
+        );
+        asm.finish_input(&mut |delta| deltas.push(delta));
+
+        assert_eq!(asm.into_reply().unwrap().content, "ok");
+    }
+
+    #[test]
+    fn sse_rejects_malformed_data() {
+        let (asm, _) = feed("data: definitely not json\n\n");
+        let error = asm.into_reply().unwrap_err().to_string();
+        assert!(error.contains("malformed SSE data"), "{error}");
+    }
+
+    #[test]
+    fn sse_rejects_eof_without_done() {
+        let (asm, deltas) = feed("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
+        assert_eq!(deltas, vec!["text:partial"]);
+
+        let error = asm.into_reply().unwrap_err().to_string();
+        assert!(error.contains("ended before data: [DONE]"), "{error}");
+    }
+
+    #[test]
+    fn sse_rejects_incomplete_tool_call() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (asm, _) = feed(sse);
+
+        let error = asm.into_reply().unwrap_err().to_string();
+        assert!(error.contains("incomplete tool call"), "{error}");
     }
 
     #[test]
