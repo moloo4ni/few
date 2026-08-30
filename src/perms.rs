@@ -90,6 +90,7 @@ pub struct PermEngine {
     base_write: Policy,
     base_shell: Policy,
     project_detected: bool,
+    mode: Mode,
     read_policy: Policy,
     write_policy: Policy,
     shell_policy: Policy,
@@ -133,6 +134,7 @@ impl PermEngine {
             base_write,
             base_shell,
             project_detected,
+            mode: Mode::Build,
             read_policy: Policy::Allow,
             write_policy: base_write,
             shell_policy: base_shell,
@@ -156,6 +158,7 @@ impl PermEngine {
         self.read_policy = r;
         self.write_policy = w;
         self.shell_policy = s;
+        self.mode = mode;
     }
 
     pub fn target_key(&self, path: &Path) -> String {
@@ -265,6 +268,11 @@ impl PermEngine {
                 // self-corrects instead of hitting a confusing OS error.
                 if !t.as_os_str().is_empty() && !self.is_under_root(t) {
                     return Check::Denied(DenySource::OutOfProject);
+                }
+                // Plan is a hard no-write mode. A grant accepted in build
+                // remains recorded, but cannot weaken plan while it is active.
+                if self.mode == Mode::Plan {
+                    return Check::Denied(DenySource::ModePolicy);
                 }
                 let key = self.target_key(t);
                 if self.granted_allows(cap, &key) {
@@ -557,14 +565,30 @@ mod tests {
     fn write_modes_and_grants() {
         let mut e = engine(vec![]);
         let t = Path::new("/proj/src/a.rs");
+        let persisted = Path::new("/proj/src/persisted.rs");
         assert_eq!(
             e.check(Capability::FsWrite, Some(t)),
             Check::Ask { sensitive: false }
         );
         e.apply_grant(Capability::FsWrite, "src/a.rs", Grant::Session);
+        e.apply_grant(Capability::FsWrite, "src/persisted.rs", Grant::Always);
         assert_eq!(e.check(Capability::FsWrite, Some(t)), Check::Allowed);
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(persisted)),
+            Check::Allowed
+        );
 
         e.set_mode(Mode::Plan);
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(t)),
+            Check::Denied(DenySource::ModePolicy),
+            "a session grant must not weaken plan"
+        );
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(persisted)),
+            Check::Denied(DenySource::ModePolicy),
+            "a persisted grant must not weaken plan"
+        );
         let other = Path::new("/proj/src/b.rs");
         assert_eq!(
             e.check(Capability::FsWrite, Some(other)),
@@ -574,6 +598,14 @@ mod tests {
             e.check(Capability::ShellExec, Some(Path::new("git log -1"))),
             Check::Ask { sensitive: false },
             "plan mode permits read-only shell exploration after approval"
+        );
+
+        e.set_mode(Mode::Build);
+        assert_eq!(e.check(Capability::FsWrite, Some(t)), Check::Allowed);
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(persisted)),
+            Check::Allowed,
+            "grants remain available after returning to build"
         );
 
         e.set_mode(Mode::Auto);
