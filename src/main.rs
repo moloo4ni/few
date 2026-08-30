@@ -150,7 +150,12 @@ async fn run(continue_last: bool) -> anyhow::Result<()> {
         let (r, note) = match few::session::load_latest(&paths.sessions_dir(), &root) {
             Ok(Some((r, sess))) => {
                 let n = sess.messages.len();
-                agent.set_convo(sess.messages);
+                let saved_prompt_tokens = if sess.model == cfg.model {
+                    sess.last_prompt_tokens
+                } else {
+                    0
+                };
+                agent.restore_convo(sess.messages, saved_prompt_tokens);
                 (Some(r), format!("resumed session · {n} messages restored"))
             }
             Ok(None) => (

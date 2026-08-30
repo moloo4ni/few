@@ -111,7 +111,17 @@ fn render_note(steps: &[String]) -> String {
 /// Rough token estimate (chars/4) - good enough for a trigger that is fed
 /// exact prompt_tokens every turn anyway.
 pub fn estimate_tokens(convo: &[Msg]) -> u64 {
-    let chars: usize = convo.iter().map(|m| m.content.len()).sum();
+    let chars: usize = convo
+        .iter()
+        .map(|m| {
+            let calls: usize = m
+                .tool_calls
+                .iter()
+                .map(|tc| tc.name.len() + tc.arguments.to_string().len())
+                .sum();
+            m.content.len() + calls
+        })
+        .sum();
     (chars as u64) / 4
 }
 

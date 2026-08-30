@@ -62,7 +62,13 @@ indexes only the top level, and Few does not create project memory automatically
 In plan mode writes remain denied; auto-approve remains explicit and unchanged.
 
 On resume, the restored provider context is also available in the transcript as
-a collapsed `> resumed session` block.
+a collapsed `> resumed session` block. Its last provider-reported context usage
+is restored immediately as well; older session files receive a conservative
+estimate instead of displaying an empty context.
+
+In the prompt input, `Tab` is reserved for file completion and does nothing when
+there is no candidate. `Shift+Tab` cycles the permission mode independently of
+completion state; `/mode` remains the explicit selector.
 
 Few reads `<project>/.few/config.toml` (per-project, overrides global) and
 `~/.config/few/config.toml` (global: provider, model, key). Sessions persist

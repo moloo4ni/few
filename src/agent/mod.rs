@@ -233,8 +233,25 @@ impl<P: Provider> Agent<P> {
         self.convo.lock().unwrap().clone()
     }
 
-    /// Seed the conversation with persisted history (session resume).
-    pub fn set_convo(&self, msgs: Vec<Msg>) {
+    /// Seed the conversation and its most recent provider usage on resume.
+    /// Older sessions have no saved usage, so they receive a conservative
+    /// conversation estimate instead of presenting an empty context.
+    pub fn restore_convo(&self, msgs: Vec<Msg>, saved_prompt_tokens: u64) {
+        let has_messages = !msgs.is_empty();
+        *self.convo.lock().unwrap() = msgs;
+        let tokens = if saved_prompt_tokens > 0 {
+            saved_prompt_tokens
+        } else {
+            compact::estimate_tokens(&self.snapshot_convo()).max(u64::from(has_messages))
+        };
+        self.last_prompt_tokens.store(tokens, Ordering::Relaxed);
+    }
+
+    pub fn context_tokens(&self) -> u64 {
+        self.last_prompt_tokens.load(Ordering::Relaxed)
+    }
+
+    fn set_convo(&self, msgs: Vec<Msg>) {
         *self.convo.lock().unwrap() = msgs;
     }
 
@@ -774,10 +791,9 @@ mod tests {
             convo.push(Msg::tool_result("t1", "read", "body"));
             convo.push(Msg::user(format!("follow-up {k}")));
         }
-        agent.set_convo(convo);
-
-        // 900 >= 0.75 * 1000 -> compaction expected
-        agent.last_prompt_tokens.store(900, Ordering::Relaxed);
+        // 900 >= 0.75 * 1000 -> compaction expected immediately after a
+        // restored session, before another provider request is made.
+        agent.restore_convo(convo, 900);
         let (tx, mut rx) = mpsc::unbounded_channel();
         agent.maybe_compact(&tx);
 
