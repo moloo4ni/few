@@ -952,6 +952,7 @@ mod tests {
             root.join("hist.txt"),
             root.join("sessions"),
             None,
+            Vec::new(),
         );
         app.model_name = "sonnet-5".into();
         app.mode = Mode::Build;

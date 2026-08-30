@@ -30,14 +30,14 @@ pub fn env_layer(env: &EnvInfo, root: &Path, project_detected: bool) -> String {
     format!("## Environment\n\n{rendered}")
 }
 
-pub fn project_layer(root: &Path, project_detected: bool) -> String {
+pub fn project_layer(root: &Path, project_detected: bool) -> (String, Option<String>) {
     let mut lines = vec![format!(
         "## Project\n\n- Working directory: {}",
         root.display()
     )];
     if !project_detected {
         lines.push("- Project markers: none detected.".into());
-        return lines.join("\n");
+        return (lines.join("\n"), None);
     }
     if root.join(".git").exists() {
         lines.push("- Git repository: yes".into());
@@ -53,19 +53,42 @@ pub fn project_layer(root: &Path, project_detected: bool) -> String {
     }
 
     let mut entries: Vec<String> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten().take(60) {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let kind = if e.path().is_dir() { "/" } else { "" };
-            entries.push(format!("{name}{kind}"));
+    let mut warning = None;
+    match std::fs::read_dir(root) {
+        Ok(rd) => {
+            for result in rd.take(60) {
+                match result {
+                    Ok(entry) => {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let kind = match entry.file_type() {
+                            Ok(file_type) if file_type.is_dir() => "/",
+                            Ok(_) => "",
+                            Err(error) => {
+                                if warning.is_none() {
+                                    warning = Some(format!(
+                                        "could not inspect project entry {name}: {error}"
+                                    ));
+                                }
+                                ""
+                            }
+                        };
+                        entries.push(format!("{name}{kind}"));
+                    }
+                    Err(error) if warning.is_none() => {
+                        warning = Some(format!("could not inspect a project entry: {error}"));
+                    }
+                    Err(_) => {}
+                }
+            }
         }
+        Err(error) => warning = Some(format!("could not inspect project directory: {error}")),
     }
     entries.sort();
     if !entries.is_empty() {
         lines.push(format!("- Top-level entries: {}", entries.join(", ")));
     }
     lines.push("- Discover further details yourself with read/shell before acting.".into());
-    lines.join("\n")
+    (lines.join("\n"), warning)
 }
 
 pub fn mode_directive(mode: Mode) -> String {
@@ -93,7 +116,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "").unwrap();
-        let layer = project_layer(&dir, true);
+        let (layer, warning) = project_layer(&dir, true);
+        assert!(warning.is_none());
         assert!(layer.contains("Rust (cargo)"));
         assert!(layer.contains("Cargo.toml"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -110,9 +134,24 @@ mod tests {
         let env_text = env_layer(&env, &dir, false);
         assert!(env_text.contains("no project detected"));
         assert!(env_text.contains("do not recursively scan"));
-        let project_text = project_layer(&dir, false);
+        let (project_text, warning) = project_layer(&dir, false);
+        assert!(warning.is_none());
         assert!(project_text.contains("Project markers: none detected"));
         assert!(!project_text.contains("private-notes.txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_inventory_failure_keeps_a_usable_layer() {
+        let dir = std::env::temp_dir().join(format!("few-missing-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (layer, warning) = project_layer(&dir, true);
+
+        assert!(layer.contains("Working directory"));
+        assert!(layer.contains("Discover further details"));
+        assert!(warning
+            .unwrap()
+            .contains("could not inspect project directory"));
     }
 }

@@ -40,6 +40,11 @@ pub struct SessionRef {
     pub created_at_ms: u64,
 }
 
+pub struct LatestSession {
+    pub session: Option<(SessionRef, Session)>,
+    pub skipped: Vec<String>,
+}
+
 impl SessionRef {
     pub fn short_label(&self) -> String {
         // millisecond ids sort chronologically; show a compact form
@@ -124,26 +129,35 @@ pub fn save(
 }
 
 /// Load the most recent session belonging to `project_root`.
-pub fn load_latest(
-    dir: &Path,
-    project_root: &Path,
-) -> anyhow::Result<Option<(SessionRef, Session)>> {
+pub fn load_latest(dir: &Path, project_root: &Path) -> anyhow::Result<LatestSession> {
     let mut files = list_session_files(dir)?;
+    let mut skipped = Vec::new();
     while let Some(path) = files.pop() {
-        let Ok(session) = read_session(&path) else {
-            continue;
+        let session = match read_session(&path) {
+            Ok(session) => session,
+            Err(error) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                skipped.push(format!("{name}: {error}"));
+                continue;
+            }
         };
         if same_root(&session.project_root, project_root) {
-            return Ok(Some((
-                SessionRef {
-                    id: session.id.clone(),
-                    created_at_ms: session.created_at_ms,
-                },
-                session,
-            )));
+            return Ok(LatestSession {
+                session: Some((
+                    SessionRef {
+                        id: session.id.clone(),
+                        created_at_ms: session.created_at_ms,
+                    },
+                    session,
+                )),
+                skipped,
+            });
         }
     }
-    Ok(None)
+    Ok(LatestSession {
+        session: None,
+        skipped,
+    })
 }
 
 fn list_session_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -258,7 +272,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let r = save(&dir, &root, "qwen3:8b", None, 321, sample_convo()).unwrap();
-        let (_, loaded) = load_latest(&dir, &root).unwrap().unwrap();
+        let (_, loaded) = load_latest(&dir, &root).unwrap().session.unwrap();
         assert_eq!(loaded.messages.len(), 4);
         assert_eq!(loaded.model, "qwen3:8b");
         assert_eq!(loaded.last_prompt_tokens, 321);
@@ -332,14 +346,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         save(&dir, &root_b, "m", None, 0, vec![Msg::user("in b")]).unwrap();
 
-        let (_, la) = load_latest(&dir, &root_a).unwrap().unwrap();
+        let (_, la) = load_latest(&dir, &root_a).unwrap().session.unwrap();
         assert_eq!(la.messages[0].content, "in a");
-        let (_, lb) = load_latest(&dir, &root_b).unwrap().unwrap();
+        let (_, lb) = load_latest(&dir, &root_b).unwrap().session.unwrap();
         assert_eq!(lb.messages[0].content, "in b");
 
         let stranger = dir.join("nope");
         std::fs::create_dir_all(&stranger).unwrap();
-        assert!(load_latest(&dir, &stranger).unwrap().is_none());
+        assert!(load_latest(&dir, &stranger).unwrap().session.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -350,9 +364,42 @@ mod tests {
         let root = base.join("project");
         std::fs::create_dir_all(&root).unwrap();
 
-        assert!(load_latest(&sessions, &root).unwrap().is_none());
+        let loaded = load_latest(&sessions, &root).unwrap();
+        assert!(loaded.session.is_none());
+        assert!(loaded.skipped.is_empty());
         assert!(!sessions.exists(), "loading must not create state");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn malformed_newer_session_is_reported_while_older_one_resumes() {
+        let dir = temp_dir("malformed");
+        let root = dir.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        save(&dir, &root, "m", None, 0, vec![Msg::user("usable")]).unwrap();
+        std::fs::write(dir.join("z-newer.json"), "not json").unwrap();
+
+        let loaded = load_latest(&dir, &root).unwrap();
+
+        let (_, session) = loaded.session.unwrap();
+        assert_eq!(session.messages[0].content, "usable");
+        assert_eq!(loaded.skipped.len(), 1);
+        assert!(loaded.skipped[0].contains("z-newer.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_only_session_is_not_reported_as_empty_history() {
+        let dir = temp_dir("malformed-only");
+        let root = dir.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.join("1.json"), "{}").unwrap();
+
+        let loaded = load_latest(&dir, &root).unwrap();
+
+        assert!(loaded.session.is_none());
+        assert_eq!(loaded.skipped.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -368,7 +415,7 @@ mod tests {
         let files = list_session_files(&dir).unwrap();
         assert_eq!(files.len(), MAX_SESSIONS);
         // oldest gone, newest kept
-        let (_, s) = load_latest(&dir, &root).unwrap().unwrap();
+        let (_, s) = load_latest(&dir, &root).unwrap().session.unwrap();
         assert_eq!(s.messages[0].content, format!("t{}", MAX_SESSIONS + 4));
         let _ = std::fs::remove_dir_all(&dir);
     }

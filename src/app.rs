@@ -68,6 +68,7 @@ pub struct App {
     pub agent: Arc<Agent<OpenAiProvider>>,
     pub memory: Memory,
     history_path: PathBuf,
+    history_error_reported: bool,
     /// Ordered background persistence. The worker owns the current session
     /// identity so an older snapshot can never overtake a newer one.
     session_tx: Option<std::sync::mpsc::Sender<SessionSaveRequest>>,
@@ -102,6 +103,7 @@ impl App {
         history_path: PathBuf,
         sessions_dir: PathBuf,
         resume: Option<(Option<crate::session::SessionRef>, String)>,
+        startup_warnings: Vec<String>,
     ) -> Self {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (app_tx, app_rx) = mpsc::unbounded_channel();
@@ -112,8 +114,15 @@ impl App {
             initial_session,
             ev_tx.clone(),
         );
+        let (history, history_warning) = match load_history(&history_path) {
+            Ok(history) => (history, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("could not load prompt history: {error}")),
+            ),
+        };
         let mut input = InputState::new();
-        for entry in load_history(&history_path) {
+        for entry in history {
             input.push_history(&entry);
         }
         let restored_context_tokens = agent.context_tokens();
@@ -142,6 +151,7 @@ impl App {
             agent,
             memory,
             history_path,
+            history_error_reported: history_warning.is_some(),
             session_tx: Some(session_tx),
             session_worker: Some(session_worker),
             live_narration: String::new(),
@@ -168,6 +178,9 @@ impl App {
                 app.push_notice(note);
             }
         }
+        for warning in history_warning.into_iter().chain(startup_warnings) {
+            app.push_notice_level(warning, NoticeLevel::Warn);
+        }
         app
     }
 
@@ -176,7 +189,9 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> anyhow::Result<()> {
         self.spawn_index_rebuild();
-        self.agent.refresh_memory_layer();
+        for warning in self.agent.refresh_memory_layer() {
+            self.push_notice_level(warning, NoticeLevel::Warn);
+        }
         let mut events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(120));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -708,14 +723,8 @@ impl App {
             },
             "/model" => {
                 if rest.is_empty() || rest == "list" {
-                    self.push_notice("fetching models…".into());
-                    let mut list = self.agent.provider.list_models().await.unwrap_or_default();
-                    for m in &self.cfg.models {
-                        if !list.contains(m) {
-                            list.insert(0, m.clone());
-                        }
-                    }
-                    self.absorb_models(list);
+                    let result = self.agent.provider.list_models().await;
+                    self.finish_model_fetch(result);
                     self.input.set_text("/model ");
                 } else {
                     self.agent.provider.set_model(&rest);
@@ -743,6 +752,23 @@ impl App {
         self.agent.set_mode_directive(sysprompt::mode_directive(m));
     }
 
+    fn finish_model_fetch(&mut self, result: anyhow::Result<Vec<String>>) {
+        match result {
+            Ok(mut list) => {
+                for model in &self.cfg.models {
+                    if !list.contains(model) {
+                        list.insert(0, model.clone());
+                    }
+                }
+                self.absorb_models(list);
+            }
+            Err(error) => self.push_notice_level(
+                format!("could not fetch provider models: {error}"),
+                NoticeLevel::Warn,
+            ),
+        }
+    }
+
     /// Cycle the agent mode (Build -> Plan -> Auto -> Build) from Shift+Tab.
     fn cycle_mode(&mut self) {
         let next = match self.mode {
@@ -754,8 +780,16 @@ impl App {
     }
 
     fn memory_view(&mut self, level: MemLevel) {
-        let path = self.memory.level_path(level).to_path_buf();
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = match self.memory.read_level(level) {
+            Ok(text) => text,
+            Err(error) => {
+                self.push_notice_level(
+                    format!("could not read {} memory: {error}", level.label()),
+                    NoticeLevel::Warn,
+                );
+                return;
+            }
+        };
         let entries = Memory::entries(&text);
         let display = match level {
             MemLevel::Project => self.memory.display_project_path(),
@@ -776,7 +810,13 @@ impl App {
 
     fn memory_edit(&mut self, level: MemLevel) {
         let path = self.memory.level_path(level).to_path_buf();
-        let _ = self.memory.ensure_file(level);
+        if let Err(error) = self.memory.ensure_file(level) {
+            self.push_notice_level(
+                format!("could not prepare {} memory: {error}", level.label()),
+                NoticeLevel::Warn,
+            );
+            return;
+        }
         // hand the terminal over to $EDITOR: stop drawing until it returns
         self.suspended = true;
         let agent = Arc::clone(&self.agent);
@@ -784,16 +824,18 @@ impl App {
         let atx = self.app_tx.clone();
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || run_editor_blocking(&path)).await;
-            agent.refresh_memory_layer();
-            let msg = match res {
-                Ok(Ok(())) => "memory updated".to_owned(),
-                Ok(Err(e)) => format!("editor failed: {e:#}"),
-                Err(e) => format!("editor join failed: {e}"),
+            for warning in agent.refresh_memory_layer() {
+                let _ = tx.send(AgentEvent::Notice {
+                    text: warning,
+                    level: NoticeLevel::Warn,
+                });
+            }
+            let (msg, level) = match res {
+                Ok(Ok(())) => ("memory updated".to_owned(), NoticeLevel::Info),
+                Ok(Err(e)) => (format!("editor failed: {e:#}"), NoticeLevel::Warn),
+                Err(e) => (format!("editor join failed: {e}"), NoticeLevel::Warn),
             };
-            let _ = tx.send(AgentEvent::Notice {
-                text: msg,
-                level: crate::agent::NoticeLevel::Info,
-            });
+            let _ = tx.send(AgentEvent::Notice { text: msg, level });
             // always restore drawing, even when the editor failed
             let _ = atx.send(AppMsg::EditorDone);
         });
@@ -816,7 +858,10 @@ impl App {
     }
 
     fn push_notice_level(&mut self, text: String, level: NoticeLevel) {
-        self.blocks.push(Block::Notice { text, level });
+        self.blocks.push(Block::Notice {
+            text: clean(&text),
+            level,
+        });
     }
 
     fn on_agent_event(&mut self, ae: AgentEvent) {
@@ -1027,8 +1072,22 @@ impl App {
             return;
         }
 
-        append_history_line(&self.history_path, &text);
+        self.record_history(&text);
         self.start_task(text);
+    }
+
+    fn record_history(&mut self, text: &str) {
+        match append_history_line(&self.history_path, text) {
+            Ok(()) => self.history_error_reported = false,
+            Err(error) if !self.history_error_reported => {
+                self.push_notice_level(
+                    format!("could not save prompt history: {error}"),
+                    NoticeLevel::Warn,
+                );
+                self.history_error_reported = true;
+            }
+            Err(_) => {}
+        }
     }
 
     fn start_task(&mut self, text: String) {
@@ -1069,9 +1128,17 @@ impl App {
         let root = self.cfg.project_root.clone();
         let project_detected = self.cfg.project_detected;
         let idx = Arc::clone(&self.file_index);
+        let ev = self.ev_tx.clone();
         tokio::spawn(async move {
-            let files = build_file_index(root, project_detected).await;
-            *idx.lock().unwrap() = files;
+            match build_file_index(root, project_detected).await {
+                Ok(files) => *idx.lock().unwrap() = files,
+                Err(error) => {
+                    let _ = ev.send(AgentEvent::Notice {
+                        text: format!("could not build file completion index: {error}"),
+                        level: NoticeLevel::Warn,
+                    });
+                }
+            }
         });
     }
 }
@@ -1222,9 +1289,11 @@ fn unescape_history(line: &str) -> String {
     out
 }
 
-fn load_history(path: &PathBuf) -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
+fn load_history(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     let lines: Vec<String> = content
         .lines()
@@ -1232,17 +1301,16 @@ fn load_history(path: &PathBuf) -> Vec<String> {
         .map(unescape_history)
         .collect();
     if lines.len() > 1000 {
-        lines[lines.len() - 1000..].to_vec()
+        Ok(lines[lines.len() - 1000..].to_vec())
     } else {
-        lines
+        Ok(lines)
     }
 }
 
-fn append_history_line(path: &std::path::Path, entry: &str) {
+fn append_history_line(path: &std::path::Path, entry: &str) -> std::io::Result<()> {
     use std::io::Write;
-    if let Ok(mut f) = crate::fsutil::open_private_append(path) {
-        let _ = writeln!(f, "{}", escape_history(entry));
-    }
+    let mut file = crate::fsutil::open_private_append(path)?;
+    writeln!(file, "{}", escape_history(entry))
 }
 
 fn spawn_session_saver(
@@ -1297,37 +1365,38 @@ fn session_saver_loop(
     }
 }
 
-async fn build_file_index(root: PathBuf, recursive: bool) -> Vec<String> {
-    tokio::task::spawn_blocking(move || {
+async fn build_file_index(root: PathBuf, recursive: bool) -> anyhow::Result<Vec<String>> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
         let mut out = Vec::new();
         if !recursive {
-            if let Ok(entries) = std::fs::read_dir(&root) {
-                for entry in entries.flatten().take(20_000) {
-                    if entry.path().is_file() {
-                        out.push(entry.file_name().to_string_lossy().into_owned());
-                    }
+            for result in std::fs::read_dir(&root)?.take(20_000) {
+                let entry = result?;
+                if entry.file_type()?.is_file() {
+                    out.push(entry.file_name().to_string_lossy().into_owned());
                 }
             }
             out.sort();
-            return out;
+            return Ok(out);
         }
         let walker = ignore::WalkBuilder::new(&root).build();
-        for entry in walker.flatten() {
+        for result in walker {
+            let entry = result?;
             let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
             if is_file {
-                if let Ok(rel) = entry.path().strip_prefix(&root) {
-                    out.push(rel.to_string_lossy().replace('\\', "/"));
-                }
+                let rel = entry.path().strip_prefix(&root).with_context(|| {
+                    format!("{} escaped the completion root", entry.path().display())
+                })?;
+                out.push(rel.to_string_lossy().replace('\\', "/"));
             }
             if out.len() >= 20_000 {
                 break;
             }
         }
         out.sort();
-        out
+        Ok(out)
     })
     .await
-    .unwrap_or_default()
+    .context("file index task failed")?
 }
 
 #[cfg(test)]
@@ -1342,11 +1411,21 @@ mod file_index_tests {
         std::fs::write(root.join("top.txt"), "top").unwrap();
         std::fs::write(root.join("nested/private.txt"), "private").unwrap();
 
-        let shallow = build_file_index(root.clone(), false).await;
+        let shallow = build_file_index(root.clone(), false).await.unwrap();
         assert_eq!(shallow, vec!["top.txt"]);
-        let recursive = build_file_index(root.clone(), true).await;
+        let recursive = build_file_index(root.clone(), true).await.unwrap();
         assert!(recursive.contains(&"nested/private.txt".to_owned()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn index_failure_is_distinct_from_an_empty_index() {
+        let root = std::env::temp_dir().join(format!("few-index-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let error = build_file_index(root, false).await.unwrap_err();
+
+        assert!(!error.to_string().is_empty());
     }
 }
 
@@ -1401,6 +1480,18 @@ mod history_escape_tests {
         // a literal backslash survives the roundtrip
         let bs = "path\\to\\file";
         assert_eq!(unescape_history(&escape_history(bs)), bs);
+    }
+
+    #[test]
+    fn missing_history_is_empty_but_other_read_failures_are_errors() {
+        let root = std::env::temp_dir().join(format!("few-history-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("history.txt");
+
+        assert!(load_history(&path).unwrap().is_empty());
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(load_history(&path).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1493,7 +1584,7 @@ mod history_escape_tests {
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("state/history.txt");
 
-        append_history_line(&path, "private prompt");
+        append_history_line(&path, "private prompt").unwrap();
 
         assert_eq!(
             std::fs::metadata(path.parent().unwrap())
@@ -1544,6 +1635,7 @@ mod history_escape_tests {
 
         let (_, saved) = crate::session::load_latest(&sessions, &project)
             .unwrap()
+            .session
             .unwrap();
         assert_eq!(saved.last_prompt_tokens, 2);
         assert_eq!(saved.messages[0].content, "newer");
@@ -1609,6 +1701,7 @@ mod memory_step_tests {
             root.join("hist"),
             root.join("sessions"),
             None,
+            Vec::new(),
         )
     }
 
@@ -1700,6 +1793,115 @@ mod memory_step_tests {
             crate::perms::Check::Ask { sensitive: true }
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn history_errors_are_surfaced_once_until_a_success() {
+        let root = std::env::temp_dir().join(format!("few-history-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        std::fs::create_dir_all(&app.history_path).unwrap();
+
+        app.record_history("first");
+        app.record_history("second");
+        std::fs::remove_dir(&app.history_path).unwrap();
+        app.record_history("saved");
+        std::fs::remove_file(&app.history_path).unwrap();
+        std::fs::create_dir(&app.history_path).unwrap();
+        app.record_history("fails again");
+
+        let notices: Vec<_> = app
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Notice {
+                    text,
+                    level: NoticeLevel::Warn,
+                } if text.contains("could not save prompt history") => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn history_load_failure_is_a_startup_warning() {
+        let root = std::env::temp_dir().join(format!("few-history-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("hist")).unwrap();
+
+        let app = app_with(root.clone());
+
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Notice { text, level: NoticeLevel::Warn }
+                if text.contains("could not load prompt history")
+        )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_view_reports_read_failure_instead_of_showing_empty() {
+        let root = std::env::temp_dir().join(format!("few-memory-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        std::fs::create_dir_all(&app.memory.project_path).unwrap();
+
+        app.memory_view(MemLevel::Project);
+
+        assert!(!app
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::MemoryView { .. })));
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Notice { text, level: NoticeLevel::Warn }
+                if text.contains("could not read project memory")
+        )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_discovery_failure_preserves_cached_models_and_warns() {
+        let root = std::env::temp_dir().join(format!("few-model-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        app.models_cache = vec!["configured-model".into()];
+
+        app.finish_model_fetch(Err(anyhow::anyhow!("provider unavailable")));
+
+        assert_eq!(app.models_cache, vec!["configured-model"]);
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Notice { text, level: NoticeLevel::Warn }
+                if text.contains("provider unavailable")
+        )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn background_index_failure_sends_a_non_fatal_notice() {
+        let root = std::env::temp_dir().join(format!("few-index-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        app.spawn_index_rebuild();
+        let event = tokio::time::timeout(Duration::from_secs(2), app.ev_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            event,
+            AgentEvent::Notice { text, level: NoticeLevel::Warn }
+                if text.contains("could not build file completion index")
+        ));
     }
 
     #[test]

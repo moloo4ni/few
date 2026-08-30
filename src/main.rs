@@ -127,10 +127,12 @@ async fn run(continue_last: bool) -> anyhow::Result<()> {
         }
     }
 
+    let (project_layer, project_warning) = sysprompt::project_layer(&root, cfg.project_detected);
+    let mut startup_warnings: Vec<String> = project_warning.into_iter().collect();
     let layers = [
         sysprompt::BASE.to_owned(),
         sysprompt::env_layer(&env, &root, cfg.project_detected),
-        sysprompt::project_layer(&root, cfg.project_detected),
+        project_layer,
         String::new(),
         sysprompt::mode_directive(Mode::Build),
     ];
@@ -147,24 +149,34 @@ async fn run(continue_last: bool) -> anyhow::Result<()> {
 
     let mut resume = None;
     if continue_last {
-        let (r, note) = match few::session::load_latest(&paths.sessions_dir(), &root) {
-            Ok(Some((r, sess))) => {
-                let n = sess.messages.len();
-                let saved_prompt_tokens = if sess.model == cfg.model {
-                    sess.last_prompt_tokens
-                } else {
-                    0
+        match few::session::load_latest(&paths.sessions_dir(), &root) {
+            Ok(loaded) => {
+                let found_usable = loaded.session.is_some();
+                if let Some(warning) = skipped_sessions_warning(&loaded.skipped, found_usable) {
+                    startup_warnings.push(warning);
+                }
+                let (r, note) = match loaded.session {
+                    Some((r, sess)) => {
+                        let n = sess.messages.len();
+                        let saved_prompt_tokens = if sess.model == cfg.model {
+                            sess.last_prompt_tokens
+                        } else {
+                            0
+                        };
+                        agent.restore_convo(sess.messages, saved_prompt_tokens);
+                        (Some(r), format!("resumed session · {n} messages restored"))
+                    }
+                    None => (
+                        None,
+                        "no previous session found for this project - starting fresh".into(),
+                    ),
                 };
-                agent.restore_convo(sess.messages, saved_prompt_tokens);
-                (Some(r), format!("resumed session · {n} messages restored"))
+                resume = Some((r, note));
             }
-            Ok(None) => (
-                None,
-                "no previous session found for this project - starting fresh".into(),
-            ),
-            Err(e) => (None, format!("failed loading previous session: {e}")),
-        };
-        resume = Some((r, note));
+            Err(error) => startup_warnings.push(format!(
+                "could not load previous sessions; starting fresh: {error}"
+            )),
+        }
     }
 
     let mut app = App::new(
@@ -174,12 +186,27 @@ async fn run(continue_last: bool) -> anyhow::Result<()> {
         history_path,
         paths.sessions_dir(),
         resume,
+        startup_warnings,
     );
 
     let mut terminal = tui::init()?;
     let result = app.run_app(&mut terminal).await;
     tui::restore(terminal);
     result
+}
+
+fn skipped_sessions_warning(skipped: &[String], resumed_older: bool) -> Option<String> {
+    let newest = skipped.first()?;
+    let outcome = if resumed_older {
+        "resumed an older usable session"
+    } else {
+        "no usable session remained; starting fresh"
+    };
+    Some(format!(
+        "skipped {} unreadable session file{} ({newest}); {outcome}",
+        skipped.len(),
+        if skipped.len() == 1 { "" } else { "s" }
+    ))
 }
 
 #[cfg(test)]
@@ -226,5 +253,17 @@ mod tests {
             parse(&["--help", "--version"]),
             Err("--help and --version cannot be used together".into())
         );
+    }
+
+    #[test]
+    fn skipped_session_warning_explains_resume_outcome() {
+        let skipped = vec!["2.json: malformed JSON".to_owned()];
+        let resumed = skipped_sessions_warning(&skipped, true).unwrap();
+        assert!(resumed.contains("skipped 1 unreadable session file"));
+        assert!(resumed.contains("resumed an older usable session"));
+
+        let fresh = skipped_sessions_warning(&skipped, false).unwrap();
+        assert!(fresh.contains("starting fresh"));
+        assert!(skipped_sessions_warning(&[], false).is_none());
     }
 }
