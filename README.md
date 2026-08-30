@@ -70,7 +70,9 @@ estimate instead of displaying an empty context.
 
 In the prompt input, `Tab` is reserved for file completion and does nothing when
 there is no candidate. `Shift+Tab` cycles the permission mode independently of
-completion state; `/mode` remains the explicit selector.
+completion state; `/mode` remains the explicit selector. Accepting a non-sensitive
+file completion grants read access to that exact path for the session, never write;
+sensitive files still require explicit approval.
 
 Few reads `<project>/.few/config.toml` (per-project, overrides global) and
 `~/.config/few/config.toml` (global: provider, model, key). Sessions persist

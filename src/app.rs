@@ -992,6 +992,7 @@ impl App {
 
     async fn submit(&mut self) {
         let text = self.input.text();
+        let mentioned_paths = self.input.mentioned_paths();
         if text.trim().is_empty() {
             return;
         }
@@ -1000,6 +1001,14 @@ impl App {
         if text.starts_with('/') && !text.contains('\n') {
             self.execute_command(&text).await;
             return;
+        }
+
+        {
+            let mut perms = PermEngine::lock(&self.agent.perms);
+            for path in mentioned_paths {
+                let path = crate::paths::resolve_under(&self.cfg.project_root, &path);
+                perms.grant_implicit_read(&path);
+            }
         }
 
         if self.running {
@@ -1395,12 +1404,20 @@ mod memory_step_tests {
     }
 
     fn app_with_context(root: std::path::PathBuf, restored_tokens: u64) -> App {
+        app_with_context_and_detection(root, restored_tokens, true)
+    }
+
+    fn app_with_context_and_detection(
+        root: std::path::PathBuf,
+        restored_tokens: u64,
+        project_detected: bool,
+    ) -> App {
         let cfg = Arc::new(Config {
             model: "m".into(),
             context_window: 1000,
             project_root: root.clone(),
             project_config_path: root.join(".few/config.toml"),
-            project_detected: true,
+            project_detected,
             ..Default::default()
         });
         let perms = Arc::new(Mutex::new(PermEngine::new(
@@ -1409,7 +1426,7 @@ mod memory_step_tests {
             Default::default(),
             Policy::Ask,
             Policy::Ask,
-            true,
+            project_detected,
         )));
         let memory = Memory::new(&root, &root.join(".data"));
         let provider = OpenAiProvider::new("http://127.0.0.1:9/v1", None, "m").unwrap();
@@ -1480,6 +1497,46 @@ mod memory_step_tests {
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT))
             .await;
         assert_eq!(app.mode, Mode::Auto);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accepted_completion_grants_only_non_sensitive_read() {
+        let root =
+            std::env::temp_dir().join(format!("few-completion-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut app = app_with_context_and_detection(root.clone(), 0, false);
+        app.running = true;
+        *app.file_index.lock().unwrap() = vec!["notes.txt".into()];
+        app.input.set_text("Read not");
+        app.after_edit();
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await;
+        app.submit().await;
+        let notes = root.join("notes.txt");
+        assert_eq!(
+            PermEngine::lock(&app.agent.perms)
+                .check(crate::perms::Capability::FsRead, Some(&notes)),
+            crate::perms::Check::Allowed
+        );
+
+        let mut sensitive = app_with_context_and_detection(root.clone(), 0, false);
+        sensitive.running = true;
+        *sensitive.file_index.lock().unwrap() = vec![".env".into()];
+        sensitive.input.set_text("Read .e");
+        sensitive.after_edit();
+        sensitive
+            .on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await;
+        sensitive.submit().await;
+        let env = root.join(".env");
+        assert_eq!(
+            PermEngine::lock(&sensitive.agent.perms)
+                .check(crate::perms::Capability::FsRead, Some(&env)),
+            crate::perms::Check::Ask { sensitive: true }
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -32,10 +32,15 @@ impl InputState {
         self.text.is_empty()
     }
 
-    fn apply_edit(&mut self, start: usize, end: usize, repl_len: usize) {
+    fn apply_edit(&mut self, start: usize, end: usize, repl_len: usize, inserted_separator: bool) {
         let delta = repl_len as isize - (end - start) as isize;
-        self.mentions
-            .retain(|(a, b)| !((*a >= start && *a < end) || (*b > start && *b <= end)));
+        self.mentions.retain(|(a, b)| {
+            let overlaps = start < *b && end > *a;
+            let insertion_inside = start == end && *a < start && start < *b;
+            let joins_path =
+                start == end && repl_len > 0 && !inserted_separator && (start == *a || start == *b);
+            !(overlaps || insertion_inside || joins_path)
+        });
         for (a, b) in self.mentions.iter_mut() {
             if *a >= end {
                 *a = (*a as isize + delta).max(0) as usize;
@@ -52,7 +57,7 @@ impl InputState {
         for (i, c) in chars.iter().enumerate() {
             self.text.insert(pos + i, *c);
         }
-        self.apply_edit(pos, pos, n);
+        self.apply_edit(pos, pos, n, s.chars().all(char::is_whitespace));
         self.cursor += n;
     }
 
@@ -66,7 +71,7 @@ impl InputState {
         }
         let pos = self.cursor - 1;
         self.text.remove(pos);
-        self.apply_edit(pos, pos + 1, 0);
+        self.apply_edit(pos, pos + 1, 0, false);
         self.cursor = pos;
     }
 
@@ -75,7 +80,7 @@ impl InputState {
             return;
         }
         self.text.remove(self.cursor);
-        self.apply_edit(self.cursor, self.cursor + 1, 0);
+        self.apply_edit(self.cursor, self.cursor + 1, 0, false);
     }
 
     pub fn left(&mut self) {
@@ -262,7 +267,7 @@ impl InputState {
         for (i, c) in new_chars.iter().enumerate() {
             self.text.insert(start + i, *c);
         }
-        self.apply_edit(start, end, n);
+        self.apply_edit(start, end, n, false);
         self.mentions.push((start, start + n));
         self.cursor = start + n;
         self.completion = None;
@@ -282,6 +287,19 @@ impl InputState {
             }
             None => {}
         }
+    }
+
+    pub fn mentioned_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for (start, end) in &self.mentions {
+            if start < end && *end <= self.text.len() {
+                let path: String = self.text[*start..*end].iter().collect();
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
     }
 
     pub fn cycle_menu(&mut self, forward: bool) {
@@ -335,5 +353,39 @@ impl InputState {
 
     pub fn char_width(c: char) -> usize {
         c.width().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_mentions_survive_separators_but_not_path_edits() {
+        let index = vec!["src/main.rs".to_owned()];
+        let mut input = InputState::new();
+        input.set_text("src/ma");
+        input.update_completion(&index);
+        input.accept_selected();
+        assert_eq!(input.mentioned_paths(), vec!["src/main.rs"]);
+
+        input.insert_str(" ");
+        assert_eq!(input.mentioned_paths(), vec!["src/main.rs"]);
+
+        input.cursor = "src".chars().count();
+        input.insert_str("x");
+        assert!(input.mentioned_paths().is_empty());
+    }
+
+    #[test]
+    fn editing_inside_a_mention_invalidates_its_range() {
+        let index = vec!["notes.txt".to_owned()];
+        let mut input = InputState::new();
+        input.set_text("not");
+        input.update_completion(&index);
+        input.accept_selected();
+        input.cursor = 3;
+        input.delete_forward();
+        assert!(input.mentioned_paths().is_empty());
     }
 }
