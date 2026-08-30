@@ -1,0 +1,28 @@
+---
+source: src/uirender.rs
+expression: "render(&mut app, 60, 24).join(\"\\n\")"
+---
+
+
+
+
+
+
+
+Result
+
+Use cargo test, then inspect it.
+
+- first item with enough text to wrap cleanly
+- second item
+
+> quoted note
+
+  fn main() {
+      let count = 42;
+      println!("done"); // status
+  }
+
+> ask few anything · /commands · shift+enter newline
+────────────────────────────────────────────────────────────
+model: sonnet-5    mode: build    ctx: 12.4k / 200k (6%)
