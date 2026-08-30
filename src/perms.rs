@@ -136,7 +136,7 @@ impl PermEngine {
 
     pub fn set_mode(&mut self, mode: Mode) {
         let (w, s) = match mode {
-            Mode::Plan => (Policy::Deny, Policy::Deny),
+            Mode::Plan => (Policy::Deny, Policy::Ask),
             Mode::Build => (self.base_write, self.base_shell),
             Mode::Auto => (Policy::Allow, Policy::Allow),
         };
@@ -153,7 +153,7 @@ impl PermEngine {
     }
 
     pub fn is_under_root(&self, path: &Path) -> bool {
-        path.strip_prefix(&self.root).is_ok()
+        containment_path(path).starts_with(containment_path(&self.root))
     }
 
     pub fn is_sensitive(&self, path: &Path) -> bool {
@@ -323,6 +323,49 @@ impl PermEngine {
     }
 }
 
+/// Resolve lexical `..` and any existing symlink prefix without requiring the
+/// final target to exist. Writes commonly point at a new file, so canonicalize
+/// the nearest existing ancestor and then re-attach the missing suffix.
+fn containment_path(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return normalize_lexically(path);
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return normalize_lexically(path);
+        };
+        existing = parent;
+    }
+
+    let mut resolved = existing
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexically(existing));
+    for part in suffix.iter().rev() {
+        resolved.push(part);
+    }
+    normalize_lexically(&resolved)
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +394,46 @@ mod tests {
             e.check(Capability::FsWrite, Some(Path::new("/proj/x.txt"))),
             Check::Ask { sensitive: false }
         );
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(Path::new("/proj/../outside.txt"))),
+            Check::Denied(DenySource::OutOfProject)
+        );
+        assert_eq!(
+            e.check(Capability::FsRead, Some(Path::new("/proj/../outside.txt"))),
+            Check::Ask { sensitive: false }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cannot_bypass_project_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("few-perms-link-{}", std::process::id()));
+        let root = base.join("project");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+
+        let e = PermEngine::new(
+            root.clone(),
+            vec![],
+            Default::default(),
+            Policy::Ask,
+            Policy::Ask,
+        );
+        let escaped = root.join("escape/new.txt");
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(&escaped)),
+            Check::Denied(DenySource::OutOfProject)
+        );
+        assert_eq!(
+            e.check(Capability::FsRead, Some(&escaped)),
+            Check::Ask { sensitive: false }
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -405,6 +488,11 @@ mod tests {
         assert_eq!(
             e.check(Capability::FsWrite, Some(other)),
             Check::Denied(DenySource::ModePolicy)
+        );
+        assert_eq!(
+            e.check(Capability::ShellExec, Some(Path::new("git log -1"))),
+            Check::Ask { sensitive: false },
+            "plan mode permits read-only shell exploration after approval"
         );
 
         e.set_mode(Mode::Auto);
