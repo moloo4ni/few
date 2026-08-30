@@ -1296,9 +1296,8 @@ mod tests {
             steps: vec![StepItem::Step(StepBlock {
                 view: StepView {
                     verb: Verb::Ran,
-                    arg:
-                        "cd /home/moloo4ni/few-sandbox && python3 -m py_compile greet.py && echo OK"
-                            .into(),
+                    arg: "cd /tmp/few-test-project && python3 -m py_compile greet.py && echo OK"
+                        .into(),
                     detail: None,
                 },
                 expand: Expand::Collapsed,

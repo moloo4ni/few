@@ -168,10 +168,6 @@ impl App {
                 app.push_notice(note);
             }
         }
-        // Surface in the UI if the configuration is dummy or missing.
-        if cfg.model == "dummy-model" || cfg.provider_base_url.contains("localhost:9999") {
-            app.push_notice("Configure a provider: set model and api_key_env (default OPENAI_API_KEY) in .few/config.toml".into());
-        }
         app
     }
 
