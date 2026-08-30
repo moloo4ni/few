@@ -99,7 +99,8 @@ build (`--no-default-features`) or the OS-native backend
 Tagged releases are built in controlled GitHub Actions runners and publish explicitly named
 archives for static Linux x86_64, macOS Intel, and macOS Apple Silicon, together with
 `SHA256SUMS`. A manual workflow run builds and smoke-tests the same artifacts without creating
-a GitHub release; only a matching `v<package-version>` tag publishes one.
+a GitHub release. A matching `v<package-version>` tag publishes one automatically; the optional
+manual `release_tag` input retries publishing an existing matching tag after a transient failure.
 
 At startup Few probes that the selected model answers with native tool calls; otherwise it
 exits with an explicit error - switch models rather than hoping text parsing will work.
