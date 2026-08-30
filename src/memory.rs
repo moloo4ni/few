@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,14 +44,7 @@ impl Memory {
 
     pub fn ensure_file(&self, level: MemLevel) -> std::io::Result<()> {
         let file_path = self.level_path(level);
-        if !file_path.exists() {
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut file = std::fs::File::create(file_path)?;
-            file.write_all(HEADER.as_bytes())?;
-        }
-        Ok(())
+        crate::fsutil::ensure_private_file(file_path, HEADER.as_bytes())
     }
 
     pub fn ensure_startup_files(&self, project_detected: bool) -> std::io::Result<()> {
@@ -173,5 +165,32 @@ mod tests {
             .render_for_prompt(true)
             .contains("private project fact"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_files_and_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("few-memory-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let memory = Memory::new(&dir.join("project"), &dir.join("data"));
+        memory.ensure_startup_files(true).unwrap();
+
+        for path in [&memory.project_path, &memory.persistent_path] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

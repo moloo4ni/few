@@ -33,6 +33,12 @@ pub enum AppMsg {
     EditorDone,
 }
 
+struct SessionSaveRequest {
+    model: String,
+    last_prompt_tokens: u64,
+    messages: Vec<Msg>,
+}
+
 pub struct App {
     pub blocks: Vec<Block>,
     pub steps_group_idx: Option<usize>,
@@ -62,9 +68,10 @@ pub struct App {
     pub agent: Arc<Agent<OpenAiProvider>>,
     pub memory: Memory,
     history_path: PathBuf,
-    sessions_dir: PathBuf,
-    /// session identity, updated by background saves (serialized by the mutex)
-    session: Arc<std::sync::Mutex<Option<crate::session::SessionRef>>>,
+    /// Ordered background persistence. The worker owns the current session
+    /// identity so an older snapshot can never overtake a newer one.
+    session_tx: Option<std::sync::mpsc::Sender<SessionSaveRequest>>,
+    session_worker: Option<std::thread::JoinHandle<()>>,
     live_narration: String,
     live_thought: String,
     /// slot of the most recent folded Narration pushed this turn, so Finished
@@ -98,6 +105,13 @@ impl App {
     ) -> Self {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (app_tx, app_rx) = mpsc::unbounded_channel();
+        let initial_session = resume.as_ref().and_then(|(session, _)| session.clone());
+        let (session_tx, session_worker) = spawn_session_saver(
+            sessions_dir.clone(),
+            cfg.project_root.clone(),
+            initial_session,
+            ev_tx.clone(),
+        );
         let mut input = InputState::new();
         for entry in load_history(&history_path) {
             input.push_history(&entry);
@@ -128,10 +142,8 @@ impl App {
             agent,
             memory,
             history_path,
-            sessions_dir,
-            session: Arc::new(std::sync::Mutex::new(
-                resume.as_ref().and_then(|(r, _)| r.clone()),
-            )),
+            session_tx: Some(session_tx),
+            session_worker: Some(session_worker),
             live_narration: String::new(),
             live_thought: String::new(),
             last_said: None,
@@ -1043,43 +1055,18 @@ impl App {
         });
     }
 
-    fn save_session(&mut self) {
+    fn save_session(&self) {
         let convo = self.agent.snapshot_convo();
         if convo.is_empty() {
             return;
         }
-        let root = self.cfg.project_root.clone();
-        let model = self.agent.provider.model_name();
-        let last_prompt_tokens = self.agent.context_tokens();
-        let dir = self.sessions_dir.clone();
-        let session = Arc::clone(&self.session);
-        let ev = self.ev_tx.clone();
-        // serialization + disk IO happen off the render loop; the shared
-        // mutex also serializes overlapping saves so an older snapshot can
-        // never overwrite a newer one
-        tokio::task::spawn_blocking(move || {
-            let prev = session.lock().ok().and_then(|g| g.clone());
-            match crate::session::save(
-                &dir,
-                &root,
-                &model,
-                prev.as_ref(),
-                last_prompt_tokens,
-                convo,
-            ) {
-                Ok(r) => {
-                    if let Ok(mut g) = session.lock() {
-                        *g = Some(r);
-                    }
-                }
-                Err(e) => {
-                    let _ = ev.send(AgentEvent::Notice {
-                        text: format!("failed saving session: {e}"),
-                        level: crate::agent::NoticeLevel::Error,
-                    });
-                }
-            }
-        });
+        if let Some(tx) = &self.session_tx {
+            let _ = tx.send(SessionSaveRequest {
+                model: self.agent.provider.model_name(),
+                last_prompt_tokens: self.agent.context_tokens(),
+                messages: convo,
+            });
+        }
     }
 
     fn spawn_index_rebuild(&mut self) {
@@ -1255,17 +1242,62 @@ fn load_history(path: &PathBuf) -> Vec<String> {
     }
 }
 
-fn append_history_line(path: &PathBuf, entry: &str) {
+fn append_history_line(path: &std::path::Path, entry: &str) {
     use std::io::Write;
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut f) = crate::fsutil::open_private_append(path) {
         let _ = writeln!(f, "{}", escape_history(entry));
+    }
+}
+
+fn spawn_session_saver(
+    dir: PathBuf,
+    root: PathBuf,
+    current: Option<crate::session::SessionRef>,
+    ev: mpsc::UnboundedSender<AgentEvent>,
+) -> (
+    std::sync::mpsc::Sender<SessionSaveRequest>,
+    std::thread::JoinHandle<()>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || session_saver_loop(rx, dir, root, current, ev));
+    (tx, worker)
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Closing the sender lets the worker drain every queued snapshot. Join
+        // it so a fast `/exit` cannot terminate the process mid-save.
+        self.session_tx.take();
+        if let Some(worker) = self.session_worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn session_saver_loop(
+    rx: std::sync::mpsc::Receiver<SessionSaveRequest>,
+    dir: PathBuf,
+    root: PathBuf,
+    mut current: Option<crate::session::SessionRef>,
+    ev: mpsc::UnboundedSender<AgentEvent>,
+) {
+    for request in rx {
+        match crate::session::save(
+            &dir,
+            &root,
+            &request.model,
+            current.as_ref(),
+            request.last_prompt_tokens,
+            request.messages,
+        ) {
+            Ok(saved) => current = Some(saved),
+            Err(error) => {
+                let _ = ev.send(AgentEvent::Notice {
+                    text: format!("failed saving session: {error}"),
+                    level: NoticeLevel::Error,
+                });
+            }
+        }
     }
 }
 
@@ -1386,6 +1418,72 @@ mod history_escape_tests {
         assert!(matches!(&items[1], ResumedItem::Step(s) if s == "wrote hello.py"));
         assert!(matches!(&items[2], ResumedItem::Step(s) if s == "ran python3 hello.py"));
         assert!(matches!(&items[3], ResumedItem::Assistant(s) if s == "Done."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_file_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!("few-history-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("state/history.txt");
+
+        append_history_line(&path, "private prompt");
+
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_saver_keeps_request_order() {
+        let root = std::env::temp_dir().join(format!("few-session-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&project).unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let worker_sessions = sessions.clone();
+        let worker_project = project.clone();
+        let worker = std::thread::spawn(move || {
+            session_saver_loop(request_rx, worker_sessions, worker_project, None, event_tx);
+        });
+
+        request_tx
+            .send(SessionSaveRequest {
+                model: "m".into(),
+                last_prompt_tokens: 1,
+                messages: vec![Msg::user("older")],
+            })
+            .unwrap();
+        request_tx
+            .send(SessionSaveRequest {
+                model: "m".into(),
+                last_prompt_tokens: 2,
+                messages: vec![Msg::user("newer")],
+            })
+            .unwrap();
+        drop(request_tx);
+        worker.join().unwrap();
+
+        let (_, saved) = crate::session::load_latest(&sessions, &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.last_prompt_tokens, 2);
+        assert_eq!(saved.messages[0].content, "newer");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

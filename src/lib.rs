@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod diffgen;
 pub mod envinfo;
+mod fsutil;
 pub mod inputline;
 mod markdown;
 pub mod memory;

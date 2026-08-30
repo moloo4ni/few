@@ -31,11 +31,11 @@ impl Paths {
     pub fn init() -> anyhow::Result<Self> {
         let pd = directories::ProjectDirs::from("", "", "few")
             .ok_or_else(|| anyhow::anyhow!("cannot determine user directories"))?;
-        std::fs::create_dir_all(pd.config_dir())?;
-        std::fs::create_dir_all(pd.data_dir())?;
-        std::fs::create_dir_all(pd.cache_dir())?;
+        crate::fsutil::ensure_private_dir(pd.config_dir())?;
+        crate::fsutil::ensure_private_dir(pd.data_dir())?;
+        crate::fsutil::ensure_private_dir(pd.cache_dir())?;
         if let Some(s) = pd.state_dir() {
-            let _ = std::fs::create_dir_all(s);
+            crate::fsutil::ensure_private_dir(s)?;
         }
         Ok(Self {
             config_dir: pd.config_dir().to_path_buf(),

@@ -86,7 +86,7 @@ pub fn save(
     last_prompt_tokens: u64,
     messages: Vec<Msg>,
 ) -> anyhow::Result<SessionRef> {
-    std::fs::create_dir_all(dir)?;
+    crate::fsutil::ensure_private_dir(dir)?;
     let now = now_ms();
     let mut id = match prev {
         Some(r) => r.id.clone(),
@@ -115,10 +115,10 @@ pub fn save(
         messages,
     };
     let path = dir.join(format!("{id}.json"));
-    // atomic write: temp file + rename, so a crash never leaves a torn file
-    let tmp = dir.join(format!("{id}.json.tmp"));
-    std::fs::write(&tmp, serde_json::to_string_pretty(&session)?)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::fsutil::atomic_replace_private(
+        &path,
+        serde_json::to_string_pretty(&session)?.as_bytes(),
+    )?;
     prune(dir)?;
     Ok(SessionRef { id, created_at_ms })
 }
@@ -269,6 +269,29 @@ mod tests {
         assert_eq!(loaded.messages[2].tool_call_id.as_deref(), Some("t1"));
         assert_eq!(r.id, loaded.id);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_state_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir("mode");
+        let root = dir.join("proj");
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let saved = save(&sessions, &root, "m", None, 0, vec![Msg::user("private")]).unwrap();
+        let path = sessions.join(format!("{}.json", saved.id));
+
+        assert_eq!(
+            std::fs::metadata(&sessions).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
