@@ -122,7 +122,7 @@ impl StepBlock {
             ..
         }) = &self.view.detail
         {
-            s += &format!(" (output captured, {}b)", total_bytes);
+            s += &format!(" (output captured, {total_bytes}b)");
         }
         s
     }
@@ -161,7 +161,7 @@ impl StepBlock {
                 Expand::Shown => {
                     let mut rows: Vec<String> = text.lines().take(cap).map(str::to_owned).collect();
                     if text.lines().count() > cap {
-                        rows.push(format!("... output truncated, {} bytes total", total_bytes));
+                        rows.push(format!("... output truncated, {total_bytes} bytes total"));
                     }
                     rows
                 }

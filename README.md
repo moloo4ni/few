@@ -96,6 +96,11 @@ TLS ships as the default `tls` feature (`reqwest` + `rustls`). Alternatives: an 
 build (`--no-default-features`) or the OS-native backend
 (`--no-default-features --features tls-native`) for toolchains without a C compiler.
 
+Tagged releases are built in controlled GitHub Actions runners and publish explicitly named
+archives for static Linux x86_64, macOS Intel, and macOS Apple Silicon, together with
+`SHA256SUMS`. A manual workflow run builds and smoke-tests the same artifacts without creating
+a GitHub release; only a matching `v<package-version>` tag publishes one.
+
 At startup Few probes that the selected model answers with native tool calls; otherwise it
 exits with an explicit error - switch models rather than hoping text parsing will work.
 

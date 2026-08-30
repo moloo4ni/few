@@ -252,7 +252,7 @@ pub fn exec_write(
 
     let verb = if existed { "updated" } else { "created" };
     Ok(WriteOut {
-        for_model: format!("{} {disp}", verb),
+        for_model: format!("{verb} {disp}"),
         path_display: disp.clone(),
         created: !existed,
         deleted: false,
