@@ -446,34 +446,8 @@ impl App {
             return;
         }
 
-        // transcript cursor: Alt+Up/Down to move, Space toggles, typing clears
-        if k.modifiers.contains(KeyModifiers::ALT) && matches!(k.code, KeyCode::Up | KeyCode::Down)
-        {
-            self.move_focus(k.code == KeyCode::Down);
+        if self.handle_transcript_key(k) {
             return;
-        }
-        if self.focus.is_some() {
-            match k.code {
-                KeyCode::Char(' ') => {
-                    if !self.toggle_focused() {
-                        self.focus = None;
-                    }
-                    return;
-                }
-                KeyCode::Esc => {
-                    self.focus = None;
-                    return;
-                }
-                KeyCode::Char(_)
-                | KeyCode::Enter
-                | KeyCode::Backspace
-                | KeyCode::Tab
-                | KeyCode::BackTab => {
-                    self.focus = None;
-                    // fall through: the key keeps its normal meaning
-                }
-                _ => {}
-            }
         }
 
         if self.active_ask.is_some() {
@@ -489,50 +463,12 @@ impl App {
             return;
         }
         if text.starts_with('/') && !text.contains('\n') {
-            match k.code {
-                KeyCode::Esc => self.input.clear(),
-                KeyCode::Up => self.palette_sel = self.palette_sel.saturating_sub(1),
-                KeyCode::Down | KeyCode::Tab => {
-                    let len = uirender::current_palette(self)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    if len > 0 {
-                        self.palette_sel = (self.palette_sel + 1).min(len - 1);
-                    }
-                }
-                KeyCode::Enter => {
-                    self.pick_palette().await;
-                    return;
-                }
-                KeyCode::Backspace => {
-                    self.input.backspace();
-                    self.palette_sel = 0;
-                }
-                KeyCode::Char(ch) => {
-                    self.input.insert_str(&ch.to_string());
-                    self.palette_sel = 0;
-                }
-                _ => {}
-            }
+            self.handle_palette_key(k.code).await;
             return;
         }
 
         if self.input.menu_items().is_some() {
-            match k.code {
-                KeyCode::Esc => self.input.completion = None,
-                KeyCode::Tab | KeyCode::Down => self.input.cycle_menu(true),
-                KeyCode::Up => self.input.cycle_menu(false),
-                KeyCode::Right | KeyCode::Enter => self.input.accept_selected(),
-                KeyCode::Char(ch) => {
-                    self.input.insert_str(&ch.to_string());
-                    self.after_edit();
-                }
-                KeyCode::Backspace => {
-                    self.input.backspace();
-                    self.after_edit();
-                }
-                _ => {}
-            }
+            self.handle_completion_key(k.code);
             return;
         }
 
@@ -583,6 +519,83 @@ impl App {
             KeyCode::End => self.input.end(),
             KeyCode::Up => self.input.history_prev(),
             KeyCode::Down => self.input.history_next(),
+            _ => {}
+        }
+    }
+
+    /// Transcript navigation has priority over the prompt modes. Returning
+    /// false means focus was cleared and the same key keeps its input meaning.
+    fn handle_transcript_key(&mut self, k: KeyEvent) -> bool {
+        if k.modifiers.contains(KeyModifiers::ALT) && matches!(k.code, KeyCode::Up | KeyCode::Down)
+        {
+            self.move_focus(k.code == KeyCode::Down);
+            return true;
+        }
+        if self.focus.is_none() {
+            return false;
+        }
+        match k.code {
+            KeyCode::Char(' ') => {
+                if !self.toggle_focused() {
+                    self.focus = None;
+                }
+                true
+            }
+            KeyCode::Esc => {
+                self.focus = None;
+                true
+            }
+            KeyCode::Char(_)
+            | KeyCode::Enter
+            | KeyCode::Backspace
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
+                self.focus = None;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    async fn handle_palette_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.input.clear(),
+            KeyCode::Up => self.palette_sel = self.palette_sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => {
+                let len = uirender::current_palette(self)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.palette_sel = (self.palette_sel + 1).min(len - 1);
+                }
+            }
+            KeyCode::Enter => self.pick_palette().await,
+            KeyCode::Backspace => {
+                self.input.backspace();
+                self.palette_sel = 0;
+            }
+            KeyCode::Char(ch) => {
+                self.input.insert_str(&ch.to_string());
+                self.palette_sel = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_completion_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.input.completion = None,
+            KeyCode::Tab | KeyCode::Down => self.input.cycle_menu(true),
+            KeyCode::Up => self.input.cycle_menu(false),
+            KeyCode::Right | KeyCode::Enter => self.input.accept_selected(),
+            KeyCode::Char(ch) => {
+                self.input.insert_str(&ch.to_string());
+                self.after_edit();
+            }
+            KeyCode::Backspace => {
+                self.input.backspace();
+                self.after_edit();
+            }
             _ => {}
         }
     }
@@ -873,51 +886,14 @@ impl App {
             AgentEvent::ThoughtDelta { text } => {
                 self.live_thought.push_str(&text);
             }
-            AgentEvent::ThinkingFinished { .. } => {
-                self.thinking_since = None;
-                let text = clean(&std::mem::take(&mut self.live_thought));
-                if !text.is_empty() {
-                    self.flush_narration(false);
-                    self.push_step_item(StepItem::Thought {
-                        text,
-                        expand: Expand::Collapsed,
-                    });
-                }
-            }
+            AgentEvent::ThinkingFinished { .. } => self.finish_thinking(),
             AgentEvent::AssistantDelta { text } => {
                 // accumulate intermediate prose; it is folded into the current
                 // step group as a collapsed Narration item once the turn seals
                 self.live_narration.push_str(&clean(&text));
             }
-            AgentEvent::TurnClosed => {
-                // Remember whether this turn left any prose after its last tool
-                // call: only then is the concluding answer auto-visible. The
-                // final-turn promotion (if needed) happens at Finished.
-                //
-                // The step group is intentionally NOT collapsed or detached here.
-                // Per the UX spec the whole task collapses into ONE line on
-                // completion - not several nested sub-groups - so a task is a
-                // single group that stays expanded through every turn and only
-                // collapses to "> N steps" at Finished.
-                self.final_turn_had_post_prose = !self.live_narration.trim().is_empty();
-                self.flush_narration(true);
-            }
-            AgentEvent::Step(view) => {
-                self.live_step = None;
-                self.flush_narration(false);
-                // A memory write surfaces outside the step group, so a completed
-                // task cannot hide a durable fact behind its collapsed summary.
-                if let Some(facts) = memory_facts(&self.memory, &self.cfg.project_root, &view) {
-                    for fact in facts {
-                        self.blocks.push(Block::Remembered(clean(&fact)));
-                    }
-                    return;
-                }
-                self.push_step_item(StepItem::Step(StepBlock {
-                    view: sanitize_step(view),
-                    expand: Expand::Collapsed,
-                }));
-            }
+            AgentEvent::TurnClosed => self.close_turn(),
+            AgentEvent::Step(view) => self.record_step(view),
             AgentEvent::Notice { text, level } => {
                 self.blocks.push(Block::Notice {
                     text: clean(&text),
@@ -929,69 +905,118 @@ impl App {
                     self.ctx_used = prompt_tokens;
                 }
             }
-            AgentEvent::PermAsk(view) => {
-                self.blocks.push(Block::PermAsk(PermAskBlock {
-                    id: view.id,
-                    verb: clean(&view.verb),
-                    target: clean(&view.target),
-                    cap_label: clean(view.cap_label),
-                    sensitive: view.sensitive,
-                    selected: 0,
-                    resolved: None,
-                }));
-                self.active_ask = Some(self.blocks.len() - 1);
-            }
+            AgentEvent::PermAsk(view) => self.record_permission_ask(view),
             AgentEvent::StepStarted(view) => {
                 let v = sanitize_step_start(view);
                 self.live_step = Some((v.0.to_owned(), v.1));
             }
-            AgentEvent::Finished(outcome) => {
-                self.flush_narration(true);
-                // The final turn's answer: if it was written before the last
-                // verify step it sits folded as a Narration - promote it to a
-                // visible top-level answer so it is not hidden. Narration from
-                // earlier turns stays folded inside its own group.
-                if !self.final_turn_had_post_prose {
-                    if let Some((gi, si)) = self.last_said.take() {
-                        if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
-                            if let Some(StepItem::Narration { text, .. }) = g.steps.get(si) {
-                                let t = text.clone();
-                                g.steps.remove(si);
-                                self.blocks.push(Block::Assistant(t));
-                            }
-                        }
-                    }
-                }
-                self.last_said = None;
-                self.final_turn_had_post_prose = false;
-                self.thinking_since = None;
-                self.live_thought.clear();
-                self.live_step = None;
-                if let Some(gi) = self.steps_group_idx {
-                    let mut dropped = false;
-                    if let Some(Block::Steps(g)) = self.blocks.get_mut(gi) {
-                        g.outcome = Some(outcome.clone());
-                        g.expanded = false;
-                        dropped = g.steps.is_empty() && outcome == TaskOutcome::Done;
-                    }
-                    if dropped && self.blocks.len() == gi + 1 {
-                        self.blocks.remove(gi);
-                        // keep the keyboard focus pointing at a real element
-                        if let Some((bi, _)) = self.focus {
-                            if bi == gi {
-                                self.focus = None;
-                            }
-                        }
-                    }
-                }
-                self.steps_group_idx = None;
-                self.running = false;
-                self.started_at = None;
-                self.escalation = None;
-                self.ctl_tx = None;
-                self.active_ask = None;
-                self.save_session();
-                self.spawn_index_rebuild();
+            AgentEvent::Finished(outcome) => self.finish_task(outcome),
+        }
+    }
+
+    fn finish_thinking(&mut self) {
+        self.thinking_since = None;
+        let text = clean(&std::mem::take(&mut self.live_thought));
+        if !text.is_empty() {
+            self.flush_narration(false);
+            self.push_step_item(StepItem::Thought {
+                text,
+                expand: Expand::Collapsed,
+            });
+        }
+    }
+
+    fn close_turn(&mut self) {
+        // The task owns one StepsGroup for its full lifetime. Closing a model
+        // turn only seals its prose; Finished alone collapses the group.
+        self.final_turn_had_post_prose = !self.live_narration.trim().is_empty();
+        self.flush_narration(true);
+    }
+
+    fn record_step(&mut self, view: StepView) {
+        self.live_step = None;
+        self.flush_narration(false);
+        // Memory facts stay outside the collapsible task group.
+        if let Some(facts) = memory_facts(&self.memory, &self.cfg.project_root, &view) {
+            for fact in facts {
+                self.blocks.push(Block::Remembered(clean(&fact)));
+            }
+            return;
+        }
+        self.push_step_item(StepItem::Step(StepBlock {
+            view: sanitize_step(view),
+            expand: Expand::Collapsed,
+        }));
+    }
+
+    fn record_permission_ask(&mut self, view: crate::agent::PermAskView) {
+        self.blocks.push(Block::PermAsk(PermAskBlock {
+            id: view.id,
+            verb: clean(&view.verb),
+            target: clean(&view.target),
+            cap_label: clean(view.cap_label),
+            sensitive: view.sensitive,
+            selected: 0,
+            resolved: None,
+        }));
+        self.active_ask = Some(self.blocks.len() - 1);
+    }
+
+    fn finish_task(&mut self, outcome: TaskOutcome) {
+        self.flush_narration(true);
+        self.promote_final_narration();
+        self.finish_steps_group(&outcome);
+
+        self.last_said = None;
+        self.final_turn_had_post_prose = false;
+        self.thinking_since = None;
+        self.live_thought.clear();
+        self.live_step = None;
+        self.steps_group_idx = None;
+        self.running = false;
+        self.started_at = None;
+        self.escalation = None;
+        self.ctl_tx = None;
+        self.active_ask = None;
+        self.save_session();
+        self.spawn_index_rebuild();
+    }
+
+    fn promote_final_narration(&mut self) {
+        if self.final_turn_had_post_prose {
+            return;
+        }
+        let Some((group_idx, step_idx)) = self.last_said.take() else {
+            return;
+        };
+        let Some(Block::Steps(group)) = self.blocks.get_mut(group_idx) else {
+            return;
+        };
+        let Some(StepItem::Narration { text, .. }) = group.steps.get(step_idx) else {
+            return;
+        };
+        let text = text.clone();
+        group.steps.remove(step_idx);
+        self.blocks.push(Block::Assistant(text));
+    }
+
+    fn finish_steps_group(&mut self, outcome: &TaskOutcome) {
+        let Some(group_idx) = self.steps_group_idx else {
+            return;
+        };
+        let mut drop_empty = false;
+        if let Some(Block::Steps(group)) = self.blocks.get_mut(group_idx) {
+            group.outcome = Some(outcome.clone());
+            group.expanded = false;
+            drop_empty = group.steps.is_empty() && *outcome == TaskOutcome::Done;
+        }
+        if drop_empty && self.blocks.len() == group_idx + 1 {
+            self.blocks.remove(group_idx);
+            if self
+                .focus
+                .is_some_and(|(block_idx, _)| block_idx == group_idx)
+            {
+                self.focus = None;
             }
         }
     }

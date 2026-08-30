@@ -3,7 +3,10 @@ use crate::app::{label_mode, App};
 use crate::commands::{arg_options, filter_commands, find_command};
 use crate::markdown::{self, MarkdownLine};
 use crate::theme;
-use crate::transcript::{Block, Expand, Hit, ResumedItem, StepItem, PERM_OPTIONS};
+use crate::transcript::{
+    Block, Expand, Hit, PermAskBlock, ResumedItem, ResumedSession, StepItem, StepsGroup,
+    PERM_OPTIONS,
+};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -444,20 +447,17 @@ fn merge_models(app: &App) -> Vec<String> {
     out
 }
 
+fn focus_style(style: Style, focused: bool) -> Style {
+    if focused {
+        theme::normal()
+    } else {
+        style
+    }
+}
+
 fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
     let mut rows: Vec<(Vec<Seg>, Hit)> = Vec::new();
     let cap = app.cfg.diff_lines.max(10);
-
-    // keyboard focus is shown purely by contrast: dim text becomes normal
-    // (the same mechanism as the selected permission option turning amber)
-    let focused = |bi: usize, si: usize| -> bool { app.focus == Some((bi, si)) };
-    let mark = |s: ratatui::style::Style, on: bool| -> ratatui::style::Style {
-        if on {
-            theme::normal()
-        } else {
-            s
-        }
-    };
 
     for (bi, block) in app.blocks.iter().enumerate() {
         // A step group with no actual step (only interim thought/narration) has
@@ -477,115 +477,14 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             Block::Assistant(text) => {
                 push_markdown_text(&mut rows, text, width, Hit::Nothing, 0);
             }
-            Block::Resumed(resumed) => {
-                let marker = if resumed.expanded { 'v' } else { '>' };
-                push_wrapped_text(
-                    &mut rows,
-                    &format!("{marker} {}", resumed.label),
-                    mark(theme::dim(), focused(bi, usize::MAX)),
-                    width,
-                    Hit::Block(bi),
-                );
-                if resumed.expanded {
-                    for item in &resumed.items {
-                        match item {
-                            ResumedItem::User(text) => {
-                                push_nested_user_prompt(&mut rows, text, theme::normal(), width, 2)
-                            }
-                            ResumedItem::Assistant(text) => {
-                                push_markdown_text(&mut rows, text, width, Hit::Nothing, 2)
-                            }
-                            ResumedItem::Step(text) => {
-                                push_indented(&mut rows, text, theme::dim(), width, 2)
-                            }
-                        }
-                    }
-                }
-            }
-            Block::Steps(group) => {
-                let marker = if group.expanded { 'v' } else { '>' };
-                push_wrapped_text(
-                    &mut rows,
-                    &format!("{marker} {}", group.summary()),
-                    mark(theme::dim(), focused(bi, usize::MAX)),
-                    width,
-                    Hit::Step(bi, usize::MAX),
-                );
-                if group.expanded {
-                    for (si, item) in group.steps.iter().enumerate() {
-                        match item {
-                            StepItem::Step(step) => {
-                                let style = match step.view.verb.word() {
-                                    "failed" | "error" => theme::red(),
-                                    "denied" => theme::amber(),
-                                    _ => theme::dim(),
-                                };
-                                push_indented_hit(
-                                    &mut rows,
-                                    &step.headline(),
-                                    mark(style, focused(bi, si)),
-                                    width,
-                                    2,
-                                    Hit::Step(bi, si),
-                                );
-                                if step.expand != Expand::Collapsed {
-                                    for dr in step.detail_rows(cap) {
-                                        let dstyle = if dr.starts_with('+') {
-                                            theme::green()
-                                        } else if dr.starts_with('-') {
-                                            theme::red()
-                                        } else {
-                                            theme::dim()
-                                        };
-                                        push_indented_hit(
-                                            &mut rows,
-                                            &dr,
-                                            dstyle,
-                                            width,
-                                            4,
-                                            Hit::Step(bi, si),
-                                        );
-                                    }
-                                }
-                            }
-                            StepItem::Thought { text, expand } => {
-                                let tm = if *expand == Expand::Collapsed {
-                                    '>'
-                                } else {
-                                    'v'
-                                };
-                                push_wrapped_text(
-                                    &mut rows,
-                                    &format!("  {tm} thought"),
-                                    mark(theme::dim(), focused(bi, si)),
-                                    width,
-                                    Hit::Step(bi, si),
-                                );
-                                if *expand != Expand::Collapsed {
-                                    push_indented(&mut rows, text, theme::dim(), width, 4);
-                                }
-                            }
-                            StepItem::Narration { text, expand } => {
-                                let nm = if *expand == Expand::Collapsed {
-                                    '>'
-                                } else {
-                                    'v'
-                                };
-                                push_wrapped_text(
-                                    &mut rows,
-                                    &format!("  {nm} said"),
-                                    mark(theme::dim(), focused(bi, si)),
-                                    width,
-                                    Hit::Step(bi, si),
-                                );
-                                if *expand != Expand::Collapsed {
-                                    push_indented(&mut rows, text, theme::dim(), width, 4);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            Block::Resumed(resumed) => render_resumed(
+                &mut rows,
+                resumed,
+                bi,
+                width,
+                app.focus == Some((bi, usize::MAX)),
+            ),
+            Block::Steps(group) => render_steps(&mut rows, group, bi, width, cap, app.focus),
             Block::Notice { text, level } => {
                 let style = match level {
                     NoticeLevel::Info => theme::dim(),
@@ -613,37 +512,7 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                     push_wrapped_text(&mut rows, l, style, width, Hit::Nothing);
                 }
             }
-            Block::PermAsk(ask) => match &ask.resolved {
-                Some(choice) => {
-                    // settled decision: no glyph, just dimmed amber, still wrapped
-                    // so long commands don't run off the window
-                    let text = format!("{} {} ({})", ask.verb, ask.target, choice);
-                    push_wrapped_text(&mut rows, &text, theme::amber_dim(), width, Hit::Nothing);
-                }
-                None => {
-                    let header = format!(
-                        "? {} {}{}  [{}]",
-                        ask.verb,
-                        ask.target,
-                        if ask.sensitive { " (sensitive)" } else { "" },
-                        ask.cap_label
-                    );
-                    push_wrapped_text(&mut rows, &header, theme::amber(), width, Hit::Nothing);
-                    for (oi, opt) in PERM_OPTIONS.iter().enumerate() {
-                        // unselected options sit at base contrast; the cursor
-                        // is the amber color itself, nothing else
-                        let style = if oi == ask.selected {
-                            theme::amber()
-                        } else {
-                            theme::normal()
-                        };
-                        rows.push((
-                            vec![(format!("  {} {opt}", oi + 1), style)],
-                            Hit::PermOption(bi, oi),
-                        ));
-                    }
-                }
-            },
+            Block::PermAsk(ask) => render_permission(&mut rows, ask, bi, width),
         }
     }
 
@@ -662,6 +531,166 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
     }
 
     rows
+}
+
+fn render_resumed(
+    rows: &mut Vec<(Vec<Seg>, Hit)>,
+    resumed: &ResumedSession,
+    block_idx: usize,
+    width: usize,
+    focused: bool,
+) {
+    let marker = if resumed.expanded { 'v' } else { '>' };
+    push_wrapped_text(
+        rows,
+        &format!("{marker} {}", resumed.label),
+        focus_style(theme::dim(), focused),
+        width,
+        Hit::Block(block_idx),
+    );
+    if !resumed.expanded {
+        return;
+    }
+    for item in &resumed.items {
+        match item {
+            ResumedItem::User(text) => {
+                push_nested_user_prompt(rows, text, theme::normal(), width, 2)
+            }
+            ResumedItem::Assistant(text) => push_markdown_text(rows, text, width, Hit::Nothing, 2),
+            ResumedItem::Step(text) => push_indented(rows, text, theme::dim(), width, 2),
+        }
+    }
+}
+
+fn render_steps(
+    rows: &mut Vec<(Vec<Seg>, Hit)>,
+    group: &StepsGroup,
+    block_idx: usize,
+    width: usize,
+    cap: usize,
+    focus: Option<(usize, usize)>,
+) {
+    let marker = if group.expanded { 'v' } else { '>' };
+    push_wrapped_text(
+        rows,
+        &format!("{marker} {}", group.summary()),
+        focus_style(theme::dim(), focus == Some((block_idx, usize::MAX))),
+        width,
+        Hit::Step(block_idx, usize::MAX),
+    );
+    if !group.expanded {
+        return;
+    }
+    for (step_idx, item) in group.steps.iter().enumerate() {
+        render_step_item(rows, item, block_idx, step_idx, width, cap, focus);
+    }
+}
+
+fn render_step_item(
+    rows: &mut Vec<(Vec<Seg>, Hit)>,
+    item: &StepItem,
+    block_idx: usize,
+    step_idx: usize,
+    width: usize,
+    cap: usize,
+    focus: Option<(usize, usize)>,
+) {
+    let hit = Hit::Step(block_idx, step_idx);
+    let focused = focus == Some((block_idx, step_idx));
+    match item {
+        StepItem::Step(step) => {
+            let style = match step.view.verb.word() {
+                "failed" | "error" => theme::red(),
+                "denied" => theme::amber(),
+                _ => theme::dim(),
+            };
+            push_indented_hit(
+                rows,
+                &step.headline(),
+                focus_style(style, focused),
+                width,
+                2,
+                hit,
+            );
+            if step.expand == Expand::Collapsed {
+                return;
+            }
+            for detail in step.detail_rows(cap) {
+                let style = if detail.starts_with('+') {
+                    theme::green()
+                } else if detail.starts_with('-') {
+                    theme::red()
+                } else {
+                    theme::dim()
+                };
+                push_indented_hit(rows, &detail, style, width, 4, hit);
+            }
+        }
+        StepItem::Thought { text, expand } => {
+            render_folded_text(rows, "thought", text, *expand, width, hit, focused)
+        }
+        StepItem::Narration { text, expand } => {
+            render_folded_text(rows, "said", text, *expand, width, hit, focused)
+        }
+    }
+}
+
+fn render_folded_text(
+    rows: &mut Vec<(Vec<Seg>, Hit)>,
+    label: &str,
+    text: &str,
+    expand: Expand,
+    width: usize,
+    hit: Hit,
+    focused: bool,
+) {
+    let marker = if expand == Expand::Collapsed {
+        '>'
+    } else {
+        'v'
+    };
+    push_wrapped_text(
+        rows,
+        &format!("  {marker} {label}"),
+        focus_style(theme::dim(), focused),
+        width,
+        hit,
+    );
+    if expand != Expand::Collapsed {
+        push_indented(rows, text, theme::dim(), width, 4);
+    }
+}
+
+fn render_permission(
+    rows: &mut Vec<(Vec<Seg>, Hit)>,
+    ask: &PermAskBlock,
+    block_idx: usize,
+    width: usize,
+) {
+    if let Some(choice) = ask.resolved {
+        let text = format!("{} {} ({choice})", ask.verb, ask.target);
+        push_wrapped_text(rows, &text, theme::amber_dim(), width, Hit::Nothing);
+        return;
+    }
+    let header = format!(
+        "? {} {}{}  [{}]",
+        ask.verb,
+        ask.target,
+        if ask.sensitive { " (sensitive)" } else { "" },
+        ask.cap_label
+    );
+    push_wrapped_text(rows, &header, theme::amber(), width, Hit::Nothing);
+    for (option_idx, option) in PERM_OPTIONS.iter().enumerate() {
+        let style = if option_idx == ask.selected {
+            theme::amber()
+        } else {
+            theme::normal()
+        };
+        rows.push((
+            vec![(format!("  {} {option}", option_idx + 1), style)],
+            Hit::PermOption(block_idx, option_idx),
+        ));
+    }
 }
 
 fn push_wrapped_text(
