@@ -11,7 +11,10 @@ use few::config::Config;
 use few::memory::Memory;
 use few::perms::{Mode, PermEngine, Policy};
 use few::providers::openai::OpenAiProvider;
+use few::providers::{Msg, Role, ToolCall};
+use few::session;
 use few::tools::Ctl;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -84,6 +87,7 @@ fn live_env() -> Option<(String, Option<String>, String)> {
 async fn drain_events(
     mut rx: mpsc::UnboundedReceiver<AgentEvent>,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
+    compacted: Arc<AtomicBool>,
 ) {
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -95,6 +99,9 @@ async fn drain_events(
             AgentEvent::AssistantDelta { text } => print!("{text}"),
             AgentEvent::TurnClosed => println!("\n--- turn closed ---"),
             AgentEvent::Notice { text, level } => {
+                if text.starts_with("context compacted") {
+                    compacted.store(true, Ordering::Relaxed);
+                }
                 println!("notice({level:?}) · {text}")
             }
             AgentEvent::AssistantText(t) => {
@@ -178,7 +185,11 @@ async fn live_agent_completes_file_task() {
     let runner = Arc::clone(&agent);
     let handle = tokio::spawn(async move { runner.run(task.to_owned(), ev_tx, ctl_rx).await });
 
-    let collector = tokio::spawn(drain_events(ev_rx, ctl_tx));
+    let collector = tokio::spawn(drain_events(
+        ev_rx,
+        ctl_tx,
+        Arc::new(AtomicBool::new(false)),
+    ));
 
     let outcome = tokio::time::timeout(Duration::from_secs(240), handle)
         .await
@@ -259,7 +270,11 @@ async fn live_verify_gives_up_on_repeated_failure() {
             .await
     });
 
-    let collector = tokio::spawn(drain_events(ev_rx, ctl_tx));
+    let collector = tokio::spawn(drain_events(
+        ev_rx,
+        ctl_tx,
+        Arc::new(AtomicBool::new(false)),
+    ));
 
     let outcome = tokio::time::timeout(Duration::from_secs(300), handle)
         .await
@@ -283,5 +298,171 @@ async fn live_verify_gives_up_on_repeated_failure() {
     );
 
     drop(collector);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn live_session_resume_restores_provider_context() {
+    let Some((base, key, model)) = live_env() else {
+        panic!("no live provider configured");
+    };
+    let root = std::env::temp_dir().join(format!("few-live-r{}", std::process::id()));
+    let sessions = root.join("sessions");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let cfg = Arc::new(Config {
+        provider_base_url: base.clone(),
+        api_key: key.clone(),
+        model: model.clone(),
+        probe_tools: false,
+        project_root: root.clone(),
+        project_config_path: root.join(".few/config.toml"),
+        ..Default::default()
+    });
+    let (perms, memory) = setup(&root);
+    let first = Arc::new(Agent::new(
+        OpenAiProvider::new(&base, key.as_deref(), &model).unwrap(),
+        Arc::clone(&cfg),
+        perms,
+        memory,
+        Default::default(),
+    ));
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let runner = Arc::clone(&first);
+    let handle = tokio::spawn(async move {
+        runner
+            .run(
+                "Remember the exact code phrase cobalt-orchid for the next turn. Reply only: remembered."
+                    .into(),
+                ev_tx,
+                ctl_rx,
+            )
+            .await
+    });
+    let collector = tokio::spawn(drain_events(
+        ev_rx,
+        ctl_tx,
+        Arc::new(AtomicBool::new(false)),
+    ));
+    assert_eq!(handle.await.unwrap(), TaskOutcome::Done);
+    collector.await.unwrap();
+
+    session::save(&sessions, &root, &model, None, first.snapshot_convo()).unwrap();
+    let (_, saved) = session::load_latest(&sessions, &root).unwrap().unwrap();
+    let restored_count = saved.messages.len();
+
+    let (perms, memory) = setup(&root);
+    let resumed = Arc::new(Agent::new(
+        OpenAiProvider::new(&base, key.as_deref(), &model).unwrap(),
+        cfg,
+        perms,
+        memory,
+        Default::default(),
+    ));
+    resumed.set_convo(saved.messages);
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let runner = Arc::clone(&resumed);
+    let handle = tokio::spawn(async move {
+        runner
+            .run(
+                "Without using tools, reply with the exact code phrase from the previous turn."
+                    .into(),
+                ev_tx,
+                ctl_rx,
+            )
+            .await
+    });
+    let collector = tokio::spawn(drain_events(
+        ev_rx,
+        ctl_tx,
+        Arc::new(AtomicBool::new(false)),
+    ));
+    assert_eq!(handle.await.unwrap(), TaskOutcome::Done);
+    collector.await.unwrap();
+    assert!(resumed.snapshot_convo()[restored_count..]
+        .iter()
+        .any(|m| m.role == Role::Assistant && m.content.contains("cobalt-orchid")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn live_context_compaction_continues_after_notice() {
+    let Some((base, key, model)) = live_env() else {
+        panic!("no live provider configured");
+    };
+    let root = std::env::temp_dir().join(format!("few-live-c{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("compact.txt"), "compact-ok\n").unwrap();
+    let cfg = Arc::new(Config {
+        provider_base_url: base.clone(),
+        api_key: key.clone(),
+        model: model.clone(),
+        context_window: 400,
+        compact_threshold: 0.25,
+        probe_tools: false,
+        project_root: root.clone(),
+        project_config_path: root.join(".few/config.toml"),
+        ..Default::default()
+    });
+    let (perms, memory) = setup(&root);
+    let agent = Arc::new(Agent::new(
+        OpenAiProvider::new(&base, key.as_deref(), &model).unwrap(),
+        cfg,
+        perms,
+        memory,
+        Default::default(),
+    ));
+    let mut history = Vec::new();
+    for i in 0..3 {
+        let id = format!("old-{i}");
+        history.push(Msg::user(format!("old round {i}")));
+        history.push(Msg {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall::parse(
+                id.clone(),
+                "read".into(),
+                r#"{"path":"old.txt"}"#.into(),
+            )],
+            tool_call_id: None,
+            name: None,
+        });
+        history.push(Msg::tool_result(&id, "read", "old output"));
+    }
+    agent.set_convo(history);
+
+    let compacted = Arc::new(AtomicBool::new(false));
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let runner = Arc::clone(&agent);
+    let handle = tokio::spawn(async move {
+        runner
+            .run(
+                "Read compact.txt with the read tool, then report its exact content.".into(),
+                ev_tx,
+                ctl_rx,
+            )
+            .await
+    });
+    let collector = tokio::spawn(drain_events(ev_rx, ctl_tx, Arc::clone(&compacted)));
+    assert_eq!(handle.await.unwrap(), TaskOutcome::Done);
+    collector.await.unwrap();
+    assert!(
+        compacted.load(Ordering::Relaxed),
+        "compaction notice missing"
+    );
+    let convo = agent.snapshot_convo();
+    assert!(convo
+        .iter()
+        .any(|m| m.content.starts_with("[few context compacted]")));
+    assert!(convo
+        .iter()
+        .any(|m| m.role == Role::Assistant && m.content.contains("compact-ok")));
     let _ = std::fs::remove_dir_all(&root);
 }
