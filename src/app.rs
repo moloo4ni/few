@@ -5,12 +5,13 @@ use crate::inputline::InputState;
 use crate::memory::{MemLevel, Memory};
 use crate::perms::{Grant, Mode, PermEngine};
 use crate::providers::openai::OpenAiProvider;
-use crate::providers::Provider as _;
+use crate::providers::{Msg, Provider as _, Role, ToolCall};
 use crate::sysprompt;
 use crate::tools::Ctl;
 
 use crate::transcript::{
-    Block, Expand, Hit, PermAskBlock, StepBlock, StepItem, StepsGroup, PERM_OPTIONS,
+    Block, Expand, Hit, PermAskBlock, ResumedItem, ResumedSession, StepBlock, StepItem, StepsGroup,
+    PERM_OPTIONS,
 };
 use crate::ui_text::clean;
 use crate::uirender;
@@ -143,8 +144,16 @@ impl App {
             ev_tx,
             ev_rx,
         };
-        if let Some((_, note)) = resume {
-            app.push_notice(note);
+        if let Some((session, note)) = resume {
+            if session.is_some() {
+                app.blocks.push(Block::Resumed(ResumedSession {
+                    label: note,
+                    items: resumed_items(&app.agent.snapshot_convo()),
+                    expanded: false,
+                }));
+            } else {
+                app.push_notice(note);
+            }
         }
         // Surface in the UI if the configuration is dummy or missing.
         if cfg.model == "dummy-model" || cfg.provider_base_url.contains("localhost:9999") {
@@ -263,6 +272,9 @@ impl App {
                             None
                         }
                     }
+                    Hit::Block(bi) if matches!(self.blocks.get(bi), Some(Block::Resumed(_))) => {
+                        Some((bi, usize::MAX))
+                    }
                     _ => None,
                 });
             }
@@ -292,12 +304,14 @@ impl App {
                 self.focus = Some(t);
                 if let Some(Block::Steps(g)) = self.blocks.get_mut(bi) {
                     match g.steps.get_mut(si) {
-                        // A repeated click reveals the full diff/output before
-                        // collapsing again, matching keyboard expansion.
-                        Some(StepItem::Step(s)) => s.expand = s.expand.next(),
+                        // Full is visited only when Shown actually truncates
+                        // detail; short content folds on the second click.
+                        Some(StepItem::Step(s)) => {
+                            s.expand = s.next_expand(self.cfg.diff_lines.max(10));
+                        }
                         Some(StepItem::Thought { expand, .. })
                         | Some(StepItem::Narration { expand, .. }) => {
-                            *expand = expand.next();
+                            *expand = expand.next_binary();
                         }
                         None => {}
                     }
@@ -308,7 +322,12 @@ impl App {
                     self.resolve_ask(opt);
                 }
             }
-            Hit::Block(_) => {}
+            Hit::Block(bi) => {
+                self.focus = Some((bi, usize::MAX));
+                if let Some(Block::Resumed(resumed)) = self.blocks.get_mut(bi) {
+                    resumed.expanded = !resumed.expanded;
+                }
+            }
         }
     }
 
@@ -317,23 +336,27 @@ impl App {
     pub fn expandable_targets(&self) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         for (bi, block) in self.blocks.iter().enumerate() {
-            if let Block::Steps(g) = block {
-                out.push((bi, usize::MAX));
-                for (si, item) in g.steps.iter().enumerate() {
-                    match item {
-                        StepItem::Step(step) => {
-                            if matches!(
-                                step.view.detail,
-                                Some(Detail::Diff { .. }) | Some(Detail::Output { .. })
-                            ) {
+            match block {
+                Block::Steps(g) => {
+                    out.push((bi, usize::MAX));
+                    for (si, item) in g.steps.iter().enumerate() {
+                        match item {
+                            StepItem::Step(step) => {
+                                if matches!(
+                                    step.view.detail,
+                                    Some(Detail::Diff { .. }) | Some(Detail::Output { .. })
+                                ) {
+                                    out.push((bi, si));
+                                }
+                            }
+                            StepItem::Thought { .. } | StepItem::Narration { .. } => {
                                 out.push((bi, si));
                             }
                         }
-                        StepItem::Thought { .. } | StepItem::Narration { .. } => {
-                            out.push((bi, si));
-                        }
                     }
                 }
+                Block::Resumed(_) => out.push((bi, usize::MAX)),
+                _ => {}
             }
         }
         out
@@ -375,16 +398,20 @@ impl App {
             }
             Some(Block::Steps(g)) => match g.steps.get_mut(si) {
                 Some(StepItem::Step(s)) => {
-                    s.expand = s.expand.next();
+                    s.expand = s.next_expand(self.cfg.diff_lines.max(10));
                     true
                 }
                 Some(StepItem::Thought { expand, .. })
                 | Some(StepItem::Narration { expand, .. }) => {
-                    *expand = expand.next();
+                    *expand = expand.next_binary();
                     true
                 }
                 None => false,
             },
+            Some(Block::Resumed(resumed)) if si == usize::MAX => {
+                resumed.expanded = !resumed.expanded;
+                true
+            }
             _ => false,
         }
     }
@@ -1058,6 +1085,49 @@ fn parse_mode(s: &str) -> Option<Mode> {
     }
 }
 
+fn resumed_items(messages: &[Msg]) -> Vec<ResumedItem> {
+    let mut items = Vec::new();
+    for msg in messages {
+        match msg.role {
+            Role::User if !msg.content.starts_with("[few ") => {
+                let text = clean(&msg.content);
+                if !text.trim().is_empty() {
+                    items.push(ResumedItem::User(text));
+                }
+            }
+            Role::Assistant => {
+                let text = clean(&msg.content);
+                if !text.trim().is_empty() {
+                    items.push(ResumedItem::Assistant(text));
+                }
+                for call in &msg.tool_calls {
+                    items.push(ResumedItem::Step(clean(&resumed_tool_label(call))));
+                }
+            }
+            Role::System | Role::Tool | Role::User => {}
+        }
+    }
+    items
+}
+
+fn resumed_tool_label(call: &ToolCall) -> String {
+    let arg = call.primary_arg();
+    let verb = match call.name.as_str() {
+        "read" => "read",
+        "write" if call.arguments.get("delete").and_then(|v| v.as_bool()) == Some(true) => {
+            "deleted"
+        }
+        "write" | "edit" => "wrote",
+        "shell" => "ran",
+        other => other,
+    };
+    if arg.is_empty() {
+        verb.to_owned()
+    } else {
+        format!("{verb} {arg}")
+    }
+}
+
 /// If a step mutates a known memory file, return the recorded `- fact`
 /// lines so they can be shown as `remembered:` entries instead of a generic
 /// write/edit step. Every added fact line is surfaced - the diff already
@@ -1234,6 +1304,40 @@ mod history_escape_tests {
         // a literal backslash survives the roundtrip
         let bs = "path\\to\\file";
         assert_eq!(unescape_history(&escape_history(bs)), bs);
+    }
+
+    #[test]
+    fn resumed_history_keeps_dialogue_and_summarizes_tools() {
+        let messages = vec![
+            Msg::user("Create hello.py"),
+            Msg {
+                role: Role::Assistant,
+                tool_calls: vec![
+                    ToolCall::parse(
+                        "w1".into(),
+                        "write".into(),
+                        r#"{"path":"hello.py","content":"print('hi')"}"#.into(),
+                    ),
+                    ToolCall::parse(
+                        "s1".into(),
+                        "shell".into(),
+                        r#"{"command":"python3 hello.py"}"#.into(),
+                    ),
+                ],
+                ..Default::default()
+            },
+            Msg::tool_result("w1", "write", "large raw output is omitted"),
+            Msg::tool_result("s1", "shell", "hi"),
+            Msg::assistant("Done."),
+            Msg::user("[few verify] internal feedback"),
+        ];
+
+        let items = resumed_items(&messages);
+        assert_eq!(items.len(), 4);
+        assert!(matches!(&items[0], ResumedItem::User(s) if s == "Create hello.py"));
+        assert!(matches!(&items[1], ResumedItem::Step(s) if s == "wrote hello.py"));
+        assert!(matches!(&items[2], ResumedItem::Step(s) if s == "ran python3 hello.py"));
+        assert!(matches!(&items[3], ResumedItem::Assistant(s) if s == "Done."));
     }
 }
 

@@ -54,6 +54,9 @@ cd /path/to/your/project
 /path/to/few/target/release/few -c     # resume the last session for this project
 ```
 
+On resume, the restored provider context is also available in the transcript as
+a collapsed `> resumed session` block.
+
 Few reads `<project>/.few/config.toml` (per-project, overrides global) and
 `~/.config/few/config.toml` (global: provider, model, key). Sessions persist
 automatically after each completed task as JSON under the user's data directory
