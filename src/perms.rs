@@ -87,6 +87,7 @@ pub struct PermEngine {
     sensitive: Gitignore,
     granted: BTreeMap<String, String>,
     session: HashSet<(Capability, String)>,
+    implicit_reads: HashSet<String>,
     base_write: Policy,
     base_shell: Policy,
     project_detected: bool,
@@ -131,6 +132,7 @@ impl PermEngine {
             sensitive: matcher,
             granted,
             session: HashSet::new(),
+            implicit_reads: HashSet::new(),
             base_write,
             base_shell,
             project_detected,
@@ -187,6 +189,16 @@ impl PermEngine {
                 ignore::Match::Ignore(_)
             )
         })
+    }
+
+    /// A file explicitly accepted through completion may be read without a
+    /// second prompt. This remains distinct from an explicit permission grant
+    /// so it can never bypass the sensitive-file policy.
+    pub fn grant_implicit_read(&mut self, path: &Path) -> bool {
+        if self.is_sensitive(path) {
+            return false;
+        }
+        self.implicit_reads.insert(self.target_key(path))
     }
 
     fn granted_allows(&self, cap: Capability, key: &str) -> bool {
@@ -249,6 +261,9 @@ impl PermEngine {
                 }
                 if self.is_sensitive(t) {
                     return Check::Ask { sensitive: true };
+                }
+                if self.implicit_reads.contains(&self.target_key(t)) {
+                    return Check::Allowed;
                 }
                 if self.is_under_root(t) {
                     match self.read_policy {
@@ -558,6 +573,37 @@ mod tests {
         assert_eq!(
             e.check(Capability::ShellExec, Some(Path::new("pwd"))),
             Check::Allowed
+        );
+    }
+
+    #[test]
+    fn completion_grants_only_non_sensitive_reads() {
+        let root = PathBuf::from("/non-project");
+        let mut e = PermEngine::new(
+            root.clone(),
+            vec![],
+            Default::default(),
+            Policy::Ask,
+            Policy::Ask,
+            false,
+        );
+        let note = root.join("notes.txt");
+        let env = root.join(".env");
+        assert_eq!(
+            e.check(Capability::FsRead, Some(&note)),
+            Check::Ask { sensitive: false }
+        );
+        assert!(e.grant_implicit_read(&note));
+        assert_eq!(e.check(Capability::FsRead, Some(&note)), Check::Allowed);
+        assert!(!e.grant_implicit_read(&env));
+        assert_eq!(
+            e.check(Capability::FsRead, Some(&env)),
+            Check::Ask { sensitive: true }
+        );
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(&note)),
+            Check::Ask { sensitive: false },
+            "completion must never grant write"
         );
     }
 
