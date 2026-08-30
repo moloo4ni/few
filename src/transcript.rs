@@ -122,7 +122,7 @@ impl StepBlock {
             ..
         }) = &self.view.detail
         {
-            s += &format!(" (output captured, {total_bytes}b)");
+            s += &format!(" (output truncated, {total_bytes}b total)");
         }
         s
     }
