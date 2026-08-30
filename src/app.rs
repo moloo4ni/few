@@ -735,8 +735,7 @@ impl App {
         self.agent.set_mode_directive(sysprompt::mode_directive(m));
     }
 
-    /// Cycle the agent mode (Build -> Plan -> Auto -> Build) so it can be
-    /// switched from the keyboard, e.g. mid-prompt via Tab.
+    /// Cycle the agent mode (Build -> Plan -> Auto -> Build) from Shift+Tab.
     fn cycle_mode(&mut self) {
         let next = match self.mode {
             Mode::Build => Mode::Plan,
