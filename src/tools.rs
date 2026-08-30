@@ -291,27 +291,35 @@ fn shell_program(override_prog: Option<&str>) -> (String, Vec<String>) {
     }
 }
 
+/// Absolute retained-output ceiling. The readers continue draining and counting
+/// after this point so the UI can report the real size instead of silently
+/// presenting the retained prefix as complete output.
 const HARD_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 
-async fn drain(
-    pipe: impl tokio::io::AsyncRead + Unpin,
-    buf: std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>,
-) {
+#[derive(Default)]
+struct PipeCapture {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+}
+
+async fn drain(pipe: impl tokio::io::AsyncRead + Unpin, retain_limit: usize) -> PipeCapture {
     use tokio::io::AsyncReadExt;
     let mut pipe = pipe;
     let mut chunk = [0u8; 8192];
+    let mut capture = PipeCapture::default();
     loop {
         match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let mut b = buf.lock().await;
-                if b.len() < HARD_CAPTURE_LIMIT {
-                    let room = HARD_CAPTURE_LIMIT - b.len();
-                    b.extend_from_slice(&chunk[..n.min(room)]);
+                capture.total_bytes = capture.total_bytes.saturating_add(n);
+                if capture.bytes.len() < retain_limit {
+                    let room = retain_limit - capture.bytes.len();
+                    capture.bytes.extend_from_slice(&chunk[..n.min(room)]);
                 }
             }
         }
     }
+    capture
 }
 
 pub async fn run_shell(
@@ -353,18 +361,15 @@ pub async fn run_shell(
         }
     };
 
-    let out_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let err_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-
-    let mut readers = Vec::new();
-    if let Some(out) = child.stdout.take() {
-        let b = out_buf.clone();
-        readers.push(tokio::spawn(drain(out, b)));
-    }
-    if let Some(err) = child.stderr.take() {
-        let b = err_buf.clone();
-        readers.push(tokio::spawn(drain(err, b)));
-    }
+    let retain_limit = byte_cap.min(HARD_CAPTURE_LIMIT);
+    let out_reader = child
+        .stdout
+        .take()
+        .map(|stdout| tokio::spawn(drain(stdout, retain_limit)));
+    let err_reader = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(drain(stderr, retain_limit)));
 
     let mut killed = false;
     let mut kill_deadline: Option<std::time::Instant> = None;
@@ -373,11 +378,8 @@ pub async fn run_shell(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                for r in readers {
-                    let _ = r.await;
-                }
-                let out = out_buf.lock().await.clone();
-                let err = err_buf.lock().await.clone();
+                let out = finish_reader(out_reader).await;
+                let err = finish_reader(err_reader).await;
 
                 let status_line = if killed {
                     "^C process killed".to_owned()
@@ -400,27 +402,10 @@ pub async fn run_shell(
                     }
                 };
 
-                let total = out.len() + err.len();
-                let (out_s, err_s) = if total <= byte_cap {
-                    (
-                        String::from_utf8_lossy(&out).into_owned(),
-                        String::from_utf8_lossy(&err).into_owned(),
-                    )
-                } else {
-                    let half = byte_cap / 2;
-                    (clip_bytes(&out, half), clip_bytes(&err, half))
-                };
-
                 return ShellRun {
                     success: status.success() && !killed && !hard_abort,
                     status_line,
-                    capture: OutputCapture {
-                        stdout: out_s,
-                        stderr: err_s,
-                        total_bytes: total,
-                        truncated_from: if total > byte_cap { Some(total) } else { None },
-                        killed,
-                    },
+                    capture: finish_capture(out, err, byte_cap, HARD_CAPTURE_LIMIT, killed),
                 };
             }
             Ok(None) => {}
@@ -431,7 +416,7 @@ pub async fn run_shell(
                     capture: OutputCapture {
                         stdout: String::new(),
                         stderr: e.to_string(),
-                        total_bytes: 0,
+                        total_bytes: e.to_string().len(),
                         truncated_from: None,
                         killed: false,
                     },
@@ -471,6 +456,46 @@ pub async fn run_shell(
     }
 }
 
+async fn finish_reader(reader: Option<tokio::task::JoinHandle<PipeCapture>>) -> PipeCapture {
+    match reader {
+        Some(reader) => reader.await.unwrap_or_default(),
+        None => PipeCapture::default(),
+    }
+}
+
+fn finish_capture(
+    out: PipeCapture,
+    err: PipeCapture,
+    configured_limit: usize,
+    safety_limit: usize,
+    killed: bool,
+) -> OutputCapture {
+    let limit = configured_limit.min(safety_limit);
+    let total_bytes = out.total_bytes.saturating_add(err.total_bytes);
+    let (out_limit, err_limit) = split_output_budget(out.total_bytes, err.total_bytes, limit);
+    let truncated = out.total_bytes > out_limit || err.total_bytes > err_limit;
+
+    OutputCapture {
+        stdout: render_pipe(&out, out_limit),
+        stderr: render_pipe(&err, err_limit),
+        total_bytes,
+        truncated_from: truncated.then_some(total_bytes),
+        killed,
+    }
+}
+
+fn split_output_budget(out_bytes: usize, err_bytes: usize, limit: usize) -> (usize, usize) {
+    let mut out_limit = out_bytes.min(limit / 2 + limit % 2);
+    let mut err_limit = err_bytes.min(limit / 2);
+    let mut remaining = limit.saturating_sub(out_limit.saturating_add(err_limit));
+
+    let extra_out = out_bytes.saturating_sub(out_limit).min(remaining);
+    out_limit += extra_out;
+    remaining -= extra_out;
+    err_limit += err_bytes.saturating_sub(err_limit).min(remaining);
+    (out_limit, err_limit)
+}
+
 fn soft_terminate(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -488,10 +513,15 @@ fn kill_group(pgid: i32, sig: i32) -> bool {
     unsafe { libc::kill(-pgid, sig) == 0 }
 }
 
-fn clip_bytes(data: &[u8], cap: usize) -> String {
-    let end = data.len().min(cap);
-    let mut s = String::from_utf8_lossy(&data[..end]).into_owned();
-    s.push_str("\n... output truncated");
+fn render_pipe(capture: &PipeCapture, limit: usize) -> String {
+    let end = capture.bytes.len().min(limit);
+    let mut s = String::from_utf8_lossy(&capture.bytes[..end]).into_owned();
+    if capture.total_bytes > limit {
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s += &format!("... output truncated, {} bytes total", capture.total_bytes);
+    }
     s
 }
 
@@ -638,6 +668,100 @@ mod tests {
         let capped = cap_for_model(&long, 10);
         assert!(capped.contains("truncated"));
         assert!(capped.contains("100 characters total"));
+    }
+
+    fn pipe(byte: u8, retained: usize, total: usize) -> PipeCapture {
+        PipeCapture {
+            bytes: vec![byte; retained],
+            total_bytes: total,
+        }
+    }
+
+    #[test]
+    fn shell_capture_gives_an_idle_streams_budget_to_stdout() {
+        let capture = finish_capture(
+            pipe(b'o', 300, 300),
+            PipeCapture::default(),
+            200,
+            1000,
+            false,
+        );
+
+        assert!(capture.stdout.starts_with(&"o".repeat(200)));
+        assert!(capture.stdout.contains("300 bytes total"));
+        assert!(capture.stderr.is_empty());
+        assert_eq!(capture.total_bytes, 300);
+        assert_eq!(capture.truncated_from, Some(300));
+    }
+
+    #[test]
+    fn shell_capture_gives_an_idle_streams_budget_to_stderr() {
+        let capture = finish_capture(
+            PipeCapture::default(),
+            pipe(b'e', 300, 300),
+            200,
+            1000,
+            false,
+        );
+
+        assert!(capture.stdout.is_empty());
+        assert!(capture.stderr.starts_with(&"e".repeat(200)));
+        assert!(capture.stderr.contains("300 bytes total"));
+        assert_eq!(capture.total_bytes, 300);
+        assert_eq!(capture.truncated_from, Some(300));
+    }
+
+    #[test]
+    fn shell_capture_redistributes_a_shared_mixed_budget() {
+        let capture = finish_capture(pipe(b'o', 250, 250), pipe(b'e', 20, 20), 100, 1000, false);
+
+        assert!(capture.stdout.starts_with(&"o".repeat(80)));
+        assert!(!capture.stdout.starts_with(&"o".repeat(81)));
+        assert_eq!(capture.stderr, "e".repeat(20));
+        assert_eq!(capture.total_bytes, 270);
+        assert_eq!(capture.truncated_from, Some(270));
+    }
+
+    #[test]
+    fn shell_capture_keeps_complete_output_within_the_limit() {
+        let capture = finish_capture(pipe(b'o', 30, 30), pipe(b'e', 20, 20), 100, 1000, false);
+
+        assert_eq!(capture.stdout, "o".repeat(30));
+        assert_eq!(capture.stderr, "e".repeat(20));
+        assert_eq!(capture.total_bytes, 50);
+        assert_eq!(capture.truncated_from, None);
+    }
+
+    #[test]
+    fn shell_capture_surfaces_the_safety_ceiling_and_actual_total() {
+        let actual = 17_000_000;
+        let capture = finish_capture(
+            pipe(b'o', 64, actual),
+            PipeCapture::default(),
+            20_000_000,
+            64,
+            false,
+        );
+
+        assert!(capture.stdout.starts_with(&"o".repeat(64)));
+        assert!(capture.stdout.contains("17000000 bytes total"));
+        assert_eq!(capture.total_bytes, actual);
+        assert_eq!(capture.truncated_from, Some(actual));
+    }
+
+    #[tokio::test]
+    async fn shell_reader_counts_bytes_beyond_its_retained_prefix() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let write = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 300]).await.unwrap();
+        });
+        let capture = drain(reader, 10).await;
+        write.await.unwrap();
+
+        assert_eq!(capture.bytes, vec![b'x'; 10]);
+        assert_eq!(capture.total_bytes, 300);
     }
 
     #[tokio::test]

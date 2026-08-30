@@ -159,6 +159,13 @@ invalid sensitive patterns stop startup with an error naming the offending TOML 
 intentional for permission settings; Few never silently ignores a restriction that appears to
 be configured.
 
+`limits.shell_output_bytes` is one shared retained-output budget for stdout and
+stderr; unused capacity from either stream is reassigned to the other. Few keeps
+counting bytes after truncation so the displayed total remains accurate. An
+independent 16 MiB combined safety ceiling limits retained process output even
+when a larger value is configured, and its truncation is surfaced in the step
+detail rather than silently reported as complete output.
+
 State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
 `~/.local/state` where available) and never inside a project directory - except explicitly
 project-local things (`.few/`).
