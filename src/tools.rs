@@ -99,42 +99,6 @@ fn display_rel(root: &std::path::Path, p: &std::path::Path) -> String {
     crate::paths::rel_display(root, p)
 }
 
-/// Write via temp file + rename so a crash mid-write never leaves the user's
-/// file half-written. On Windows rename-over-existing fails, hence the
-/// remove-then-rename fallback (the tiny non-atomic window is documented).
-fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ToolError> {
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        return Err(ToolError(format!(
-            "cannot create directory {}: {e}",
-            dir.display()
-        )));
-    }
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_owned());
-    let tmp = dir.join(format!(".{name}.few-tmp-{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ToolError(format!("cannot write {}: {e}", tmp.display())));
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(_) if cfg!(windows) => {
-            let r = std::fs::remove_file(path).and_then(|_| std::fs::rename(&tmp, path));
-            if r.is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-            r.map_err(|e| ToolError(format!("cannot write {}: {e}", path.display())))
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(ToolError(format!("cannot write {}: {e}", path.display())))
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct ReadOut {
     pub for_model: String,
@@ -183,16 +147,18 @@ pub fn exec_write(
 ) -> Result<WriteOut, ToolError> {
     let path = resolve(root, arg_path);
     let disp = display_rel(root, &path);
-    let existed = path.exists();
-    if existed && path.is_dir() {
-        return Err(ToolError(format!("{disp} is a directory")));
-    }
-
-    let old_bytes: Option<Vec<u8>> = if existed {
-        Some(std::fs::read(&path).unwrap_or_default())
-    } else {
-        None
+    let old_bytes = match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(ToolError(format!("{disp} is a directory")));
+        }
+        Ok(_) => Some(
+            std::fs::read(&path)
+                .map_err(|error| ToolError(format!("cannot read {disp}: {error}")))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(ToolError(format!("cannot inspect {disp}: {error}"))),
     };
+    let existed = old_bytes.is_some();
 
     if delete {
         if !existed {
@@ -219,7 +185,8 @@ pub fn exec_write(
         std::fs::create_dir_all(parent)
             .map_err(|e| ToolError(format!("cannot create directories for {disp}: {e}")))?;
     }
-    atomic_write(&path, new_bytes)?;
+    crate::fsutil::atomic_replace(&path, new_bytes)
+        .map_err(|error| ToolError(format!("cannot write {disp}: {error}")))?;
 
     let old_is_bin = old_bytes
         .as_deref()
@@ -298,7 +265,8 @@ pub fn exec_edit(
     }
 
     let updated = text.replacen(old_str, new_str, 1);
-    atomic_write(&path, updated.as_bytes())?;
+    crate::fsutil::atomic_replace(&path, updated.as_bytes())
+        .map_err(|error| ToolError(format!("cannot write {disp}: {error}")))?;
     Ok(EditOut {
         for_model: format!("edited {disp}"),
         path_display: disp,
@@ -555,7 +523,7 @@ mod tests {
         let root = tmpdir("atomic");
         let file = root.join("f.txt");
         std::fs::write(&file, "old content that is quite long\n").unwrap();
-        atomic_write(&file, b"new").unwrap();
+        crate::fsutil::atomic_replace(&file, b"new").unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
         // no temp leftovers
         let leftovers: Vec<_> = std::fs::read_dir(&root)
@@ -565,6 +533,56 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp files must be cleaned up");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_and_edit_preserve_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tmpdir("permissions");
+        let script = root.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exec_edit(&root, "run.sh", "old", "new").unwrap();
+        assert_eq!(
+            std::fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let private = root.join("private.txt");
+        std::fs::write(&private, "old\n").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+        exec_write(&root, "private.txt", "new\n", false).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_refuses_an_unreadable_existing_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tmpdir("unreadable");
+        let path = root.join("locked.txt");
+        std::fs::write(&path, "keep me\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        if std::fs::File::open(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
+        let error = exec_write(&root, "locked.txt", "replacement\n", false).unwrap_err();
+
+        assert!(error.0.contains("cannot read locked.txt"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me\n");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

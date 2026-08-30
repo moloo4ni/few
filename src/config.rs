@@ -1,9 +1,7 @@
 use crate::perms::Policy;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -387,7 +385,11 @@ fn validate_permissions(config: &FileConfig, path: &Path) -> anyhow::Result<()> 
 }
 
 pub fn persist_grant(path: &Path, key: &str, cap: &str) -> anyhow::Result<()> {
-    let mut text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
     let assign = format!("{} = \"{}\"", toml_quote(key), cap);
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let header = "[permissions.granted]";
@@ -432,7 +434,7 @@ pub fn persist_grant(path: &Path, key: &str, cap: &str) -> anyhow::Result<()> {
             }
         }
     }
-    atomic_write_config(path, text.as_bytes())?;
+    crate::fsutil::atomic_replace_new_private(path, text.as_bytes())?;
     Ok(())
 }
 
@@ -455,55 +457,6 @@ fn parse_quoted_key(trimmed_line: &str) -> Option<String> {
         .keys()
         .next()
         .cloned()
-}
-
-fn atomic_write_config(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let original_permissions = std::fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "config.toml".to_owned());
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(".{name}.few-tmp-{}-{sequence}", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp)?;
-    if let Err(error) = file.write_all(bytes) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error);
-    }
-    drop(file);
-    if let Some(permissions) = original_permissions {
-        if let Err(error) = std::fs::set_permissions(&temp, permissions) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(error);
-        }
-    }
-    match std::fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(_) if cfg!(windows) => {
-            let result = std::fs::remove_file(path).and_then(|_| std::fs::rename(&temp, path));
-            if result.is_err() {
-                let _ = std::fs::remove_file(&temp);
-            }
-            result
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(error)
-        }
-    }
 }
 
 fn parse_policy(s: &str) -> Option<Policy> {
@@ -654,23 +607,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn persisted_grant_preserves_private_config_permissions() {
+    fn persisted_grant_preserves_existing_mode_and_creates_private() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("few-grant-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("config.toml");
+        let new_file = dir.join("new.toml");
         std::fs::write(&file, "[provider]\napi_key = \"secret\"\n").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
 
         persist_grant(&file, "shell::cargo test", "execute").unwrap();
+        persist_grant(&new_file, "Cargo.toml", "write").unwrap();
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::metadata(&new_file).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert!(toml::from_str::<FileConfig>(&std::fs::read_to_string(&file).unwrap()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_grant_refuses_an_unreadable_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("few-config-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        let original = "[provider]\nmodel = \"keep\"\n";
+        std::fs::write(&file, original).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        if std::fs::File::open(&file).is_ok() {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+
+        assert!(persist_grant(&file, "Cargo.toml", "write").is_err());
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
