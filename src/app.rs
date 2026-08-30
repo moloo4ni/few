@@ -769,7 +769,7 @@ impl App {
 
     fn memory_edit(&mut self, level: MemLevel) {
         let path = self.memory.level_path(level).to_path_buf();
-        let _ = self.memory.ensure_files();
+        let _ = self.memory.ensure_file(level);
         // hand the terminal over to $EDITOR: stop drawing until it returns
         self.suspended = true;
         let agent = Arc::clone(&self.agent);
@@ -1068,9 +1068,10 @@ impl App {
 
     fn spawn_index_rebuild(&mut self) {
         let root = self.cfg.project_root.clone();
+        let project_detected = self.cfg.project_detected;
         let idx = Arc::clone(&self.file_index);
         tokio::spawn(async move {
-            let files = build_file_index(root).await;
+            let files = build_file_index(root, project_detected).await;
             *idx.lock().unwrap() = files;
         });
     }
@@ -1252,9 +1253,20 @@ fn append_history_line(path: &PathBuf, entry: &str) {
     }
 }
 
-async fn build_file_index(root: PathBuf) -> Vec<String> {
+async fn build_file_index(root: PathBuf, recursive: bool) -> Vec<String> {
     tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
+        if !recursive {
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten().take(20_000) {
+                    if entry.path().is_file() {
+                        out.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            out.sort();
+            return out;
+        }
         let walker = ignore::WalkBuilder::new(&root).build();
         for entry in walker.flatten() {
             let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
@@ -1272,6 +1284,26 @@ async fn build_file_index(root: PathBuf) -> Vec<String> {
     })
     .await
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod file_index_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn non_project_index_is_shallow() {
+        let root = std::env::temp_dir().join(format!("few-index-shallow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("top.txt"), "top").unwrap();
+        std::fs::write(root.join("nested/private.txt"), "private").unwrap();
+
+        let shallow = build_file_index(root.clone(), false).await;
+        assert_eq!(shallow, vec!["top.txt"]);
+        let recursive = build_file_index(root.clone(), true).await;
+        assert!(recursive.contains(&"nested/private.txt".to_owned()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 fn run_editor_blocking(path: &PathBuf) -> anyhow::Result<()> {
@@ -1357,6 +1389,7 @@ mod memory_step_tests {
             context_window: 1000,
             project_root: root.clone(),
             project_config_path: root.join(".few/config.toml"),
+            project_detected: true,
             ..Default::default()
         });
         let perms = Arc::new(Mutex::new(PermEngine::new(
@@ -1365,6 +1398,7 @@ mod memory_step_tests {
             Default::default(),
             Policy::Ask,
             Policy::Ask,
+            true,
         )));
         let memory = Memory::new(&root, &root.join(".data"));
         let provider = OpenAiProvider::new("http://127.0.0.1:9/v1", None, "m").unwrap();

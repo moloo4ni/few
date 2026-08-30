@@ -54,6 +54,12 @@ cd /path/to/your/project
 /path/to/few/target/release/few -c     # resume the last session for this project
 ```
 
+Few recognizes a project from a bounded set of root markers such as `.git`,
+`Cargo.toml`, `go.mod`, `package.json`, and `pyproject.toml`. Outside a detected
+project, reads and writes require approval in the normal modes, file completion
+indexes only the top level, and Few does not create project memory automatically.
+In plan mode writes remain denied; auto-approve remains explicit and unchanged.
+
 On resume, the restored provider context is also available in the transcript as
 a collapsed `> resumed session` block.
 

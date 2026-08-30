@@ -133,10 +133,11 @@ fn setup(root: &std::path::Path) -> (Arc<Mutex<PermEngine>>, Memory) {
         Default::default(),
         Policy::Ask,
         Policy::Ask,
+        true,
     )));
     perms.lock().unwrap().set_mode(Mode::Auto);
     let memory = Memory::new(root, &root.join(".data"));
-    memory.ensure_files().unwrap();
+    memory.ensure_startup_files(true).unwrap();
     (perms, memory)
 }
 
@@ -163,6 +164,7 @@ async fn live_agent_completes_file_task() {
         probe_tools: false,
         project_root: root.clone(),
         project_config_path: root.join(".few/config.toml"),
+        project_detected: true,
         ..Default::default()
     });
     let (perms, memory) = setup(&root);
@@ -245,6 +247,7 @@ async fn live_verify_gives_up_on_repeated_failure() {
         verify_command: Some(fail_cmd.to_owned()),
         project_root: root.clone(),
         project_config_path: root.join(".few/config.toml"),
+        project_detected: true,
         ..Default::default()
     });
     let (perms, memory) = setup(&root);
@@ -319,6 +322,7 @@ async fn live_session_resume_restores_provider_context() {
         probe_tools: false,
         project_root: root.clone(),
         project_config_path: root.join(".few/config.toml"),
+        project_detected: true,
         ..Default::default()
     });
     let (perms, memory) = setup(&root);
@@ -408,6 +412,7 @@ async fn live_context_compaction_continues_after_notice() {
         probe_tools: false,
         project_root: root.clone(),
         project_config_path: root.join(".few/config.toml"),
+        project_detected: true,
         ..Default::default()
     });
     let (perms, memory) = setup(&root);

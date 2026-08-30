@@ -89,6 +89,8 @@ pub struct PermEngine {
     session: HashSet<(Capability, String)>,
     base_write: Policy,
     base_shell: Policy,
+    project_detected: bool,
+    read_policy: Policy,
     write_policy: Policy,
     shell_policy: Policy,
 }
@@ -109,6 +111,7 @@ impl PermEngine {
         granted: BTreeMap<String, String>,
         base_write: Policy,
         base_shell: Policy,
+        project_detected: bool,
     ) -> Self {
         let mut lines: Vec<String> = BUILTIN_SENSITIVE.iter().map(|s| s.to_string()).collect();
         lines.extend(extra_sensitive);
@@ -122,24 +125,35 @@ impl PermEngine {
                 .build()
                 .unwrap_or_else(|_| Gitignore::empty()),
         };
-        Self {
+        let mut engine = Self {
             root,
             sensitive: matcher,
             granted,
             session: HashSet::new(),
             base_write,
             base_shell,
+            project_detected,
+            read_policy: Policy::Allow,
             write_policy: base_write,
             shell_policy: base_shell,
-        }
+        };
+        engine.set_mode(Mode::Build);
+        engine
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
+        let r = if self.project_detected || mode == Mode::Auto {
+            Policy::Allow
+        } else {
+            Policy::Ask
+        };
         let (w, s) = match mode {
             Mode::Plan => (Policy::Deny, Policy::Ask),
-            Mode::Build => (self.base_write, self.base_shell),
+            Mode::Build if self.project_detected => (self.base_write, self.base_shell),
+            Mode::Build => (Policy::Ask, self.base_shell),
             Mode::Auto => (Policy::Allow, Policy::Allow),
         };
+        self.read_policy = r;
         self.write_policy = w;
         self.shell_policy = s;
     }
@@ -234,7 +248,11 @@ impl PermEngine {
                     return Check::Ask { sensitive: true };
                 }
                 if self.is_under_root(t) {
-                    Check::Allowed
+                    match self.read_policy {
+                        Policy::Allow => Check::Allowed,
+                        Policy::Ask => Check::Ask { sensitive: false },
+                        Policy::Deny => Check::Denied(DenySource::ModePolicy),
+                    }
                 } else {
                     Check::Ask { sensitive: false }
                 }
@@ -392,6 +410,7 @@ mod tests {
             Default::default(),
             Policy::Ask,
             Policy::Ask,
+            true,
         )
     }
 
@@ -438,6 +457,7 @@ mod tests {
             Default::default(),
             Policy::Ask,
             Policy::Ask,
+            true,
         );
         let escaped = root.join("escape/new.txt");
         assert_eq!(
@@ -484,6 +504,52 @@ mod tests {
         assert_eq!(
             e.check(Capability::FsRead, Some(Path::new("/proj/.env"))),
             Check::Ask { sensitive: true }
+        );
+    }
+
+    #[test]
+    fn non_project_modes_require_approval_inside_cwd() {
+        let root = PathBuf::from("/non-project");
+        let mut e = PermEngine::new(
+            root.clone(),
+            vec![],
+            Default::default(),
+            Policy::Allow,
+            Policy::Ask,
+            false,
+        );
+        let file = root.join("notes.txt");
+
+        e.set_mode(Mode::Build);
+        assert_eq!(
+            e.check(Capability::FsRead, Some(&file)),
+            Check::Ask { sensitive: false }
+        );
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(&file)),
+            Check::Ask { sensitive: false }
+        );
+        assert_eq!(
+            e.check(Capability::ShellExec, Some(Path::new("pwd"))),
+            Check::Ask { sensitive: false }
+        );
+
+        e.set_mode(Mode::Plan);
+        assert_eq!(
+            e.check(Capability::FsRead, Some(&file)),
+            Check::Ask { sensitive: false }
+        );
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(&file)),
+            Check::Denied(DenySource::ModePolicy)
+        );
+
+        e.set_mode(Mode::Auto);
+        assert_eq!(e.check(Capability::FsRead, Some(&file)), Check::Allowed);
+        assert_eq!(e.check(Capability::FsWrite, Some(&file)), Check::Allowed);
+        assert_eq!(
+            e.check(Capability::ShellExec, Some(Path::new("pwd"))),
+            Check::Allowed
         );
     }
 

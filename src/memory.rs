@@ -43,15 +43,22 @@ impl Memory {
         }
     }
 
-    pub fn ensure_files(&self) -> std::io::Result<()> {
-        for f in [&self.project_path, &self.persistent_path] {
-            if !f.exists() {
-                if let Some(parent) = f.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut file = std::fs::File::create(f)?;
-                file.write_all(HEADER.as_bytes())?;
+    pub fn ensure_file(&self, level: MemLevel) -> std::io::Result<()> {
+        let file_path = self.level_path(level);
+        if !file_path.exists() {
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
+            let mut file = std::fs::File::create(file_path)?;
+            file.write_all(HEADER.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_startup_files(&self, project_detected: bool) -> std::io::Result<()> {
+        self.ensure_file(MemLevel::Persistent)?;
+        if project_detected {
+            self.ensure_file(MemLevel::Project)?;
         }
         Ok(())
     }
@@ -88,9 +95,12 @@ impl Memory {
             .collect()
     }
 
-    pub fn render_for_prompt(&self) -> String {
+    pub fn render_for_prompt(&self, include_project: bool) -> String {
         let mut out = String::new();
         for level in [MemLevel::Project, MemLevel::Persistent] {
+            if level == MemLevel::Project && !include_project {
+                continue;
+            }
             let text = self.read_level(level);
             let facts = Self::entries(&text);
             if facts.is_empty() {
@@ -129,5 +139,39 @@ mod tests {
             Memory::entries(text),
             vec!["fact one".to_owned(), "indented fact".to_owned()]
         );
+    }
+
+    #[test]
+    fn non_project_startup_does_not_create_project_memory() {
+        let dir = std::env::temp_dir().join(format!("few-memory-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let memory = Memory::new(&dir.join("cwd"), &dir.join("data"));
+
+        memory.ensure_startup_files(false).unwrap();
+        assert!(memory.persistent_path.is_file());
+        assert!(!memory.project_path.exists());
+
+        memory.ensure_file(MemLevel::Project).unwrap();
+        assert!(memory.project_path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_project_prompt_excludes_stale_project_memory() {
+        let dir = std::env::temp_dir().join(format!("few-memory-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let memory = Memory::new(&dir.join("cwd"), &dir.join("data"));
+        memory.ensure_file(MemLevel::Project).unwrap();
+        memory.ensure_file(MemLevel::Persistent).unwrap();
+        std::fs::write(&memory.project_path, "- private project fact\n").unwrap();
+        std::fs::write(&memory.persistent_path, "- persistent fact\n").unwrap();
+
+        let rendered = memory.render_for_prompt(false);
+        assert!(!rendered.contains("private project fact"));
+        assert!(rendered.contains("persistent fact"));
+        assert!(memory
+            .render_for_prompt(true)
+            .contains("private project fact"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
