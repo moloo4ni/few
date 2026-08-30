@@ -154,6 +154,11 @@ extra = ["*.secret"]                     # appended to the built-in list
 # "Cargo.toml" = "write"                 # persistent per-project grant
 ```
 
+Configuration is fail-closed: unknown or removed fields, invalid policy or grant values, and
+invalid sensitive patterns stop startup with an error naming the offending TOML file. This is
+intentional for permission settings; Few never silently ignores a restriction that appears to
+be configured.
+
 State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
 `~/.local/state` where available) and never inside a project directory - except explicitly
 project-local things (`.few/`).
