@@ -102,6 +102,7 @@ impl App {
         for entry in load_history(&history_path) {
             input.push_history(&entry);
         }
+        let restored_context_tokens = agent.context_tokens();
         let mut app = Self {
             blocks: Vec::new(),
             steps_group_idx: None,
@@ -114,7 +115,7 @@ impl App {
             thinking_since: None,
             mode: Mode::Build,
             model_name: cfg.model.clone(),
-            ctx_used: 0,
+            ctx_used: restored_context_tokens,
             ctx_window: cfg.context_window,
             escalation: None,
             quit: false,
@@ -440,7 +441,11 @@ impl App {
                     self.focus = None;
                     return;
                 }
-                KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Tab => {
+                KeyCode::Char(_)
+                | KeyCode::Enter
+                | KeyCode::Backspace
+                | KeyCode::Tab
+                | KeyCode::BackTab => {
                     self.focus = None;
                     // fall through: the key keeps its normal meaning
                 }
@@ -454,6 +459,12 @@ impl App {
         }
 
         let text = self.input.text();
+        let shift_tab = k.code == KeyCode::BackTab
+            || (k.code == KeyCode::Tab && k.modifiers.contains(KeyModifiers::SHIFT));
+        if shift_tab {
+            self.cycle_mode();
+            return;
+        }
         if text.starts_with('/') && !text.contains('\n') {
             match k.code {
                 KeyCode::Esc => self.input.clear(),
@@ -527,12 +538,10 @@ impl App {
                 let index = self.file_index.lock().unwrap();
                 self.input.update_completion(&index);
                 drop(index);
+                // With no candidate Tab is intentionally a no-op, so typing a
+                // path never changes the permission mode by accident.
                 if self.input.completion.is_some() {
                     self.input.accept_selected();
-                } else if k.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.cycle_mode_rev();
-                } else {
-                    self.cycle_mode();
                 }
             }
             KeyCode::Esc => self.input.completion = None,
@@ -733,15 +742,6 @@ impl App {
             Mode::Build => Mode::Plan,
             Mode::Plan => Mode::Auto,
             Mode::Auto => Mode::Build,
-        };
-        self.apply_mode(next);
-    }
-
-    fn cycle_mode_rev(&mut self) {
-        let next = match self.mode {
-            Mode::Build => Mode::Auto,
-            Mode::Plan => Mode::Build,
-            Mode::Auto => Mode::Plan,
         };
         self.apply_mode(next);
     }
@@ -1042,6 +1042,7 @@ impl App {
         }
         let root = self.cfg.project_root.clone();
         let model = self.agent.provider.model_name();
+        let last_prompt_tokens = self.agent.context_tokens();
         let dir = self.sessions_dir.clone();
         let session = Arc::clone(&self.session);
         let ev = self.ev_tx.clone();
@@ -1050,7 +1051,14 @@ impl App {
         // never overwrite a newer one
         tokio::task::spawn_blocking(move || {
             let prev = session.lock().ok().and_then(|g| g.clone());
-            match crate::session::save(&dir, &root, &model, prev.as_ref(), convo) {
+            match crate::session::save(
+                &dir,
+                &root,
+                &model,
+                prev.as_ref(),
+                last_prompt_tokens,
+                convo,
+            ) {
                 Ok(r) => {
                     if let Ok(mut g) = session.lock() {
                         *g = Some(r);
@@ -1384,6 +1392,10 @@ mod memory_step_tests {
     use std::sync::{Arc, Mutex};
 
     fn app_with(root: std::path::PathBuf) -> App {
+        app_with_context(root, 0)
+    }
+
+    fn app_with_context(root: std::path::PathBuf, restored_tokens: u64) -> App {
         let cfg = Arc::new(Config {
             model: "m".into(),
             context_window: 1000,
@@ -1409,6 +1421,9 @@ mod memory_step_tests {
             memory.clone(),
             Default::default(),
         ));
+        if restored_tokens > 0 {
+            agent.restore_convo(vec![Msg::user("restored")], restored_tokens);
+        }
         App::new(
             cfg,
             agent,
@@ -1417,6 +1432,56 @@ mod memory_step_tests {
             root.join("sessions"),
             None,
         )
+    }
+
+    #[test]
+    fn restored_context_usage_initializes_status_state() {
+        let root =
+            std::env::temp_dir().join(format!("few-resume-context-{}-usage", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let app = app_with_context(root.clone(), 12_345);
+        assert_eq!(app.ctx_used, 12_345);
+        assert_eq!(app.agent.context_tokens(), 12_345);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn tab_completes_while_shift_tab_cycles_mode() {
+        let root = std::env::temp_dir().join(format!("few-tab-mode-{}-keys", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        *app.file_index.lock().unwrap() = vec!["src/main.rs".into()];
+
+        app.input.set_text("src/ma");
+        app.after_edit();
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.input.text(), "src/main.rs");
+        assert_eq!(app.mode, Mode::Build, "completion must not change mode");
+
+        app.input.set_text("no-match");
+        app.after_edit();
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.mode, Mode::Build, "bare Tab with no match is a no-op");
+
+        app.input.set_text("src/ma");
+        app.after_edit();
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(app.mode, Mode::Plan);
+        assert_eq!(app.input.text(), "src/ma");
+        assert!(
+            app.input.completion.is_some(),
+            "mode cycling must preserve the active completion"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(app.mode, Mode::Auto);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

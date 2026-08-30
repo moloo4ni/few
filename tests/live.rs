@@ -354,7 +354,15 @@ async fn live_session_resume_restores_provider_context() {
     assert_eq!(handle.await.unwrap(), TaskOutcome::Done);
     collector.await.unwrap();
 
-    session::save(&sessions, &root, &model, None, first.snapshot_convo()).unwrap();
+    session::save(
+        &sessions,
+        &root,
+        &model,
+        None,
+        first.context_tokens(),
+        first.snapshot_convo(),
+    )
+    .unwrap();
     let (_, saved) = session::load_latest(&sessions, &root).unwrap().unwrap();
     let restored_count = saved.messages.len();
 
@@ -366,7 +374,7 @@ async fn live_session_resume_restores_provider_context() {
         memory,
         Default::default(),
     ));
-    resumed.set_convo(saved.messages);
+    resumed.restore_convo(saved.messages, saved.last_prompt_tokens);
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let runner = Arc::clone(&resumed);
@@ -440,7 +448,7 @@ async fn live_context_compaction_continues_after_notice() {
         });
         history.push(Msg::tool_result(&id, "read", "old output"));
     }
-    agent.set_convo(history);
+    agent.restore_convo(history, 101);
 
     let compacted = Arc::new(AtomicBool::new(false));
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
