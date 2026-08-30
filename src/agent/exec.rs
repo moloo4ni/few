@@ -369,7 +369,12 @@ impl<P: Provider> Agent<P> {
             return self.arg_error(tc, ctx, "shell requires \"command\"");
         };
         match self
-            .gate(ctx, Capability::ShellExec, None, command.clone())
+            .gate(
+                ctx,
+                Capability::ShellExec,
+                Some(Path::new(&command)),
+                command.clone(),
+            )
             .await
         {
             GateResult::Proceed => {
