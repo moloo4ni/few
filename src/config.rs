@@ -506,6 +506,14 @@ mod tests {
         assert!(t.contains("\".env\" = \"execute\""));
         assert!(t.matches("[permissions.granted]").count() == 1);
         assert!(!t.contains("\".env\" = \"write\""));
+
+        persist_grant(&file, ".env", "all").unwrap();
+        let t = std::fs::read_to_string(&file).unwrap();
+        let parsed: FileConfig = toml::from_str(&t).unwrap();
+        assert_eq!(
+            parsed.permissions.granted.get(".env").map(String::as_str),
+            Some("all")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -317,16 +317,25 @@ impl PermEngine {
         }
     }
 
-    pub fn apply_grant(&mut self, cap: Capability, key: &str, grant: Grant) -> bool {
+    pub fn apply_grant(&mut self, cap: Capability, key: &str, grant: Grant) -> Option<String> {
         match grant {
-            Grant::Once => false,
+            Grant::Once => None,
             Grant::Session => {
                 self.session.insert((cap, key.to_owned()));
-                false
+                None
             }
             Grant::Always => {
-                self.granted.insert(key.to_owned(), cap.short().to_owned());
-                true
+                let existing = self.granted.get(key).map(String::as_str);
+                let value = match (cap, existing) {
+                    (_, Some("all")) => "all",
+                    (Capability::FsRead, Some("write")) | (Capability::FsWrite, Some("read")) => {
+                        "all"
+                    }
+                    _ => cap.short(),
+                }
+                .to_owned();
+                self.granted.insert(key.to_owned(), value.clone());
+                Some(value)
             }
         }
     }
@@ -616,8 +625,8 @@ mod tests {
             e.check(Capability::FsWrite, Some(t)),
             Check::Ask { sensitive: false }
         );
-        e.apply_grant(Capability::FsWrite, "src/a.rs", Grant::Session);
-        e.apply_grant(Capability::FsWrite, "src/persisted.rs", Grant::Always);
+        let _ = e.apply_grant(Capability::FsWrite, "src/a.rs", Grant::Session);
+        let _ = e.apply_grant(Capability::FsWrite, "src/persisted.rs", Grant::Always);
         assert_eq!(e.check(Capability::FsWrite, Some(t)), Check::Allowed);
         assert_eq!(
             e.check(Capability::FsWrite, Some(persisted)),
@@ -667,7 +676,7 @@ mod tests {
             Check::Ask { sensitive: true }
         );
         // user grants "always allow" once - the spec promises no re-asking
-        e.apply_grant(Capability::FsRead, ".env", Grant::Always);
+        let _ = e.apply_grant(Capability::FsRead, ".env", Grant::Always);
         assert_eq!(e.check(Capability::FsRead, Some(env)), Check::Allowed);
     }
 
@@ -675,9 +684,9 @@ mod tests {
     fn shell_grant_covers_argument_extensions_only() {
         let mut e = engine(vec![]);
         let key = PermEngine::shell_key("cargo test");
-        e.apply_grant(Capability::ShellExec, &key, Grant::Always);
+        let _ = e.apply_grant(Capability::ShellExec, &key, Grant::Always);
         let compound = "cargo test && cargo fmt --check";
-        e.apply_grant(
+        let _ = e.apply_grant(
             Capability::ShellExec,
             &PermEngine::shell_key(compound),
             Grant::Always,
@@ -720,7 +729,7 @@ mod tests {
     #[test]
     fn always_allow_overrides_sensitive() {
         let mut e = engine(vec![]);
-        e.apply_grant(Capability::FsWrite, ".env", Grant::Always);
+        let _ = e.apply_grant(Capability::FsWrite, ".env", Grant::Always);
         assert_eq!(
             e.check(Capability::FsWrite, Some(Path::new("/proj/.env"))),
             Check::Allowed
@@ -733,10 +742,41 @@ mod tests {
     fn shell_key_roundtrip() {
         let mut e = engine(vec![]);
         let k = PermEngine::shell_key("cargo test");
-        e.apply_grant(Capability::ShellExec, &k, Grant::Always);
+        let _ = e.apply_grant(Capability::ShellExec, &k, Grant::Always);
         assert_eq!(
             e.check(Capability::ShellExec, Some(Path::new("cargo test"))),
             Check::Allowed
         );
+    }
+
+    #[test]
+    fn persistent_file_grants_combine_read_and_write() {
+        for (first, second) in [
+            (Capability::FsRead, Capability::FsWrite),
+            (Capability::FsWrite, Capability::FsRead),
+        ] {
+            let mut e = engine(vec![]);
+            assert_eq!(
+                e.apply_grant(first, ".env", Grant::Always).as_deref(),
+                Some(first.short())
+            );
+            assert_eq!(
+                e.apply_grant(second, ".env", Grant::Always).as_deref(),
+                Some("all")
+            );
+            assert_eq!(
+                e.apply_grant(second, ".env", Grant::Always).as_deref(),
+                Some("all"),
+                "repeating a grant must preserve the combined value"
+            );
+            assert_eq!(
+                e.check(Capability::FsRead, Some(Path::new("/proj/.env"))),
+                Check::Allowed
+            );
+            assert_eq!(
+                e.check(Capability::FsWrite, Some(Path::new("/proj/.env"))),
+                Check::Allowed
+            );
+        }
     }
 }
