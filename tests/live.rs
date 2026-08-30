@@ -95,7 +95,7 @@ async fn drain_events(
             AgentEvent::StepStarted(v) => println!("… {} {}", v.verb.doing(), v.arg),
             AgentEvent::ThinkingStarted => println!("thinking…"),
             AgentEvent::ThoughtDelta { text } => print!("{text}"),
-            AgentEvent::ThinkingFinished { dur_ms } => println!("\nthought {}ms", dur_ms),
+            AgentEvent::ThinkingFinished { dur_ms } => println!("\nthought {dur_ms}ms"),
             AgentEvent::AssistantDelta { text } => print!("{text}"),
             AgentEvent::TurnClosed => println!("\n--- turn closed ---"),
             AgentEvent::Notice { text, level } => {

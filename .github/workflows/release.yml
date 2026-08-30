@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.88.0
+          components: clippy, rustfmt
+      - name: Verify tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ "${GITHUB_REF_NAME}" != "v${package_version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo version ${package_version}" >&2
+            exit 1
+          fi
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: git diff --check
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            install: musl-tools
+            target_cc: musl-gcc
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            install: ""
+            target_cc: ""
+            macos_deployment_target: "11.0"
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            install: ""
+            target_cc: ""
+            macos_deployment_target: "11.0"
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+      CC_x86_64_unknown_linux_musl: ${{ matrix.target_cc }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - name: Install Linux target tools
+        if: matrix.install != ''
+        run: sudo apt-get update && sudo apt-get install --yes ${{ matrix.install }}
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Smoke test
+        run: target/${{ matrix.target }}/release/few --version
+      - name: Package
+        shell: bash
+        run: |
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          archive="few-${package_version}-${{ matrix.target }}"
+          mkdir -p "dist/${archive}"
+          cp "target/${{ matrix.target }}/release/few" README.md LICENSE "dist/${archive}/"
+          tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: few-${{ matrix.target }}
+          path: dist/few-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  bundle:
+    name: Bundle artifacts and checksums
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: few-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum few-*.tar.gz | sort -k2 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: few-release-bundle
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: bundle
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: few-release-bundle
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          release_flags=()
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          cat > release-notes.md <<'EOF'
+          Experimental Few release.
+
+          Supported artifacts:
+
+          - `x86_64-unknown-linux-musl`: static Linux x86_64 binary
+          - `x86_64-apple-darwin`: macOS 11+ on Intel
+          - `aarch64-apple-darwin`: macOS 11+ on Apple Silicon
+
+          Download the archive for your target and verify it against `SHA256SUMS`.
+          EOF
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/few-*.tar.gz dist/SHA256SUMS \
+            --verify-tag \
+            --title "Few ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            "${release_flags[@]}"
