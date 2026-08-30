@@ -1,7 +1,9 @@
 use crate::perms::Policy;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct FileConfig {
@@ -364,43 +366,78 @@ pub fn persist_grant(path: &Path, key: &str, cap: &str) -> anyhow::Result<()> {
             }
         }
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, text)?;
+    atomic_write_config(path, text.as_bytes())?;
     Ok(())
 }
 
 fn toml_quote(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    // JSON strings use the same escapes TOML basic quoted keys require for
+    // quotes, backslashes and control characters. `toml::Value::to_string`
+    // cannot be used here because it may choose multiline value syntax, which
+    // TOML deliberately forbids for keys.
+    serde_json::to_string(s).expect("serializing a string cannot fail")
 }
 
 fn parse_quoted_key(trimmed_line: &str) -> Option<String> {
-    let rest = trimmed_line.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                other => out.push(other),
-            },
-            other => out.push(other),
+    trimmed_line.strip_prefix('"')?;
+    let source = format!("[permissions.granted]\n{trimmed_line}\n");
+    let value: toml::Value = toml::from_str(&source).ok()?;
+    value
+        .get("permissions")?
+        .get("granted")?
+        .as_table()?
+        .keys()
+        .next()
+        .cloned()
+}
+
+fn atomic_write_config(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let original_permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_owned());
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".{name}.few-tmp-{}-{sequence}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    if let Err(error) = file.write_all(bytes) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    drop(file);
+    if let Some(permissions) = original_permissions {
+        if let Err(error) = std::fs::set_permissions(&temp, permissions) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
         }
     }
-    None
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(_) if cfg!(windows) => {
+            let result = std::fs::remove_file(path).and_then(|_| std::fs::rename(&temp, path));
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp);
+            }
+            result
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
 }
 
 fn parse_policy(s: &str) -> Option<Policy> {
@@ -469,6 +506,57 @@ mod tests {
         assert!(t.contains("\".env\" = \"execute\""));
         assert!(t.matches("[permissions.granted]").count() == 1);
         assert!(!t.contains("\".env\" = \"write\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_grant_keys_roundtrip_toml_control_characters() {
+        let dir = std::env::temp_dir().join(format!("few-grant-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        let keys = [
+            "shell::echo first\necho second",
+            "shell::printf \\\"quoted\\\"",
+            "shell::printf tab\tvalue",
+            "shell::printf C:\\tmp\\file",
+            "shell::echo carriage\rreturn",
+            "shell::echo привет",
+        ];
+        for key in keys {
+            persist_grant(&file, key, "execute").unwrap();
+        }
+
+        let text = std::fs::read_to_string(&file).unwrap();
+        let parsed: FileConfig = toml::from_str(&text).unwrap();
+        for key in keys {
+            assert_eq!(
+                parsed.permissions.granted.get(key).map(String::as_str),
+                Some("execute")
+            );
+        }
+        assert!(!text.contains("echo first\necho second"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_grant_preserves_private_config_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("few-grant-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "[provider]\napi_key = \"secret\"\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        persist_grant(&file, "shell::cargo test", "execute").unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(toml::from_str::<FileConfig>(&std::fs::read_to_string(&file).unwrap()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
