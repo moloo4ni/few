@@ -49,10 +49,6 @@ impl Paths {
         self.config_dir.join("config.toml")
     }
 
-    pub fn persistent_memory_file(&self) -> PathBuf {
-        self.data_dir.join("memory.md")
-    }
-
     pub fn history_file(&self) -> PathBuf {
         self.state_dir
             .clone()

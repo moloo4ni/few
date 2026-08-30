@@ -104,9 +104,6 @@ async fn drain_events(
                 }
                 println!("notice({level:?}) · {text}")
             }
-            AgentEvent::AssistantText(t) => {
-                println!("assistant · {}", t.lines().next().unwrap_or(""))
-            }
             AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,

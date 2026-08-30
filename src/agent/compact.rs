@@ -24,7 +24,6 @@ const MAX_NOTE_LINES: usize = 100;
 
 pub struct Compaction {
     pub folded_rounds: usize,
-    pub folded_steps: usize,
 }
 
 /// Fold all rounds except the tail. Returns the compacted conversation and,
@@ -39,7 +38,6 @@ pub fn compact(convo: Vec<Msg>) -> (Vec<Msg>, Option<Compaction>) {
     let mut out: Vec<Msg> = Vec::with_capacity(convo.len());
     let mut steps: Vec<String> = Vec::new();
     let mut folded_rounds = 0usize;
-    let mut folded_steps = 0usize;
 
     for (i, msg) in convo.iter().enumerate() {
         if i >= tail_from {
@@ -53,7 +51,6 @@ pub fn compact(convo: Vec<Msg>) -> (Vec<Msg>, Option<Compaction>) {
                 if msg.has_tool_calls() {
                     folded_rounds += 1;
                     for tc in &msg.tool_calls {
-                        folded_steps += 1;
                         if steps.len() < MAX_NOTE_LINES {
                             steps.push(format!("- {} {}", tc.name, tc.primary_arg()));
                         }
@@ -76,13 +73,7 @@ pub fn compact(convo: Vec<Msg>) -> (Vec<Msg>, Option<Compaction>) {
     out.push(Msg::user(render_note(&steps)));
     out.extend(convo[tail_from..].iter().cloned());
 
-    (
-        out,
-        Some(Compaction {
-            folded_rounds,
-            folded_steps,
-        }),
-    )
+    (out, Some(Compaction { folded_rounds }))
 }
 
 fn round_starts(convo: &[Msg]) -> Vec<usize> {
@@ -168,7 +159,6 @@ mod tests {
         let rep = report.expect("compaction expected");
 
         assert_eq!(rep.folded_rounds, 2);
-        assert_eq!(rep.folded_steps, 2);
 
         // invariant: every assistant with tool_calls is immediately followed
         // by exactly its own results

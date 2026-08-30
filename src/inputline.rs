@@ -1,5 +1,3 @@
-use unicode_width::UnicodeWidthChar;
-
 #[derive(Debug, Clone)]
 pub enum Completion {
     Ghost { tail: String },
@@ -168,27 +166,6 @@ impl InputState {
         self.draft = None;
     }
 
-    pub fn cursor_line_col(&self) -> (usize, usize) {
-        let mut line = 0;
-        let mut col = 0;
-        for (i, c) in self.text.iter().enumerate() {
-            if i >= self.cursor {
-                break;
-            }
-            if *c == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
-    }
-
-    pub fn lines_count(&self) -> usize {
-        self.text.iter().filter(|c| **c == '\n').count() + 1
-    }
-
     pub fn current_word(&self) -> Option<(usize, usize)> {
         let mut start = self.cursor;
         while start > 0 && !WORD_STOP.contains(&self.text[start - 1]) {
@@ -349,10 +326,6 @@ impl InputState {
             }
             None => None,
         }
-    }
-
-    pub fn char_width(c: char) -> usize {
-        c.width().unwrap_or(0)
     }
 }
 
