@@ -718,6 +718,14 @@ impl App {
                     self.execute_command(&item).await;
                     return;
                 }
+                // "/model" must reach execute_command: that is where the
+                // provider model list is fetched before the palette reopens
+                // on "/model " with real candidates.
+                Some(cmd) if cmd.arg_kind == ArgKind::Models => {
+                    self.execute_command(&item).await;
+                    self.palette_sel = 0;
+                    return;
+                }
                 Some(_) => {
                     self.input.set_text(&format!("{item} "));
                     self.palette_sel = 0;
@@ -1750,6 +1758,29 @@ mod memory_step_tests {
         let app = app_with_context(root.clone(), 12_345);
         assert_eq!(app.ctx_used, 12_345);
         assert_eq!(app.agent.context_tokens(), 12_345);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn palette_model_pick_triggers_fetch() {
+        let root = std::env::temp_dir().join(format!("few-palette-{}-model", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+
+        // picking "/model" from the palette must go through execute_command
+        // (which fetches the provider list), not just append a space
+        app.input.set_text("/model");
+        app.palette_sel = 0;
+        app.pick_palette().await;
+        assert_eq!(app.input.text(), "/model ", "input primed for argument");
+        assert!(
+            app.blocks.iter().any(|b| matches!(
+                b,
+                Block::Notice { text, .. } if text.contains("could not fetch provider models")
+            )),
+            "fetch against the unreachable test provider must surface its failure notice"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
