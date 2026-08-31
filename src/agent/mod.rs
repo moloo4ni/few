@@ -351,8 +351,14 @@ impl<P: Provider> Agent<P> {
             prompt_tokens: reply.usage.prompt_tokens,
             completion_tokens: reply.usage.completion_tokens,
         });
-        self.last_prompt_tokens
-            .store(reply.usage.prompt_tokens, Ordering::Relaxed);
+        // Guard against providers that omit usage or send it only on the final
+        // SSE chunk (yielding prompt_tokens=0 via serde default). Overwriting a
+        // real count with zero would suppress compaction until the provider
+        // happens to include usage again. restore_convo() applies the same guard.
+        if reply.usage.prompt_tokens > 0 {
+            self.last_prompt_tokens
+                .store(reply.usage.prompt_tokens, Ordering::Relaxed);
+        }
         self.push_convo(Msg {
             role: Role::Assistant,
             content: reply.content.clone(),
@@ -1275,6 +1281,69 @@ mod tests {
         agent.last_prompt_tokens.store(10, Ordering::Relaxed);
         agent.maybe_compact(&tx);
         assert_eq!(agent.snapshot_convo().len(), before.len());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn zero_usage_does_not_reset_compaction_trigger() {
+        let root = temp_root("zero-usage");
+        let (perms, mem) = setup(&root);
+        let cfg = test_cfg(&root);
+        let agent = Agent::new(Scripted::new(vec![]), cfg, perms, mem, Default::default());
+
+        // Seed with a real prompt_tokens count
+        agent.last_prompt_tokens.store(500, Ordering::Relaxed);
+        assert_eq!(agent.context_tokens(), 500);
+
+        // Simulate a provider reply with omitted usage (prompt_tokens=0 via serde default)
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctx = RunCtx {
+            cfg: &Config::default(),
+            ev: tx.clone(),
+            ctl_rx: mpsc::unbounded_channel().1,
+            stash: vec![],
+            queue: vec![],
+            soft: false,
+            hard_abort: false,
+            perm_answers: HashMap::new(),
+            ask_seq: 0,
+            steps: 0,
+            wrote_since_user: false,
+        };
+        agent.record_reply(
+            &Reply {
+                content: "answer".into(),
+                reasoning: None,
+                tool_calls: vec![],
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 10,
+                },
+            },
+            &ctx,
+        );
+
+        // The trigger must NOT be overwritten with zero
+        assert_eq!(
+            agent.context_tokens(),
+            500,
+            "zero usage must not reset the compaction trigger"
+        );
+
+        // A real non-zero count should still update
+        agent.record_reply(
+            &Reply {
+                content: "answer2".into(),
+                reasoning: None,
+                tool_calls: vec![],
+                usage: Usage {
+                    prompt_tokens: 600,
+                    completion_tokens: 15,
+                },
+            },
+            &ctx,
+        );
+        assert_eq!(agent.context_tokens(), 600);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
