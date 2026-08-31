@@ -107,10 +107,11 @@ build (`--no-default-features`) or the OS-native backend
 (`--no-default-features --features tls-native`) for toolchains without a C compiler.
 
 Tagged releases are built in controlled GitHub Actions runners and publish explicitly named
-archives for static Linux x86_64, macOS Intel, and macOS Apple Silicon, together with
-`SHA256SUMS`. A manual workflow run builds and smoke-tests the same artifacts without creating
-a GitHub release. A matching `v<package-version>` tag publishes one automatically; the optional
-manual `release_tag` input retries publishing an existing matching tag after a transient failure.
+archives for static Linux and FreeBSD on x86_64/ARM64, plus macOS Intel and Apple Silicon,
+together with `SHA256SUMS`. A manual workflow run builds and smoke-tests the same artifacts
+without creating a GitHub release. A matching `v<package-version>` tag publishes one
+automatically; the optional manual `release_tag` input retries publishing an existing matching
+tag after a transient failure.
 
 At startup Few probes that the selected model answers with native tool calls; otherwise it
 exits with an explicit error - switch models rather than hoping text parsing will work.
