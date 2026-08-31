@@ -612,7 +612,11 @@ fn render_step_item(
                 2,
                 hit,
             );
-            if step.expand == Expand::Collapsed {
+            // Detail::Message (permission-denial reasons, tool error text) is
+            // always visible: such steps are not navigable, so a collapsed
+            // state could never be toggled and the text would be lost.
+            let always_inline = matches!(step.view.detail, Some(crate::agent::Detail::Message(_)));
+            if step.expand == Expand::Collapsed && !always_inline {
                 return;
             }
             for detail in step.detail_rows(cap) {
@@ -1111,6 +1115,33 @@ mod tests {
         assert!(
             !joined.contains("README.md"),
             "collapsed group must hide step args"
+        );
+    }
+
+    #[test]
+    fn message_detail_renders_despite_collapsed_state() {
+        let mut app = test_app("msgdetail");
+        app.blocks.push(Block::Steps(StepsGroup {
+            steps: vec![StepItem::Step(StepBlock {
+                view: crate::agent::StepView {
+                    verb: crate::agent::Verb::Denied,
+                    arg: "write src/main.rs".into(),
+                    detail: Some(crate::agent::Detail::Message(
+                        "write denied in plan mode".into(),
+                    )),
+                },
+                // Message steps are created collapsed and are not navigable,
+                // so their text must render regardless of expand state.
+                expand: Expand::Collapsed,
+            })],
+            expanded: true,
+            outcome: None,
+        }));
+        let rows = render(&mut app, 60, 12);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("write denied in plan mode"),
+            "Message detail must be visible while collapsed: {joined:?}"
         );
     }
 
