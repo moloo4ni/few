@@ -128,7 +128,8 @@ jobs:
         with:
           release: "14.4"
           arch: ${{ matrix.arch }}
-          sync: nfs
+          sync: rsync
+          copyback: true
           run: |
             set -eu
             rust_archive="rust-1.98.0-${{ matrix.target }}.tar.xz"
