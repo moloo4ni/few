@@ -39,9 +39,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch:
-          - x86_64
-          - aarch64
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-freebsd
+            rust_sha256: 88393111151774fc14914198805130fc7c07dd7298484e3d14721d7f2958f85e
+          - arch: aarch64
+            target: aarch64-unknown-freebsd
+            rust_sha256: 783c2983b9e1f6c4f9bebb96a459df46903a7f63fcfc20c6ef2524f0f959776e
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Test in FreeBSD
@@ -51,12 +55,19 @@ jobs:
           arch: ${{ matrix.arch }}
           sync: rsync
           copyback: false
-          prepare: pkg install -y rustup-init
           run: |
             set -eu
             freebsd-version
-            rustup-init -y --profile minimal --default-toolchain 1.98.0
-            . "$HOME/.cargo/env"
+            rust_archive="rust-1.98.0-${{ matrix.target }}.tar.xz"
+            fetch "https://static.rust-lang.org/dist/${rust_archive}"
+            test "$(sha256 -q "${rust_archive}")" = "${{ matrix.rust_sha256 }}"
+            tar -xf "${rust_archive}"
+            sh "${rust_archive%.tar.xz}/install.sh" \
+              --prefix="$HOME/.local" \
+              --without=rust-docs \
+              --disable-ldconfig
+            export PATH="$HOME/.local/bin:$PATH"
             rustc --version
             cargo --version
+            rustc -vV | grep "host: ${{ matrix.target }}"
             cargo test --locked
