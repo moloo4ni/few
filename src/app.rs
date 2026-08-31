@@ -254,7 +254,11 @@ impl App {
     async fn on_term_event(&mut self, ev: crossterm::event::Event) {
         match ev {
             crossterm::event::Event::Key(k) => {
-                if k.kind == KeyEventKind::Press {
+                // With kitty keyboard enhancements active (REPORT_EVENT_TYPES),
+                // holding a key delivers Repeat events instead of synthetic
+                // Presses; legacy terminals only ever send Press. Treat both
+                // the same so held-key navigation works identically everywhere.
+                if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     self.on_key(k).await;
                 }
             }
@@ -449,7 +453,11 @@ impl App {
 
     async fn on_key(&mut self, k: KeyEvent) {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-            self.ctrl_c_ladder();
+            // The ladder escalates per PRESS; a held Ctrl+C auto-repeating
+            // must not turn a soft interrupt into a hard abort on its own.
+            if k.kind == KeyEventKind::Press {
+                self.ctrl_c_ladder();
+            }
             return;
         }
 
@@ -1742,6 +1750,35 @@ mod memory_step_tests {
         let app = app_with_context(root.clone(), 12_345);
         assert_eq!(app.ctx_used, 12_345);
         assert_eq!(app.agent.context_tokens(), 12_345);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn key_repeat_moves_cursor_but_never_escalates_ctrl_c() {
+        let root = std::env::temp_dir().join(format!("few-repeat-{}-keys", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        app.input.set_text("abc");
+
+        // held arrow keys arrive as Repeat under kitty enhancements and must
+        // keep moving the cursor like Presses do
+        let mut left_repeat = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        left_repeat.kind = KeyEventKind::Repeat;
+        app.on_term_event(crossterm::event::Event::Key(left_repeat))
+            .await;
+        app.on_term_event(crossterm::event::Event::Key(left_repeat))
+            .await;
+        assert_eq!(app.input.cursor, 1, "repeats must move the cursor");
+
+        // a held Ctrl+C must not climb the ladder past the first press
+        let mut cc = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        cc.kind = KeyEventKind::Repeat;
+        app.on_term_event(crossterm::event::Event::Key(cc)).await;
+        assert!(
+            app.escalation.is_none() && !app.quit,
+            "Ctrl+C auto-repeat must not start or climb the ladder"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
