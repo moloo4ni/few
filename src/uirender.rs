@@ -310,10 +310,10 @@ pub fn build_input_rows(app: &App, width: usize) -> InputRender {
     // first line gets "> ", continuations get "  " - same as before
     let mut expect_prefix = true;
     for (gi, ch) in app.input.text.iter().enumerate() {
-        if gi == app.input.cursor {
-            cursor = Some((rows.len() - 1, row_w));
-        }
         if *ch == '\n' {
+            if gi == app.input.cursor {
+                cursor = Some((rows.len() - 1, row_w));
+            }
             rows.push(Vec::new());
             row_w = 0;
             expect_prefix = true;
@@ -329,6 +329,11 @@ pub fn build_input_rows(app: &App, width: usize) -> InputRender {
                 push_input_char(&mut rows, &mut row_w, pc, theme::normal(), width);
             }
             expect_prefix = false;
+        }
+        // snapshot AFTER the prefix: a cursor at the line start must sit on
+        // the first text cell, not on top of the "> " marker
+        if gi == app.input.cursor {
+            cursor = Some((rows.len() - 1, row_w));
         }
         let st = if app.input.mentions.iter().any(|(a, b)| gi >= *a && gi < *b) {
             mention_style
@@ -1266,6 +1271,30 @@ mod tests {
                 "spinner frames are gone"
             );
         }
+    }
+
+    #[test]
+    fn cursor_at_line_start_sits_after_the_prompt_marker() {
+        let mut app = test_app("input-cursor-home");
+        app.input.set_text("abc");
+        app.input.home();
+        let ir = build_input_rows(&app, 40);
+        // "> " occupies columns 0-1; a cursor on the first character must
+        // land on column 2, not on top of the marker
+        assert_eq!(ir.cursor_row, 0);
+        assert_eq!(ir.cursor_col, 2, "cursor must not overlap the '> ' prefix");
+
+        // continuation lines are indented by two spaces, same rule
+        app.input.set_text("a\nb");
+        app.input.cursor = 2;
+        let ir2 = build_input_rows(&app, 40);
+        assert_eq!(ir2.cursor_row, 1);
+        assert_eq!(ir2.cursor_col, 2, "cursor must not overlap the indent");
+
+        // an empty input still reports a position after the marker
+        app.input.set_text("");
+        let ir3 = build_input_rows(&app, 40);
+        assert_eq!(ir3.cursor_row, 0);
     }
 
     #[test]
