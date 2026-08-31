@@ -12,7 +12,7 @@ contains the fuller development notes.
 
 ## Development
 
-The repository pins Rust 1.88. Before submitting a pull request, run:
+The repository pins Rust 1.98. Before submitting a pull request, run:
 
 ```sh
 cargo fmt
