@@ -25,6 +25,12 @@ pub struct ToolCall {
 impl ToolCall {
     pub fn parse(id: String, name: String, arguments_text: String) -> Self {
         let arguments = serde_json::from_str::<Value>(&arguments_text).unwrap_or(Value::Null);
+        // Some models emit a pseudo call expression in the name field,
+        // e.g. `shell(cargo new sandbox)` — take the identifier before `(`.
+        let name = match name.split_once('(') {
+            Some((ident, _)) if !ident.is_empty() => ident.to_owned(),
+            _ => name,
+        };
         Self {
             id,
             name,
@@ -182,4 +188,40 @@ pub trait Provider {
 pub enum StreamDelta {
     Text(String),
     Reasoning(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_parse_normalizes_pseudo_call_syntax() {
+        let tc = ToolCall::parse(
+            "call_123".to_string(),
+            "shell(cargo new sandbox)".to_string(),
+            r#"{"command": "cargo new sandbox"}"#.to_string(),
+        );
+        assert_eq!(tc.name, "shell");
+        assert_eq!(tc.id, "call_123");
+    }
+
+    #[test]
+    fn tool_call_parse_preserves_normal_names() {
+        let tc = ToolCall::parse(
+            "call_456".to_string(),
+            "execute_bash".to_string(),
+            r#"{"command": "echo hi"}"#.to_string(),
+        );
+        assert_eq!(tc.name, "execute_bash");
+    }
+
+    #[test]
+    fn tool_call_parse_handles_empty_prefix() {
+        let tc = ToolCall::parse(
+            "call_789".to_string(),
+            "(invalid)".to_string(),
+            "{}".to_string(),
+        );
+        assert_eq!(tc.name, "(invalid)");
+    }
 }
