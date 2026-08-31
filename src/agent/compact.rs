@@ -237,4 +237,81 @@ mod tests {
         let convo = vec![Msg::user("12345678"), Msg::assistant("1234")];
         assert_eq!(estimate_tokens(&convo), 3);
     }
+
+    #[test]
+    fn multi_call_round_folds_atomically() {
+        // one assistant message carrying THREE tool calls plus their results
+        let multi = Msg {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![
+                ToolCall::parse("m1".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+                ToolCall::parse("m2".into(), "read".into(), r#"{"path":"b.rs"}"#.into()),
+                ToolCall::parse("m3".into(), "shell".into(), r#"{"command":"ls"}"#.into()),
+            ],
+            tool_call_id: None,
+            name: None,
+        };
+        let convo = vec![
+            Msg::user("multi task"),
+            multi,
+            tool_result("m1", "a"),
+            tool_result("m2", "b"),
+            tool_result("m3", "c"),
+            Msg::user("tail one"),
+            Msg::assistant("ok"),
+            Msg::user("tail two"),
+            Msg::assistant("done"),
+        ];
+        let (out, report) = compact(convo);
+        assert_eq!(report.expect("folds").folded_rounds, 1);
+        // every call of the multi-call message is listed in the note
+        let note = &out
+            .iter()
+            .find(|m| m.content.starts_with("[few context compacted]"))
+            .expect("note")
+            .content;
+        assert!(note.contains("- read a.rs"));
+        assert!(note.contains("- read b.rs"));
+        assert!(note.contains("- shell ls"));
+        // no orphaned piece of the folded pair survives
+        for id in ["m1", "m2", "m3"] {
+            assert!(!out.iter().any(|m| m.tool_call_id.as_deref() == Some(id)));
+        }
+        assert!(!out.iter().any(|m| m.has_tool_calls()));
+    }
+
+    #[test]
+    fn note_steps_cap_at_max_note_lines() {
+        // 120 folded single-call rounds exceed the 100-line cap
+        let mut convo = Vec::new();
+        for k in 0..120 {
+            convo.push(Msg::user(format!("task {k}")));
+            convo.push(call(
+                &format!("t{k}"),
+                "read",
+                &format!(r#"{{"path":"file{k}.rs"}}"#),
+            ));
+            convo.push(tool_result(&format!("t{k}"), "body"));
+        }
+        convo.push(Msg::user("tail one"));
+        convo.push(Msg::assistant("ok"));
+        convo.push(Msg::user("tail two"));
+        convo.push(Msg::assistant("done"));
+
+        let (out, report) = compact(convo);
+        assert_eq!(report.expect("folds").folded_rounds, 120);
+        let note = &out
+            .iter()
+            .find(|m| m.content.starts_with("[few context compacted]"))
+            .expect("note")
+            .content;
+        let step_lines = note.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(step_lines, 100, "note capped at MAX_NOTE_LINES");
+        assert!(note.contains("- read file0.rs"), "earliest steps kept");
+        assert!(
+            !note.contains("- read file119.rs"),
+            "steps past the cap dropped"
+        );
+    }
 }

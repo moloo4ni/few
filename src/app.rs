@@ -380,7 +380,14 @@ impl App {
                     }
                 }
                 Block::Resumed(_) => out.push((bi, usize::MAX)),
-                _ => {}
+                // Explicitly non-navigable; a new Block variant must make
+                // this decision here rather than inherit a wildcard default.
+                Block::User(_)
+                | Block::Assistant(_)
+                | Block::Notice { .. }
+                | Block::Remembered(_)
+                | Block::PermAsk(_)
+                | Block::MemoryView { .. } => {}
             }
         }
         out

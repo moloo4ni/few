@@ -203,3 +203,200 @@ pub enum Hit {
     Step(usize, usize),
     PermOption(usize, usize),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{Detail, StepView, TaskOutcome, Verb};
+    use crate::diffgen::DiffLine;
+
+    fn diff_step(n_lines: usize, capped_at: Option<usize>) -> StepBlock {
+        StepBlock {
+            view: StepView {
+                verb: Verb::Wrote,
+                arg: "f.txt".into(),
+                detail: Some(Detail::Diff {
+                    lines: (0..n_lines)
+                        .map(|i| DiffLine {
+                            sign: '+',
+                            text: format!("line {i}"),
+                        })
+                        .collect(),
+                    capped_at,
+                }),
+            },
+            expand: Expand::Shown,
+        }
+    }
+
+    fn output_step(text: &str, total_bytes: usize, truncated: bool) -> StepBlock {
+        StepBlock {
+            view: StepView {
+                verb: Verb::Ran,
+                arg: "cmd".into(),
+                detail: Some(Detail::Output {
+                    text: text.into(),
+                    total_bytes,
+                    truncated,
+                }),
+            },
+            expand: Expand::Shown,
+        }
+    }
+
+    #[test]
+    fn diff_rows_cap_with_more_lines_note() {
+        let step = diff_step(10, None);
+        // Shown: capped at 4, plus the "... N more lines" row
+        let rows = step.detail_rows(4);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], "+ line 0");
+        assert_eq!(rows[4], "... 6 more lines");
+        // Full: everything, no note
+        let full = StepBlock {
+            expand: Expand::Full,
+            ..diff_step(10, None)
+        };
+        assert_eq!(full.detail_rows(4).len(), 10);
+        // exactly at the cap: no note row
+        assert_eq!(diff_step(4, None).detail_rows(4).len(), 4);
+        // capped_at below cap wins
+        let narrow = diff_step(10, Some(2));
+        let rows = narrow.detail_rows(4);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2], "... 8 more lines");
+    }
+
+    #[test]
+    fn output_rows_cap_with_byte_total_note() {
+        let text = "a\nb\nc\nd\ne";
+        let step = output_step(text, 500, false);
+        let rows = step.detail_rows(3);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3], "... output truncated, 500 bytes total");
+        // at the cap: no note
+        assert_eq!(output_step("a\nb\nc", 5, false).detail_rows(3).len(), 3);
+        // collapsed diff/output render nothing
+        let collapsed = StepBlock {
+            expand: Expand::Collapsed,
+            ..output_step(text, 500, false)
+        };
+        assert!(collapsed.detail_rows(3).is_empty());
+    }
+
+    #[test]
+    fn message_detail_ignores_expand_state() {
+        let step = StepBlock {
+            view: StepView {
+                verb: Verb::Denied,
+                arg: "x".into(),
+                detail: Some(Detail::Message("denied because".into())),
+            },
+            expand: Expand::Collapsed,
+        };
+        assert_eq!(step.detail_rows(4), vec!["denied because".to_owned()]);
+    }
+
+    #[test]
+    fn next_expand_tri_state_only_when_truncated() {
+        // truncated content: Collapsed -> Shown -> Full -> Collapsed
+        let long = diff_step(10, None);
+        assert_eq!(
+            StepBlock {
+                expand: Expand::Collapsed,
+                ..diff_step(10, None)
+            }
+            .next_expand(4),
+            Expand::Shown
+        );
+        assert_eq!(long.next_expand(4), Expand::Full);
+        assert_eq!(
+            StepBlock {
+                expand: Expand::Full,
+                ..diff_step(10, None)
+            }
+            .next_expand(4),
+            Expand::Collapsed
+        );
+        // short content never visits Full
+        let short = diff_step(3, None);
+        assert_eq!(short.next_expand(4), Expand::Collapsed);
+    }
+
+    #[test]
+    fn headline_annotates_binary_and_truncated_output() {
+        let bin = StepBlock {
+            view: StepView {
+                verb: Verb::Read,
+                arg: "img.png".into(),
+                detail: Some(Detail::BinaryNote("24kb".into())),
+            },
+            expand: Expand::Collapsed,
+        };
+        assert_eq!(bin.headline(), "read img.png (binary, 24kb)");
+        let trunc = output_step("tail", 9000, true);
+        assert_eq!(trunc.headline(), "ran cmd (output truncated, 9000b total)");
+        // non-truncated output: no suffix
+        assert_eq!(output_step("ok", 2, false).headline(), "ran cmd");
+    }
+
+    fn group(steps: Vec<StepItem>, outcome: Option<TaskOutcome>) -> StepsGroup {
+        StepsGroup {
+            steps,
+            expanded: false,
+            outcome,
+        }
+    }
+
+    fn plain_step(verb: Verb) -> StepItem {
+        StepItem::Step(StepBlock {
+            view: StepView {
+                verb,
+                arg: "x".into(),
+                detail: None,
+            },
+            expand: Expand::Collapsed,
+        })
+    }
+
+    #[test]
+    fn summary_counts_pluralizes_and_appends_outcome() {
+        // thoughts and narration are not counted as steps
+        let g = group(
+            vec![
+                plain_step(Verb::Read),
+                StepItem::Thought {
+                    text: "hm".into(),
+                    expand: Expand::Collapsed,
+                },
+                plain_step(Verb::Failed),
+            ],
+            None,
+        );
+        assert_eq!(g.summary(), "2 steps · 1 error");
+
+        let two_errs = group(
+            vec![plain_step(Verb::Failed), plain_step(Verb::Errored)],
+            None,
+        );
+        assert_eq!(two_errs.summary(), "2 steps · 2 errors");
+
+        assert_eq!(
+            group(vec![plain_step(Verb::Read)], Some(TaskOutcome::Aborted)).summary(),
+            "1 steps · aborted"
+        );
+        assert_eq!(
+            group(vec![], Some(TaskOutcome::GaveUpRepeated)).summary(),
+            "0 steps · gave up (repeated error)"
+        );
+        assert_eq!(
+            group(vec![], Some(TaskOutcome::GaveUpSteps)).summary(),
+            "0 steps · gave up (step limit)"
+        );
+        assert_eq!(
+            group(vec![], Some(TaskOutcome::Done)).summary(),
+            "0 steps",
+            "Done adds no suffix"
+        );
+    }
+}

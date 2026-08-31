@@ -60,3 +60,34 @@ impl Paths {
         self.data_dir.join("sessions")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_under_absolute_and_relative() {
+        let root = Path::new("/proj");
+        assert_eq!(resolve_under(root, "src/main.rs"), root.join("src/main.rs"));
+        // an absolute path passes through untouched, ignoring the root
+        assert_eq!(
+            resolve_under(root, "/etc/hosts"),
+            PathBuf::from("/etc/hosts")
+        );
+        // "" resolves to the root itself (join with an empty path)
+        assert_eq!(resolve_under(root, ""), root.join(""));
+    }
+
+    #[test]
+    fn rel_display_strips_root_or_falls_back() {
+        let root = Path::new("/proj");
+        assert_eq!(rel_display(root, &root.join("src/main.rs")), "src/main.rs");
+        // outside the root: the full path is shown, not an error
+        assert_eq!(rel_display(root, Path::new("/etc/hosts")), "/etc/hosts");
+        // the root itself strips to an empty label
+        assert_eq!(rel_display(root, root), "");
+        // backslashes normalize to forward slashes in the displayed label
+        let sub = root.join("a\\b.txt");
+        assert_eq!(rel_display(root, &sub), "a/b.txt");
+    }
+}

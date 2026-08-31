@@ -26,6 +26,10 @@ impl<P: Provider> Agent<P> {
         plan: &VerifyPlan,
         ctx: &mut RunCtx<'_>,
     ) -> VerifyOutcome {
+        // Contract (UX spec "Verify"): the verify command goes through the
+        // IDENTICAL shell.execute gate as a model-initiated shell call in
+        // exec_shell() - shared saved/session grants, the same inline prompt.
+        // Do not fork this into a parallel permission path.
         match self
             .gate(
                 ctx,
@@ -619,5 +623,71 @@ mod exec_tests {
         );
         assert_eq!(sniff_mv("mv -f a b"), Some(("a".into(), "b".into())));
         assert_eq!(sniff_mv("cargo build"), None);
+    }
+
+    #[test]
+    fn tokenize_words_quotes_and_whitespace() {
+        assert_eq!(tokenize("cargo test"), vec!["cargo", "test"]);
+        // quoted spaces stay one token, quotes are stripped
+        assert_eq!(
+            tokenize(r#"cargo test "my test""#),
+            vec!["cargo", "test", "my test"]
+        );
+        assert_eq!(
+            tokenize("grep 'two words' f.txt"),
+            vec!["grep", "two words", "f.txt"]
+        );
+        // runs of whitespace collapse; tabs and newlines separate too
+        assert_eq!(tokenize("  a \t b \n c  "), vec!["a", "b", "c"]);
+        // empty quotes produce no token (closing quote leaves cur empty)
+        assert_eq!(tokenize(r#"a "" b"#), vec!["a", "b"]);
+        // adjacent operators are ordinary characters, not separators
+        assert_eq!(tokenize("a&&b || c"), vec!["a&&b", "||", "c"]);
+        // an unterminated quote consumes the rest as one token
+        assert_eq!(tokenize("echo 'no end"), vec!["echo", "no end"]);
+        assert_eq!(tokenize(""), Vec::<String>::new());
+        assert_eq!(tokenize("   "), Vec::<String>::new());
+    }
+
+    fn capture(stdout: &str, stderr: &str, killed: bool) -> tools::OutputCapture {
+        tools::OutputCapture {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            total_bytes: stdout.len() + stderr.len(),
+            truncated_from: None,
+            killed,
+        }
+    }
+
+    #[test]
+    fn combine_output_sections() {
+        assert_eq!(combine_output(&capture("ok\n", "", false)), "ok\n");
+        assert_eq!(
+            combine_output(&capture("", "boom\n", false)),
+            "--- stderr ---\nboom\n"
+        );
+        assert_eq!(
+            combine_output(&capture("out\n", "err\n", false)),
+            "out\n--- stderr ---\nerr\n"
+        );
+        // whitespace-only streams are dropped entirely
+        assert_eq!(combine_output(&capture("  \n", " \n", false)), "");
+        assert!(combine_output(&capture("x", "", true)).contains("killed by a user interrupt"));
+    }
+
+    #[test]
+    fn combine_output_pretty_placeholder_and_kill_note() {
+        assert_eq!(
+            combine_output_pretty(&capture("", "", false)),
+            "(no output)"
+        );
+        assert_eq!(
+            combine_output_pretty(&capture("out\n", "err\n", false)),
+            "out\n--- stderr ---\nerr"
+        );
+        assert_eq!(
+            combine_output_pretty(&capture("", "", true)),
+            "(no output)\n^C process killed"
+        );
     }
 }

@@ -147,6 +147,39 @@ mod tests {
     }
 
     #[test]
+    fn detect_each_marker_and_priority() {
+        // (marker files, expected command) - one temp dir per case
+        let cases: &[(&[&str], &str)] = &[
+            (&["Cargo.toml"], "cargo test"),
+            (&["go.mod"], "go test ./..."),
+            (&["package.json"], "npm test"),
+            (&["package.json", "yarn.lock"], "yarn test"),
+            (&["package.json", "pnpm-lock.yaml"], "pnpm test"),
+            (&["pyproject.toml"], "pytest"),
+            // priority: Cargo.toml wins over package.json; go.mod over pyproject
+            (
+                &["Cargo.toml", "package.json", "pnpm-lock.yaml"],
+                "cargo test",
+            ),
+            (&["go.mod", "pyproject.toml"], "go test ./..."),
+            (&["package.json", "pyproject.toml"], "npm test"),
+        ];
+        for (i, (markers, expected)) in cases.iter().enumerate() {
+            let dir =
+                std::env::temp_dir().join(format!("few-verify-detect-{i}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for m in *markers {
+                std::fs::write(dir.join(m), "").unwrap();
+            }
+            let plan = resolve_verify(None, &dir)
+                .unwrap_or_else(|| panic!("case {i}: no plan for {markers:?}"));
+            assert_eq!(plan.command, *expected, "case {i}: {markers:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
     fn config_overrides_detect() {
         let empty = PathBuf::from("/definitely/not/exist");
         let none = resolve_verify(Some(""), &empty);

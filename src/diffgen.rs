@@ -25,6 +25,9 @@ pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
     out
 }
 
+/// Diff line counts (added, removed). Test-only: production rendering shows
+/// diff lines directly and never displays an aggregate.
+#[cfg(test)]
 pub fn stats(lines: &[DiffLine]) -> (usize, usize) {
     let added = lines.iter().filter(|l| l.sign == '+').count();
     let removed = lines.iter().filter(|l| l.sign == '-').count();
