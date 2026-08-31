@@ -206,6 +206,14 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Few release.
 
+          Highlights since v0.1.0-pre.3:
+
+          - hardens persistence and atomic writes, preserves Unix modes, and restores terminal state after failures;
+          - rejects incomplete provider streams, accounts for complete shell output, and enforces the configured step ceiling;
+          - simplifies the agent loop and TUI state transitions for contributors without changing Few's four-tool surface;
+          - updates the pinned Rust toolchain and MSRV to 1.98;
+          - adds native Linux ARM64 and FreeBSD 14.4 x86_64/ARM64 release artifacts and CI coverage.
+
           Supported artifacts:
 
           - `x86_64-unknown-linux-musl`: static Linux x86_64 binary
