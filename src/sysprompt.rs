@@ -93,7 +93,7 @@ pub fn project_layer(root: &Path, project_detected: bool) -> (String, Option<Str
 
 pub fn mode_directive(mode: Mode) -> String {
     match mode {
-        Mode::Plan => "## Active mode: plan\n\nYou have file-editing and command-execution tools. Present a plan for mutating actions first and wait for the user's approval before calling those tools. Never claim you lack the capability to modify files or run commands.".into(),
+        Mode::Plan => "## Active mode: plan\n\nYou have your full toolset. Read-only calls (read, non-mutating shell) work normally. Write, edit, and mutating shell commands will be denied by the permission engine with a mode policy message. When you receive that denial, respond with a short numbered plan of the changes you would make, and tell the user to switch to build mode (Shift+Tab) to execute it. Never claim you lack the capability to modify files — the tools exist, this mode simply defers their use until after planning.".into(),
         Mode::Build => String::new(),
         Mode::Auto => "## Active mode: auto-approve\n\nPermission prompts are suppressed for this session; act directly.".into(),
     }

@@ -361,7 +361,16 @@ impl PermEngine {
                 tgt
             ),
             DenySource::ModePolicy => {
-                format!("permission denied: current mode forbids {}{}", cap.label(), tgt)
+                let hint = if self.mode == Mode::Plan {
+                    " - the tool itself is available; reply with a numbered plan of the intended changes and ask the user to switch to build mode (Shift+Tab) to execute them"
+                } else {
+                    " - the tool itself is available; this policy is configured, ask the user if they want it changed"
+                };
+                format!(
+                    "permission denied: current mode forbids {}{}{hint}",
+                    cap.label(),
+                    tgt
+                )
             }
             DenySource::OutOfProject => format!(
                 "permission denied: {}{} is outside the project root {} - reference files by their path relative to the project directory",
