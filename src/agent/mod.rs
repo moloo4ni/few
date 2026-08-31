@@ -373,7 +373,8 @@ impl<P: Provider> Agent<P> {
             ProviderError::NoToolSupport(message) => {
                 let _ = ctx.ev.send(AgentEvent::Notice {
                     text: format!(
-                        "model lacks native structured tool-calling, refusing to continue: {message}"
+                        "model lacks native structured tool-calling, refusing to continue: {message}\n{}",
+                        crate::providers::known_models_hint()
                     ),
                     level: NoticeLevel::Error,
                 });

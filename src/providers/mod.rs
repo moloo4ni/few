@@ -149,6 +149,22 @@ pub enum ProbeOutcome {
     Unavailable(String),
 }
 
+/// Models observed to answer with native tool calls, mirroring the README's
+/// verified-providers table. Offered as a recovery hint when the selected
+/// model is refused; observed behaviour, not a provider guarantee.
+pub const KNOWN_TOOL_CALLING_MODELS: &[&str] = &[
+    "codestral-2508 (Mistral, https://api.mistral.ai/v1)",
+    "dots-studio/dots-3-note-preview:free (OpenRouter, https://openrouter.ai/api/v1)",
+];
+
+/// One-line recovery hint listing models known to work.
+pub fn known_models_hint() -> String {
+    format!(
+        "Models observed to work: {}.",
+        KNOWN_TOOL_CALLING_MODELS.join("; ")
+    )
+}
+
 pub trait Provider {
     fn model_name(&self) -> String;
 

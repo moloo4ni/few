@@ -102,7 +102,7 @@ impl OpenAiProvider {
             let bytes = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
             asm.push_bytes(&bytes, &mut on_delta);
             if let Some(error) = &asm.error {
-                return Err(ProviderError::Http(error.clone()));
+                return Err(classify_stream_error(error));
             }
             if asm.done {
                 break;
@@ -340,7 +340,7 @@ impl StreamAssembler {
 
     fn into_reply(self) -> Result<Reply, ProviderError> {
         if let Some(error) = self.error {
-            return Err(ProviderError::Http(error));
+            return Err(classify_stream_error(&error));
         }
         if !self.done {
             return Err(ProviderError::Http(
@@ -394,16 +394,44 @@ const UNSUPPORT_PHRASES: &[&str] = &[
     "does not support",
     "doesn't support",
     "no support for",
+    "not enabled",
+    "not available for",
+    "disabled",
+    "not allowed",
+    "not permitted",
+    "cannot be used",
+    "can't be used",
+    "not capable",
+    "incompatible",
 ];
 
-fn classify_status(status: u16, body: &str) -> ProviderError {
+/// True when a provider body reads as "this model has no native tool
+/// calling" rather than a transient or unrelated failure. Requiring both a
+/// tool/function mention and a capability denial keeps gateway noise like
+/// "Model is unavailable" out of the unsupported bucket.
+fn denies_tool_support(body: &str) -> bool {
     let lowered = body.to_lowercase();
     let mentions_tools = lowered.contains("tool") || lowered.contains("function");
-    let denies_capability = UNSUPPORT_PHRASES.iter().any(|p| lowered.contains(p));
-    if matches!(status, 400 | 404 | 422 | 501) && mentions_tools && denies_capability {
+    mentions_tools && UNSUPPORT_PHRASES.iter().any(|p| lowered.contains(p))
+}
+
+fn classify_status(status: u16, body: &str) -> ProviderError {
+    if matches!(status, 400 | 404 | 422 | 501) && denies_tool_support(body) {
         ProviderError::NoToolSupport(truncate(body, 500))
     } else {
         ProviderError::Http(format!("HTTP {status}: {}", truncate(body, 500)))
+    }
+}
+
+/// Providers also deliver capability denials inside a 200 SSE `error`
+/// chunk, where no status code is available to gate on. Route those through
+/// the same body check so the startup probe reports "unsupported" (with its
+/// actionable guidance) instead of a generic "unavailable".
+fn classify_stream_error(body: &str) -> ProviderError {
+    if denies_tool_support(body) {
+        ProviderError::NoToolSupport(truncate(body, 500))
+    } else {
+        ProviderError::Http(truncate(body, 500))
     }
 }
 
@@ -665,6 +693,37 @@ mod tests {
         );
         let e = classify_status(400, "bad request");
         assert!(matches!(e, ProviderError::Http(_)));
+    }
+
+    #[test]
+    fn classifies_stream_and_loosely_worded_denials() {
+        // capability denial delivered inside a 200 SSE error chunk
+        let e = classify_stream_error("tool calling is disabled for this model");
+        assert!(matches!(e, ProviderError::NoToolSupport(_)));
+        let e = classify_stream_error("function use is not enabled on the free tier");
+        assert!(matches!(e, ProviderError::NoToolSupport(_)));
+        let e = classify_stream_error("tools are not allowed for this model");
+        assert!(matches!(e, ProviderError::NoToolSupport(_)));
+        // stream errors without a capability denial stay generic
+        let e = classify_stream_error("rate limit exceeded");
+        assert!(matches!(e, ProviderError::Http(_)));
+        // "disabled" alone without a tool mention stays generic too
+        let e = classify_stream_error("account disabled");
+        assert!(matches!(e, ProviderError::Http(_)));
+        // the loosened phrases also apply on the status path
+        let e = classify_status(400, "tool calling is disabled for this model");
+        assert!(matches!(e, ProviderError::NoToolSupport(_)));
+    }
+
+    #[test]
+    fn sse_capability_error_chunk_maps_to_no_tool_support() {
+        let sse = "data: {\"error\":{\"message\":\"tool calling is disabled for this model\"}}\n\n";
+        let (asm, _) = feed(sse);
+        let err = asm.into_reply().unwrap_err();
+        assert!(
+            matches!(err, ProviderError::NoToolSupport(_)),
+            "capability denial in a 200 stream must classify as unsupported: {err}"
+        );
     }
 
     #[test]

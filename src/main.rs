@@ -118,8 +118,9 @@ async fn run(continue_last: bool) -> anyhow::Result<()> {
         match provider.probe_tool_calling().await {
             few::providers::ProbeOutcome::Supported => {}
             few::providers::ProbeOutcome::Unsupported(msg) => anyhow::bail!(
-                "model '{}' does not provide native structured tool-calling.\n{msg}\nFew refuses prompt-based fallback - configure a tool-calling capable model.",
-                cfg.model
+                "model '{}' does not provide native structured tool-calling.\n{msg}\nFew refuses prompt-based fallback - configure a tool-calling capable model.\n{}",
+                cfg.model,
+                few::providers::known_models_hint()
             ),
             few::providers::ProbeOutcome::Unavailable(msg) => anyhow::bail!(
                 "tool-calling probe could not be verified against the provider:\n{msg}\nCheck base_url/model availability and retry."
