@@ -93,7 +93,7 @@ pub fn project_layer(root: &Path, project_detected: bool) -> (String, Option<Str
 
 pub fn mode_directive(mode: Mode) -> String {
     match mode {
-        Mode::Plan => "## Active mode: plan\n\nPresent a plan first. Do NOT modify files and do NOT run mutating commands until the user approves.".into(),
+        Mode::Plan => "## Active mode: plan\n\nYou have file-editing and command-execution tools. Present a plan for mutating actions first and wait for the user's approval before calling those tools. Never claim you lack the capability to modify files or run commands.".into(),
         Mode::Build => String::new(),
         Mode::Auto => "## Active mode: auto-approve\n\nPermission prompts are suppressed for this session; act directly.".into(),
     }
