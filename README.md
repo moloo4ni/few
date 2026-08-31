@@ -86,7 +86,8 @@ Results below describe observed API behavior, not a permanent provider guarantee
 
 | Provider | Model | Streaming | Native tools | Live result |
 |---|---|---:|---:|---|
-| Mistral | `codestral-2508` | yes | yes | file task, repeated verify failure, session resume, and context compaction passed |
+| Mistral | `mistral-medium-latest` | yes | yes | file task and plan mode passed: presents a numbered plan and defers mutating calls |
+| Mistral | `codestral-2508` | yes | yes | file task, repeated verify failure, session resume, and context compaction passed; plan mode NOT usable - the model answers "I cannot modify files" without attempting a tool call, regardless of directives |
 | OpenRouter | `dots-studio/dots-3-note-preview:free` | yes | yes | file task passed; further runs reached the account's free daily limit |
 | OpenRouter | `thinkingmachines/inkling:free` | not tested | not tested | HTTP 403: restricted to approved agentic harnesses |
 | OpenRouter | `thinkingmachines/inkling-small:free` | not tested | not tested | HTTP 403: restricted to approved agentic harnesses |
