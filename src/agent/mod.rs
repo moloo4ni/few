@@ -291,7 +291,6 @@ impl<P: Provider> Agent<P> {
         }
         if !notes.is_empty() {
             self.push_convo(Msg::user(notes));
-            ctx.wrote_since_user = false;
         }
         LoopAction::Continue
     }
@@ -475,6 +474,13 @@ impl<P: Provider> Agent<P> {
             self.execute_call(call, ctx).await;
             ctx.steps += 1;
             if ctx.hard_abort {
+                for pending in calls {
+                    self.push_convo(Msg::tool_result(
+                        &pending.id,
+                        &pending.name,
+                        "task aborted; tool call was not executed",
+                    ));
+                }
                 ctx.report_abort();
                 return LoopAction::Finish(TaskOutcome::Aborted);
             }
@@ -492,7 +498,6 @@ impl<P: Provider> Agent<P> {
             cfg: &self.cfg,
             ev,
             ctl_rx,
-            stash: Vec::new(),
             queue: Vec::new(),
             soft: false,
             hard_abort: false,
@@ -550,7 +555,6 @@ struct RunCtx<'a> {
     cfg: &'a Config,
     ev: mpsc::UnboundedSender<AgentEvent>,
     ctl_rx: mpsc::UnboundedReceiver<Ctl>,
-    stash: Vec<Ctl>,
     queue: Vec<String>,
     soft: bool,
     hard_abort: bool,
@@ -601,12 +605,15 @@ impl RunCtx<'_> {
 
     fn take_boundary_notes(&mut self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        while let Ok(c) = self.ctl_rx.try_recv() {
-            self.absorb(c);
-        }
+        self.drain_ctl();
         if self.soft {
             self.soft = false;
             parts.push(SOFT_NOTE.to_owned());
+        }
+        // Only a new user message starts a new write boundary. A synthetic
+        // interrupt note must not discard verification of earlier changes.
+        if !self.queue.is_empty() {
+            self.wrote_since_user = false;
         }
         parts.append(&mut self.queue);
         if parts.is_empty() {
@@ -874,6 +881,206 @@ mod tests {
             .expect("final read step must follow");
         assert!(start_pos < step_pos);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hard_abort_during_shell_or_verify_finishes_the_task() {
+        for verify in [false, true] {
+            let root = temp_root(&format!("running-abort-{verify}"));
+            let (perms, mem) = setup(&root);
+            let command = "echo $$ > started; exec sleep 30";
+            let cfg = Config {
+                shell_program: Some("/bin/sh".into()),
+                verify_command: verify.then(|| command.into()),
+                retry_threshold: 1,
+                ..(*test_cfg(&root)).clone()
+            };
+            let mut replies = if verify {
+                vec![
+                    reply_call("write", r#"{"path":"result.txt","content":"done"}"#),
+                    reply_text("done"),
+                ]
+            } else {
+                vec![reply_calls(vec![
+                    ToolCall::parse(
+                        "t1".into(),
+                        "shell".into(),
+                        serde_json::json!({"command": command}).to_string(),
+                    ),
+                    ToolCall::parse(
+                        "t2".into(),
+                        "write".into(),
+                        r#"{"path":"must-not-run","content":"bad"}"#.into(),
+                    ),
+                ])]
+            };
+            replies.push(reply_text("must not request another turn"));
+            let agent = Agent::new(
+                Scripted::new(replies),
+                Arc::new(cfg),
+                perms,
+                mem,
+                Default::default(),
+            );
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let (control_tx, control_rx) = mpsc::unbounded_channel();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let interrupt = async {
+                    wait_for_shell(&root).await;
+                    control_tx.send(Ctl::HardAbort).unwrap();
+                };
+                let (outcome, ()) =
+                    tokio::join!(agent.run("run".into(), event_tx, control_rx), interrupt);
+                outcome
+            })
+            .await;
+            cleanup_test_shell(&root);
+
+            assert_eq!(outcome.unwrap(), TaskOutcome::Aborted);
+            assert_eq!(agent.provider.replies.lock().unwrap().len(), 1);
+            assert!(!root.join("must-not-run").exists());
+            let convo = agent.snapshot_convo();
+            for call in convo.iter().flat_map(|message| &message.tool_calls) {
+                assert!(convo
+                    .iter()
+                    .any(|message| message.tool_call_id.as_ref() == Some(&call.id)));
+            }
+            assert!(!convo
+                .iter()
+                .any(|message| message.content.contains("[few verify]")));
+            assert_eq!(
+                std::iter::from_fn(|| event_rx.try_recv().ok())
+                    .filter(|event| matches!(event, AgentEvent::Finished(TaskOutcome::Aborted)))
+                    .count(),
+                1
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_preserves_queued_messages_and_soft_interrupt_notes() {
+        let root = temp_root("shell-queue");
+        let (perms, mem) = setup(&root);
+        let cfg = Config {
+            shell_program: Some("/bin/sh".into()),
+            ..(*test_cfg(&root)).clone()
+        };
+        let agent = Agent::new(
+            Scripted::new(vec![
+                reply_call("shell", r#"{"command":"echo $$ > started; exec sleep 30"}"#),
+                reply_text("done"),
+            ]),
+            Arc::new(cfg),
+            perms,
+            mem,
+            Default::default(),
+        );
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let interrupt = async {
+                wait_for_shell(&root).await;
+                control_tx
+                    .send(Ctl::QueuedUser("first follow-up".into()))
+                    .unwrap();
+                control_tx
+                    .send(Ctl::QueuedUser("second follow-up".into()))
+                    .unwrap();
+                let (ack, received) = tokio::sync::oneshot::channel();
+                control_tx.send(Ctl::SoftInterrupt { ack }).unwrap();
+                received.await.unwrap();
+            };
+            let (outcome, ()) =
+                tokio::join!(agent.run("run".into(), event_tx, control_rx), interrupt);
+            outcome
+        })
+        .await;
+        cleanup_test_shell(&root);
+        assert_eq!(outcome.unwrap(), TaskOutcome::Done);
+        assert!(agent
+            .snapshot_convo()
+            .iter()
+            .any(|message| message.role == Role::User
+                && message.content
+                    == format!("{SOFT_NOTE}\n\nfirst follow-up\n\nsecond follow-up")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn soft_interrupt_keeps_verification_pending() {
+        let root = temp_root("verify-soft-interrupt");
+        let (perms, mem) = setup(&root);
+        let cfg = Config {
+            shell_program: Some("/bin/sh".into()),
+            verify_command: Some(
+                "if test -f started; then touch verified; else echo $$ > started; exec sleep 30; fi".into(),
+            ),
+            ..(*test_cfg(&root)).clone()
+        };
+        let agent = Agent::new(
+            Scripted::new(vec![
+                reply_call("write", r#"{"path":"result.txt","content":"done"}"#),
+                reply_text("done"),
+                reply_text("retry verification without another edit"),
+            ]),
+            Arc::new(cfg),
+            perms,
+            mem,
+            Default::default(),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let interrupt = async {
+                wait_for_shell(&root).await;
+                let (ack, received) = tokio::sync::oneshot::channel();
+                control_tx.send(Ctl::SoftInterrupt { ack }).unwrap();
+                received.await.unwrap();
+            };
+            let (outcome, ()) = tokio::join!(
+                agent.run("write and verify".into(), event_tx, control_rx),
+                interrupt
+            );
+            outcome
+        })
+        .await;
+        cleanup_test_shell(&root);
+        assert_eq!(outcome.unwrap(), TaskOutcome::Done);
+        assert!(
+            root.join("verified").is_file(),
+            "interrupted verification must run again before Done"
+        );
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| matches!(
+                event, AgentEvent::Step(StepView { detail: Some(Detail::Output { text, .. }), .. })
+                    if text.ends_with("verify passed")
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_shell(root: &std::path::Path) {
+        while std::fs::read_to_string(root.join("started"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+            .is_none()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn cleanup_test_shell(root: &std::path::Path) {
+        if let Ok(pid) = std::fs::read_to_string(root.join("started")) {
+            unsafe {
+                libc::kill(-pid.trim().parse::<i32>().unwrap(), libc::SIGKILL);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1302,7 +1509,6 @@ mod tests {
             cfg: &Config::default(),
             ev: tx.clone(),
             ctl_rx: mpsc::unbounded_channel().1,
-            stash: vec![],
             queue: vec![],
             soft: false,
             hard_abort: false,

@@ -337,7 +337,7 @@ pub async fn run_shell(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    // own process group, so a soft interrupt reaches the whole tree
+    // Own process group, so an interrupt reaches the whole tree
     // (shell + its children like compilers and test runners), not just the shell
     #[cfg(unix)]
     {
@@ -361,6 +361,9 @@ pub async fn run_shell(
         }
     };
 
+    // Keep the group ID after try_wait() reaps the shell: background children
+    // may still hold the output pipes open at that point.
+    let process_group = child.id();
     let retain_limit = byte_cap.min(HARD_CAPTURE_LIMIT);
     let out_reader = child
         .stdout
@@ -377,14 +380,21 @@ pub async fn run_shell(
 
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
+            Ok(Some(status))
+                if out_reader
+                    .as_ref()
+                    .is_none_or(|reader| reader.is_finished())
+                    && err_reader
+                        .as_ref()
+                        .is_none_or(|reader| reader.is_finished()) =>
+            {
                 let out = finish_reader(out_reader).await;
                 let err = finish_reader(err_reader).await;
 
-                let status_line = if killed {
-                    "^C process killed".to_owned()
-                } else if hard_abort {
+                let status_line = if hard_abort {
                     "terminated".to_owned()
+                } else if killed {
+                    "^C process killed".to_owned()
                 } else if let Some(code) = status.code() {
                     format!("exit {code}")
                 } else {
@@ -408,7 +418,9 @@ pub async fn run_shell(
                     capture: finish_capture(out, err, byte_cap, HARD_CAPTURE_LIMIT, killed),
                 };
             }
-            Ok(None) => {}
+            // Keep polling control messages while descendants hold pipes open,
+            // even when try_wait() already has the shell's cached exit status.
+            Ok(_) => {}
             Err(e) => {
                 return ShellRun {
                     success: false,
@@ -427,13 +439,15 @@ pub async fn run_shell(
         match ctl_rx.try_recv() {
             Ok(Ctl::SoftInterrupt { ack }) => {
                 let _ = ack.send(());
-                soft_terminate(&mut child);
+                terminate_shell(&mut child, process_group, false);
                 killed = true;
                 kill_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
             }
             Ok(Ctl::HardAbort) => {
-                let _ = child.start_kill();
+                terminate_shell(&mut child, process_group, true);
                 hard_abort = true;
+                kill_deadline = None;
+                stash.push(Ctl::HardAbort);
             }
             Ok(other) => stash.push(other),
             Err(mpsc::error::TryRecvError::Empty)
@@ -442,12 +456,7 @@ pub async fn run_shell(
 
         if let Some(deadline) = kill_deadline {
             if std::time::Instant::now() >= deadline {
-                #[cfg(unix)]
-                if let Some(pid) = child.id() {
-                    kill_group(pid as i32, libc::SIGKILL);
-                }
-                #[cfg(not(unix))]
-                let _ = child.start_kill();
+                terminate_shell(&mut child, process_group, true);
                 kill_deadline = None;
             }
         }
@@ -496,14 +505,18 @@ fn split_output_budget(out_bytes: usize, err_bytes: usize, limit: usize) -> (usi
     (out_limit, err_limit)
 }
 
-fn soft_terminate(child: &mut tokio::process::Child) {
+fn terminate_shell(child: &mut tokio::process::Child, process_group: Option<u32>, force: bool) {
     #[cfg(unix)]
     {
-        if let Some(pid) = child.id() {
-            kill_group(pid as i32, libc::SIGTERM);
-            return;
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        if let Some(pid) = process_group {
+            if kill_group(pid as i32, signal) {
+                return;
+            }
         }
     }
+    #[cfg(not(unix))]
+    let _ = (process_group, force);
     let _ = child.start_kill();
 }
 
@@ -692,6 +705,98 @@ mod tests {
         assert!(capture.stderr.is_empty());
         assert_eq!(capture.total_bytes, 300);
         assert_eq!(capture.truncated_from, Some(300));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hard_abort_terminates_shell_process_group() {
+        interrupt_shell_after_start(false, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hard_abort_after_shell_exit_closes_inherited_pipes() {
+        interrupt_shell_after_start(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn soft_interrupt_after_shell_exit_escalates() {
+        interrupt_shell_after_start(true, false).await;
+    }
+
+    #[cfg(unix)]
+    async fn interrupt_shell_after_start(shell_exits: bool, hard: bool) {
+        use std::time::Duration;
+
+        let root = tmpdir(&format!("interrupt-{shell_exits}-{hard}"));
+        // TERM is ignored so the soft-interrupt test also exercises escalation.
+        let command = format!(
+            "trap '' TERM; sleep 30 & echo $$ > shell-pid; \
+             echo captured-out; echo captured-err >&2; echo $! > child-pid; {}",
+            if shell_exits { "exit 0" } else { "wait" }
+        );
+        let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<Ctl>();
+        let mut stash = Vec::new();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let interrupt = async {
+                loop {
+                    let shell_pid = std::fs::read_to_string(root.join("shell-pid"))
+                        .ok()
+                        .and_then(|pid| pid.trim().parse::<i32>().ok());
+                    let child_started = std::fs::read_to_string(root.join("child-pid"))
+                        .ok()
+                        .and_then(|pid| pid.trim().parse::<i32>().ok())
+                        .is_some();
+                    if let Some(pid) = shell_pid.filter(|_| child_started) {
+                        // Wait for run_shell to reap the parent, not just for an
+                        // arbitrary delay which might pass before it exits.
+                        if !shell_exits || unsafe { libc::kill(pid, 0) } == -1 {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if hard {
+                    ctl_tx.send(Ctl::HardAbort).unwrap();
+                } else {
+                    let (ack, received) = oneshot::channel();
+                    ctl_tx.send(Ctl::SoftInterrupt { ack }).unwrap();
+                    received.await.unwrap();
+                }
+            };
+            let (run, ()) = tokio::join!(
+                run_shell(
+                    Some("/bin/sh"),
+                    &root,
+                    &command,
+                    1024,
+                    &mut ctl_rx,
+                    &mut stash
+                ),
+                interrupt,
+            );
+            run
+        })
+        .await;
+        // Clean up even when the regression makes the timeout expire.
+        if let Ok(pid) = std::fs::read_to_string(root.join("shell-pid")) {
+            kill_group(pid.trim().parse().unwrap(), libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let result = result.expect("interrupt must not wait for background children");
+        assert!(!result.success);
+        assert_eq!(
+            result.status_line,
+            if hard {
+                "terminated"
+            } else {
+                "^C process killed"
+            }
+        );
+        assert!(result.capture.stdout.contains("captured-out"));
+        assert!(result.capture.stderr.contains("captured-err"));
+        assert_eq!(stash.iter().any(|ctl| matches!(ctl, Ctl::HardAbort)), hard);
     }
 
     #[test]

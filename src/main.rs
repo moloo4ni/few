@@ -82,12 +82,17 @@ async fn main() {
 
     if let Err(e) = run(continue_last).await {
         eprintln!("\nfew: {e:#}\n");
-        // Wait for Enter so the window does not close immediately (especially under kitty/sway).
-        use std::io::{self, Write};
-        print!("Press Enter to exit...");
-        io::stdout().flush().unwrap();
-        let mut buf = String::new();
-        let _ = io::stdin().read_line(&mut buf);
+        // Keep the useful pause for a terminal-launched window, but never
+        // block CI, pipes, or other non-interactive callers.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
+            use std::io::{self, Write};
+            print!("Press Enter to exit...");
+            io::stdout().flush().unwrap();
+            let mut buf = String::new();
+            let _ = io::stdin().read_line(&mut buf);
+        }
         std::process::exit(2);
     }
 }

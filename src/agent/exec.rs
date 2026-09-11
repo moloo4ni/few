@@ -58,18 +58,7 @@ impl<P: Provider> Agent<P> {
             verb: Verb::Ran,
             arg: plan.command.clone(),
         }));
-        let mut stash = std::mem::take(&mut ctx.stash);
-        let run = tools::run_shell(
-            ctx.cfg.shell_program.as_deref(),
-            &ctx.cfg.project_root,
-            &plan.command,
-            ctx.cfg.shell_output_bytes,
-            &mut ctx.ctl_rx,
-            &mut stash,
-        )
-        .await;
-        ctx.stash = stash;
-        ctx.drain_ctl();
+        let run = ctx.run_shell(&plan.command).await;
 
         let tail = combine_output(&run.capture);
         let mut out = combine_output_pretty(&run.capture);
@@ -87,7 +76,9 @@ impl<P: Provider> Agent<P> {
                 truncated: run.capture.truncated_from.is_some(),
             }),
         }));
-        if run.success {
+        if ctx.hard_abort {
+            VerifyOutcome::Aborted
+        } else if run.success {
             VerifyOutcome::Passed
         } else {
             VerifyOutcome::Failed(tail)
@@ -435,18 +426,7 @@ impl<P: Provider> Agent<P> {
             .as_ref()
             .and_then(|(src, _)| std::fs::read(resolve_path(&ctx.cfg.project_root, src)).ok());
 
-        let mut stash = std::mem::take(&mut ctx.stash);
-        let run = tools::run_shell(
-            ctx.cfg.shell_program.as_deref(),
-            &ctx.cfg.project_root,
-            &command,
-            ctx.cfg.shell_output_bytes,
-            &mut ctx.ctl_rx,
-            &mut stash,
-        )
-        .await;
-        ctx.stash = stash;
-        ctx.drain_ctl();
+        let run = ctx.run_shell(&command).await;
 
         let renamed = if run.success {
             mv.and_then(|(from, to)| {
@@ -505,6 +485,29 @@ impl<P: Provider> Agent<P> {
             detail: Some(Detail::Message(msg.to_owned())),
         }));
         self.push_convo(Msg::tool_result(&tc.id, &tc.name, msg.to_owned()));
+    }
+}
+
+impl RunCtx<'_> {
+    async fn run_shell(&mut self, command: &str) -> tools::ShellRun {
+        let mut pending = Vec::new();
+        let run = tools::run_shell(
+            self.cfg.shell_program.as_deref(),
+            &self.cfg.project_root,
+            command,
+            self.cfg.shell_output_bytes,
+            &mut self.ctl_rx,
+            &mut pending,
+        )
+        .await;
+        // The shell acknowledges soft interrupts immediately; the agent still
+        // needs the note at the next turn boundary.
+        self.soft |= run.capture.killed;
+        for control in pending {
+            self.absorb(control);
+        }
+        self.drain_ctl();
+        run
     }
 }
 

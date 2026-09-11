@@ -31,8 +31,6 @@ plugin abstractions. Keep application strings and source comments in English.
 Add headless TUI coverage for meaningful layout changes.
 
 Do not commit API keys, `.env`, local `.few/` state, sandbox data, or `target/`.
-The ignored maintainer copies of `few-concept.md` and `few-ux-spec.md` may be
-present locally; do not delete or replace them.
 
 Contributors should use pull requests. The maintainer may push reviewed work
 directly to `main`; this is a maintainer workflow, not an expectation for

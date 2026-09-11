@@ -9,6 +9,13 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::time::Duration;
 
+/// Model ids from a provider listing, plus the number of entries that carried
+/// no usable id and were left out.
+pub struct ModelList {
+    pub ids: Vec<String>,
+    pub skipped: usize,
+}
+
 pub struct OpenAiProvider {
     client: Client,
     base_url: String,
@@ -112,22 +119,14 @@ impl OpenAiProvider {
         asm.into_reply()
     }
 
-    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+    pub async fn list_models(&self) -> anyhow::Result<ModelList> {
         let mut req = self.client.get(self.url("/models"));
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
         let resp = req.timeout(Duration::from_secs(20)).send().await?;
         let v: Value = resp.error_for_status()?.json().await?;
-        let mut ids = Vec::new();
-        if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
-            for item in data {
-                if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
-                    ids.push(id.to_owned());
-                }
-            }
-        }
-        Ok(ids)
+        parse_model_ids(&v)
     }
 
     pub async fn probe_tool_calling(&self) -> ProbeOutcome {
@@ -164,6 +163,28 @@ impl OpenAiProvider {
                 .unwrap_or_else(|| "no response".into()),
         )
     }
+}
+
+fn parse_model_ids(value: &Value) -> anyhow::Result<ModelList> {
+    let data = value.get("data").and_then(Value::as_array).ok_or_else(|| {
+        anyhow::anyhow!("provider /models response is missing an array-valued 'data' field")
+    })?;
+    let ids: Vec<String> = data
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
+    if ids.is_empty() {
+        anyhow::bail!("provider /models response carried no usable model id");
+    }
+    Ok(ModelList {
+        skipped: data.len() - ids.len(),
+        ids,
+    })
 }
 
 impl Provider for OpenAiProvider {
@@ -554,6 +575,30 @@ mod tests {
             });
         }
         (asm, out.into_inner())
+    }
+
+    #[test]
+    fn model_list_skips_unusable_entries_and_counts_them() {
+        let list = parse_model_ids(&json!({"data":[{"id":"a"},{"id":"b"}]})).unwrap();
+        assert_eq!(list.ids, vec!["a", "b"]);
+        assert_eq!(list.skipped, 0);
+
+        let list = parse_model_ids(&json!({"data":[{"id":"a"},{},{"id":""},{"id":"b"}]})).unwrap();
+        assert_eq!(list.ids, vec!["a", "b"]);
+        assert_eq!(list.skipped, 2);
+    }
+
+    #[test]
+    fn model_list_fails_without_a_usable_listing() {
+        for value in [
+            json!({}),
+            json!({"data":{}}),
+            json!({"data":[]}),
+            json!({"data":[{}]}),
+            json!({"data":[{"id":""}]}),
+        ] {
+            assert!(parse_model_ids(&value).is_err());
+        }
     }
 
     #[test]

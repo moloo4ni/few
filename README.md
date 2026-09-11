@@ -168,6 +168,15 @@ independent 16 MiB combined safety ceiling limits retained process output even
 when a larger value is configured, and its truncation is surfaced in the step
 detail rather than silently reported as complete output.
 
+Numeric limits are validated at startup. `context_window`, `retry_threshold`,
+`tool_result_chars`, `shell_output_bytes`, and `diff_lines` must be greater than
+zero; `compact_threshold` must be finite and in the range `(0..1)` (both
+bounds are exclusive). Invalid values stop startup with an explanatory error.
+
+On Unix, a hard abort terminates the task and sends `SIGKILL` to the shell's
+process group, including background children still in that group. Interruption
+remains available if the shell exits while those children hold output pipes open.
+
 State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
 `~/.local/state` where available) and never inside a project directory - except explicitly
 project-local things (`.few/`).
@@ -211,6 +220,9 @@ Before changing agent behavior or the TUI, read the canonical
 and [UX specification](https://github.com/moloo4ni/few/wiki/UX-specification).
 They take priority over the implementation when they disagree, unless a
 maintainer explicitly changes the contract.
+
+For hands-on release checks, use the
+[manual QA checklist](https://github.com/moloo4ni/few/wiki/Manual-QA).
 
 For development checks, UI testing expectations, and the project's minimalism
 rules, see [Contributing](https://github.com/moloo4ni/few/wiki/Contributing).

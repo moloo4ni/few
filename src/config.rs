@@ -308,12 +308,48 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
     })
 }
 
+fn validate_numeric_config(config: &FileConfig, path: &Path) -> anyhow::Result<()> {
+    if let Some(value) = config.provider.compact_threshold {
+        if !(value > 0.0 && value < 1.0) {
+            anyhow::bail!("invalid numeric configuration in {}: provider.compact_threshold must be finite and strictly between 0 and 1", path.display());
+        }
+    }
+    for (name, is_zero) in [
+        (
+            "provider.context_window",
+            config.provider.context_window == Some(0),
+        ),
+        (
+            "loop.retry_threshold",
+            config.loop_cfg.retry_threshold == Some(0),
+        ),
+        (
+            "limits.tool_result_chars",
+            config.limits.tool_result_chars == Some(0),
+        ),
+        (
+            "limits.shell_output_bytes",
+            config.limits.shell_output_bytes == Some(0),
+        ),
+        ("limits.diff_lines", config.limits.diff_lines == Some(0)),
+    ] {
+        if is_zero {
+            anyhow::bail!(
+                "invalid numeric configuration in {}: {name} must be greater than zero",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn read_toml(path: &Path) -> anyhow::Result<Option<FileConfig>> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let config: FileConfig = toml::from_str(&text)
                 .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))?;
             validate_permissions(&config, path)?;
+            validate_numeric_config(&config, path)?;
             Ok(Some(config))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -471,6 +507,58 @@ fn parse_policy(s: &str) -> Option<Policy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_config_rejects_zero_and_invalid_thresholds() {
+        let dir = std::env::temp_dir().join(format!("few-config-numeric-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        for (field, value) in [
+            ("provider.context_window", "0"),
+            ("loop.retry_threshold", "0"),
+            ("limits.tool_result_chars", "0"),
+            ("limits.shell_output_bytes", "0"),
+            ("limits.diff_lines", "0"),
+            ("provider.compact_threshold", "-0.1"),
+            ("provider.compact_threshold", "-0.0"),
+            ("provider.compact_threshold", "0.0"),
+            ("provider.compact_threshold", "1.0"),
+            ("provider.compact_threshold", "nan"),
+            ("provider.compact_threshold", "inf"),
+            ("provider.compact_threshold", "-inf"),
+        ] {
+            std::fs::write(&file, format!("{field} = {value}\n")).unwrap();
+            let error = read_toml(&file).unwrap_err().to_string();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains(&file.display().to_string()), "{error}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn numeric_config_accepts_documented_defaults() {
+        validate_numeric_config(
+            &FileConfig {
+                provider: ProviderCfg {
+                    context_window: Some(200_000),
+                    compact_threshold: Some(0.75),
+                    ..Default::default()
+                },
+                limits: LimitsCfg {
+                    tool_result_chars: Some(40_000),
+                    shell_output_bytes: Some(262_144),
+                    diff_lines: Some(400),
+                },
+                loop_cfg: LoopCfg {
+                    max_steps: Some(0),
+                    retry_threshold: Some(3),
+                },
+                ..Default::default()
+            },
+            Path::new("config.toml"),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn merge_project_overrides_global() {

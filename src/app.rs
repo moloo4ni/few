@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::inputline::InputState;
 use crate::memory::{MemLevel, Memory};
 use crate::perms::{Grant, Mode, PermEngine};
-use crate::providers::openai::OpenAiProvider;
+use crate::providers::openai::{ModelList, OpenAiProvider};
 use crate::providers::{Msg, Provider as _, Role, ToolCall};
 use crate::sysprompt;
 use crate::tools::Ctl;
@@ -788,15 +788,21 @@ impl App {
         self.agent.set_mode_directive(sysprompt::mode_directive(m));
     }
 
-    fn finish_model_fetch(&mut self, result: anyhow::Result<Vec<String>>) {
+    fn finish_model_fetch(&mut self, result: anyhow::Result<ModelList>) {
         match result {
-            Ok(mut list) => {
+            Ok(ModelList { mut ids, skipped }) => {
+                if skipped > 0 {
+                    self.push_notice_level(
+                        format!("skipped {skipped} provider model entries without a usable id"),
+                        NoticeLevel::Warn,
+                    );
+                }
                 for model in &self.cfg.models {
-                    if !list.contains(model) {
-                        list.insert(0, model.clone());
+                    if !ids.contains(model) {
+                        ids.insert(0, model.clone());
                     }
                 }
-                self.absorb_models(list);
+                self.absorb_models(ids);
             }
             Err(error) => self.push_notice_level(
                 format!("could not fetch provider models: {error}"),
@@ -1975,6 +1981,27 @@ mod memory_step_tests {
             block,
             Block::Notice { text, level: NoticeLevel::Warn }
                 if text.contains("provider unavailable")
+        )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_discovery_warns_about_entries_without_an_id() {
+        let root = std::env::temp_dir().join(format!("few-model-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+
+        app.finish_model_fetch(Ok(ModelList {
+            ids: vec!["listed-model".into()],
+            skipped: 2,
+        }));
+
+        assert!(app.models_cache.contains(&"listed-model".to_string()));
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Notice { text, level: NoticeLevel::Warn }
+                if text.contains("skipped 2 provider model entries without a usable id")
         )));
         let _ = std::fs::remove_dir_all(&root);
     }
