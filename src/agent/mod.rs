@@ -1068,16 +1068,20 @@ mod tests {
             "an interrupted verify must not be reported to the model as a failure"
         );
         let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            AgentEvent::Step(StepView { verb: Verb::Failed, .. })
-        )), "an interrupted verify must not be shown as a failed step");
         assert!(
-            events.iter().any(|event| matches!(
-                event, AgentEvent::Step(StepView { detail: Some(Detail::Output { text, .. }), .. })
-                    if text.ends_with("verify passed")
-            ))
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Step(StepView {
+                    verb: Verb::Failed,
+                    ..
+                })
+            )),
+            "an interrupted verify must not be shown as a failed step"
         );
+        assert!(events.iter().any(|event| matches!(
+            event, AgentEvent::Step(StepView { detail: Some(Detail::Output { text, .. }), .. })
+                if text.ends_with("verify passed")
+        )));
         let _ = std::fs::remove_dir_all(&root);
     }
 

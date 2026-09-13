@@ -772,7 +772,8 @@ mod tests {
         let root = tmpdir("escaped-pipe-holder");
         // Publish readiness from inside the new session, after setsid has
         // detached; the parent's $! can be visible before that happens.
-        let command = "setsid /bin/sh -c 'echo $$ > holder-pid; echo captured-out; exec sleep 30' & exit 0";
+        let command =
+            "setsid /bin/sh -c 'echo $$ > holder-pid; echo captured-out; exec sleep 30' & exit 0";
         let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<Ctl>();
         let mut stash = Vec::new();
         let result = tokio::time::timeout(Duration::from_secs(10), async {

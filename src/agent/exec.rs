@@ -73,7 +73,11 @@ impl<P: Provider> Agent<P> {
         let _ = ctx.ev.send(AgentEvent::Step(StepView {
             // An interrupted command didn't fail on its own — the user
             // cancelled it — so surface it as "ran" rather than "failed"
-            verb: if run.success || run.capture.killed { Verb::Ran } else { Verb::Failed },
+            verb: if run.success || run.capture.killed {
+                Verb::Ran
+            } else {
+                Verb::Failed
+            },
             arg: plan.command.clone(),
             detail: Some(Detail::Output {
                 text: out,

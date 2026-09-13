@@ -1796,13 +1796,10 @@ mod memory_step_tests {
         app.pick_palette().await;
         assert_eq!(app.input.text(), "/model ", "input primed for argument");
         // The fetch is async — drain the channel to deliver its result
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            app.app_rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(3), app.app_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let AppMsg::ModelsFetched(result) = message else {
             panic!("expected ModelsFetched");
         };
