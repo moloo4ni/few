@@ -2022,7 +2022,7 @@ mod memory_step_tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0; 1024];
-            stream.read(&mut request).await.unwrap();
+            let _ = stream.read(&mut request).await.unwrap();
             release_rx.await.unwrap();
             let body = r#"{"data":[{"id":"discovered-model"}]}"#;
             stream
