@@ -17,6 +17,9 @@ pub(super) enum VerifyOutcome {
     Passed,
     Failed(String),
     Denied(String),
+    /// The user interrupted the command; its result is unknown, so it must not
+    /// be reported to the model as a failure or counted by the retry tracker.
+    Interrupted,
     Aborted,
 }
 
@@ -68,7 +71,9 @@ impl<P: Provider> Agent<P> {
             out.push_str("\nverify passed");
         }
         let _ = ctx.ev.send(AgentEvent::Step(StepView {
-            verb: if run.success { Verb::Ran } else { Verb::Failed },
+            // An interrupted command didn't fail on its own — the user
+            // cancelled it — so surface it as "ran" rather than "failed"
+            verb: if run.success || run.capture.killed { Verb::Ran } else { Verb::Failed },
             arg: plan.command.clone(),
             detail: Some(Detail::Output {
                 text: out,
@@ -76,8 +81,12 @@ impl<P: Provider> Agent<P> {
                 truncated: run.capture.truncated_from.is_some(),
             }),
         }));
+        // Check interruption/abort before success to avoid treating
+        // an interrupted command that happened to exit 0 as passed
         if ctx.hard_abort {
             VerifyOutcome::Aborted
+        } else if run.capture.killed {
+            VerifyOutcome::Interrupted
         } else if run.success {
             VerifyOutcome::Passed
         } else {

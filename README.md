@@ -176,6 +176,11 @@ bounds are exclusive). Invalid values stop startup with an explanatory error.
 On Unix, a hard abort terminates the task and sends `SIGKILL` to the shell's
 process group, including background children still in that group. Interruption
 remains available if the shell exits while those children hold output pipes open.
+If output pipes remain open two seconds after the forced kill (for example,
+because a descendant left the group), the run stops waiting on them, discards
+unfinished captures, and reports that output capture was abandoned.
+Interrupting the verify command leaves verification pending
+rather than reporting a failure the command never produced.
 
 State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
 `~/.local/state` where available) and never inside a project directory - except explicitly

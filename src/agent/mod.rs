@@ -418,6 +418,13 @@ impl<P: Provider> Agent<P> {
                 ctx.report_abort();
                 LoopAction::Finish(TaskOutcome::Aborted)
             }
+            exec::VerifyOutcome::Interrupted => {
+                self.push_convo(Msg::user(format!(
+                    "[few verify] `{}` was interrupted before it finished. Its result is unknown; do not claim it passed.",
+                    plan.command
+                )));
+                LoopAction::Continue
+            }
             exec::VerifyOutcome::Denied(message) => {
                 *verify_enabled = false;
                 self.push_convo(Msg::user(format!(
@@ -452,35 +459,29 @@ impl<P: Provider> Agent<P> {
         }
     }
 
+    /// Every tool call the provider sent needs a result, even the ones the run
+    /// never reached: a dangling call id breaks the next request.
+    fn answer_unrun(&self, calls: impl Iterator<Item = ToolCall>, reason: &str) {
+        for call in calls {
+            self.push_convo(Msg::tool_result(&call.id, &call.name, reason));
+        }
+    }
+
     async fn execute_calls(&self, calls: Vec<ToolCall>, ctx: &mut RunCtx<'_>) -> LoopAction {
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             if ctx.step_limit_reached() {
-                self.push_convo(Msg::tool_result(
-                    &call.id,
-                    &call.name,
+                self.answer_unrun(
+                    std::iter::once(call).chain(calls),
                     "step limit reached; tool call was not executed",
-                ));
-                for pending in calls {
-                    self.push_convo(Msg::tool_result(
-                        &pending.id,
-                        &pending.name,
-                        "step limit reached; tool call was not executed",
-                    ));
-                }
+                );
                 ctx.report_step_limit();
                 return LoopAction::Finish(TaskOutcome::GaveUpSteps);
             }
             self.execute_call(call, ctx).await;
             ctx.steps += 1;
             if ctx.hard_abort {
-                for pending in calls {
-                    self.push_convo(Msg::tool_result(
-                        &pending.id,
-                        &pending.name,
-                        "task aborted; tool call was not executed",
-                    ));
-                }
+                self.answer_unrun(calls, "task aborted; tool call was not executed");
                 ctx.report_abort();
                 return LoopAction::Finish(TaskOutcome::Aborted);
             }
@@ -1016,6 +1017,7 @@ mod tests {
         let (perms, mem) = setup(&root);
         let cfg = Config {
             shell_program: Some("/bin/sh".into()),
+            retry_threshold: 1,
             verify_command: Some(
                 "if test -f started; then touch verified; else echo $$ > started; exec sleep 30; fi".into(),
             ),
@@ -1054,8 +1056,24 @@ mod tests {
             root.join("verified").is_file(),
             "interrupted verification must run again before Done"
         );
+        let convo = agent.snapshot_convo();
+        assert!(convo.iter().any(|message| message
+            .content
+            .contains("was interrupted before it finished")));
         assert!(
-            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| matches!(
+            !convo
+                .iter()
+                .any(|message| message.content.contains("[few verify]")
+                    && message.content.contains("failed")),
+            "an interrupted verify must not be reported to the model as a failure"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Step(StepView { verb: Verb::Failed, .. })
+        )), "an interrupted verify must not be shown as a failed step");
+        assert!(
+            events.iter().any(|event| matches!(
                 event, AgentEvent::Step(StepView { detail: Some(Detail::Output { text, .. }), .. })
                     if text.ends_with("verify passed")
             ))

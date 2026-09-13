@@ -31,6 +31,7 @@ const ESCALATION_WINDOW: Duration = Duration::from_millis(1200);
 enum AppMsg {
     /// $EDITOR session finished - resume drawing
     EditorDone,
+    ModelsFetched(anyhow::Result<ModelList>),
 }
 
 struct SessionSaveRequest {
@@ -64,6 +65,7 @@ pub struct App {
     pub(crate) transcript_area: ratatui::layout::Rect,
     pub(crate) palette_sel: usize,
     pub(crate) models_cache: Vec<String>,
+    models_fetch_pending: bool,
     pub(crate) cfg: Arc<Config>,
     pub(crate) agent: Arc<Agent<OpenAiProvider>>,
     pub(crate) memory: Memory,
@@ -147,6 +149,7 @@ impl App {
             transcript_area: Default::default(),
             palette_sel: 0,
             models_cache: cfg.models.clone(),
+            models_fetch_pending: false,
             cfg: cfg.clone(),
             agent,
             memory,
@@ -224,6 +227,7 @@ impl App {
                         self.suspended = false;
                         let _ = terminal.clear();
                     }
+                    AppMsg::ModelsFetched(result) => self.finish_model_fetch(result),
                 },
                 _ = tick.tick() => {
                     if let Some(t) = self.escalation {
@@ -718,9 +722,8 @@ impl App {
                     self.execute_command(&item).await;
                     return;
                 }
-                // "/model" must reach execute_command: that is where the
-                // provider model list is fetched before the palette reopens
-                // on "/model " with real candidates.
+                // "/model" starts discovery and opens the palette with the
+                // cached candidates while the provider request is pending.
                 Some(cmd) if cmd.arg_kind == ArgKind::Models => {
                     self.execute_command(&item).await;
                     self.palette_sel = 0;
@@ -759,8 +762,7 @@ impl App {
             },
             "/model" => {
                 if rest.is_empty() || rest == "list" {
-                    let result = self.agent.provider.list_models().await;
-                    self.finish_model_fetch(result);
+                    self.start_model_fetch();
                     self.input.set_text("/model ");
                 } else {
                     self.agent.provider.set_model(&rest);
@@ -788,7 +790,21 @@ impl App {
         self.agent.set_mode_directive(sysprompt::mode_directive(m));
     }
 
+    fn start_model_fetch(&mut self) {
+        if self.models_fetch_pending {
+            return;
+        }
+        self.models_fetch_pending = true;
+        let agent = Arc::clone(&self.agent);
+        let tx = self.app_tx.clone();
+        tokio::spawn(async move {
+            let result = agent.provider.list_models().await;
+            let _ = tx.send(AppMsg::ModelsFetched(result));
+        });
+    }
+
     fn finish_model_fetch(&mut self, result: anyhow::Result<ModelList>) {
+        self.models_fetch_pending = false;
         match result {
             Ok(ModelList { mut ids, skipped }) => {
                 if skipped > 0 {
@@ -797,11 +813,10 @@ impl App {
                         NoticeLevel::Warn,
                     );
                 }
-                for model in &self.cfg.models {
-                    if !ids.contains(model) {
-                        ids.insert(0, model.clone());
-                    }
-                }
+                // Configured models always come first, in their configured order,
+                // whether the provider discovered them or not.
+                ids.retain(|id| !self.cfg.models.contains(id));
+                ids.splice(0..0, self.cfg.models.iter().cloned());
                 self.absorb_models(ids);
             }
             Err(error) => self.push_notice_level(
@@ -1775,11 +1790,23 @@ mod memory_step_tests {
         let mut app = app_with(root.clone());
 
         // picking "/model" from the palette must go through execute_command
-        // (which fetches the provider list), not just append a space
+        // (which starts an async fetch), not just append a space
         app.input.set_text("/model");
         app.palette_sel = 0;
         app.pick_palette().await;
         assert_eq!(app.input.text(), "/model ", "input primed for argument");
+        // The fetch is async — drain the channel to deliver its result
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            app.app_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let AppMsg::ModelsFetched(result) = message else {
+            panic!("expected ModelsFetched");
+        };
+        app.finish_model_fetch(result);
         assert!(
             app.blocks.iter().any(|b| matches!(
                 b,
@@ -1982,6 +2009,69 @@ mod memory_step_tests {
             Block::Notice { text, level: NoticeLevel::Warn }
                 if text.contains("provider unavailable")
         )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn model_discovery_keeps_input_usable_while_provider_is_pending() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = std::env::temp_dir().join(format!("few-model-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            stream.read(&mut request).await.unwrap();
+            release_rx.await.unwrap();
+            let body = r#"{"data":[{"id":"discovered-model"}]}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let mut app = app_with(root.clone());
+        app.agent = Arc::new(Agent::new(
+            OpenAiProvider::new(&base, None, "m").unwrap(),
+            Arc::clone(&app.cfg),
+            Arc::clone(&app.agent.perms),
+            app.memory.clone(),
+            Default::default(),
+        ));
+        app.models_cache = vec!["configured-model".into()];
+
+        tokio::time::timeout(Duration::from_secs(1), app.execute_command("/model"))
+            .await
+            .expect("model discovery must not block the input handler");
+        assert_eq!(app.input.text(), "/model ");
+        assert!(uirender::current_palette(&app)
+            .unwrap()
+            .contains(&"configured-model".to_string()));
+        app.input.set_text("next task");
+        release_tx.send(()).unwrap();
+
+        let message = tokio::time::timeout(Duration::from_secs(3), app.app_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let AppMsg::ModelsFetched(result) = message else {
+            panic!("expected the model discovery result");
+        };
+        app.finish_model_fetch(result);
+        server.await.unwrap();
+        assert_eq!(app.input.text(), "next task");
+        assert!(app.models_cache.contains(&"discovered-model".to_string()));
+        assert!(!app.models_fetch_pending);
+        drop(app);
         let _ = std::fs::remove_dir_all(&root);
     }
 

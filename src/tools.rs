@@ -296,6 +296,20 @@ fn shell_program(override_prog: Option<&str>) -> (String, Vec<String>) {
 /// presenting the retained prefix as complete output.
 const HARD_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 
+/// Poll interval while the shell is still running.
+const SHELL_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+/// Poll interval just after the shell has exited and only the pipes are pending.
+const PIPE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+/// How long the tighter poll lasts before backing off to the normal interval.
+const PIPE_DRAIN_FAST_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long a soft interrupt waits for SIGTERM before escalating to SIGKILL.
+const SOFT_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a forced kill waits for inherited pipes to close before the run
+/// stops waiting on them.
+const PIPE_ABANDON_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const ABANDONED_NOTE: &str =
+    "(output capture abandoned: pipes remained open after forced termination; unfinished captures were discarded)\n";
+
 #[derive(Default)]
 struct PipeCapture {
     bytes: Vec<u8>,
@@ -376,51 +390,14 @@ pub async fn run_shell(
 
     let mut killed = false;
     let mut kill_deadline: Option<std::time::Instant> = None;
+    let mut abandon_deadline: Option<std::time::Instant> = None;
+    let mut exited_at: Option<std::time::Instant> = None;
     let mut hard_abort = false;
+    let mut abandoned = false;
 
     loop {
-        match child.try_wait() {
-            Ok(Some(status))
-                if out_reader
-                    .as_ref()
-                    .is_none_or(|reader| reader.is_finished())
-                    && err_reader
-                        .as_ref()
-                        .is_none_or(|reader| reader.is_finished()) =>
-            {
-                let out = finish_reader(out_reader).await;
-                let err = finish_reader(err_reader).await;
-
-                let status_line = if hard_abort {
-                    "terminated".to_owned()
-                } else if killed {
-                    "^C process killed".to_owned()
-                } else if let Some(code) = status.code() {
-                    format!("exit {code}")
-                } else {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::process::ExitStatusExt;
-                        match status.signal() {
-                            Some(sig) => format!("signal {sig}"),
-                            None => "exited".to_owned(),
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        "exited".to_owned()
-                    }
-                };
-
-                return ShellRun {
-                    success: status.success() && !killed && !hard_abort,
-                    status_line,
-                    capture: finish_capture(out, err, byte_cap, HARD_CAPTURE_LIMIT, killed),
-                };
-            }
-            // Keep polling control messages while descendants hold pipes open,
-            // even when try_wait() already has the shell's cached exit status.
-            Ok(_) => {}
+        let exited = match child.try_wait() {
+            Ok(status) => status,
             Err(e) => {
                 return ShellRun {
                     success: false,
@@ -434,6 +411,57 @@ pub async fn run_shell(
                     },
                 };
             }
+        };
+        if exited.is_some() {
+            exited_at.get_or_insert_with(std::time::Instant::now);
+        }
+        // The shell can be reaped while background children still hold the
+        // output pipes open, so the run ends only once both readers are done -
+        // or once a forced kill failed to close them and they were abandoned.
+        let readers_done = abandoned
+            || (out_reader
+                .as_ref()
+                .is_none_or(|reader| reader.is_finished())
+                && err_reader
+                    .as_ref()
+                    .is_none_or(|reader| reader.is_finished()));
+        if let (Some(status), true) = (exited, readers_done) {
+            let out = finish_reader(out_reader).await;
+            let err = finish_reader(err_reader).await;
+
+            let status_line = if hard_abort {
+                "terminated".to_owned()
+            } else if killed {
+                "^C process killed".to_owned()
+            } else if let Some(code) = status.code() {
+                format!("exit {code}")
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    match status.signal() {
+                        Some(sig) => format!("signal {sig}"),
+                        None => "exited".to_owned(),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    "exited".to_owned()
+                }
+            };
+
+            let mut capture = finish_capture(out, err, byte_cap, HARD_CAPTURE_LIMIT, killed);
+            if abandoned {
+                if !capture.stderr.is_empty() && !capture.stderr.ends_with('\n') {
+                    capture.stderr.push('\n');
+                }
+                capture.stderr.push_str(ABANDONED_NOTE);
+            }
+            return ShellRun {
+                success: status.success() && !killed && !hard_abort && !abandoned,
+                status_line,
+                capture,
+            };
         }
 
         match ctl_rx.try_recv() {
@@ -441,12 +469,16 @@ pub async fn run_shell(
                 let _ = ack.send(());
                 terminate_shell(&mut child, process_group, false);
                 killed = true;
-                kill_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                // Keep the deadline from the first interrupt: repeated presses
+                // must not postpone the escalation to SIGKILL indefinitely.
+                kill_deadline.get_or_insert_with(|| std::time::Instant::now() + SOFT_KILL_GRACE);
             }
             Ok(Ctl::HardAbort) => {
                 terminate_shell(&mut child, process_group, true);
                 hard_abort = true;
                 kill_deadline = None;
+                abandon_deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + PIPE_ABANDON_GRACE);
                 stash.push(Ctl::HardAbort);
             }
             Ok(other) => stash.push(other),
@@ -458,10 +490,35 @@ pub async fn run_shell(
             if std::time::Instant::now() >= deadline {
                 terminate_shell(&mut child, process_group, true);
                 kill_deadline = None;
+                abandon_deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + PIPE_ABANDON_GRACE);
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        // SIGKILL only reaches the shell's own process group. A descendant that
+        // left it (setsid, a daemonized server) keeps the inherited pipes open
+        // forever, so stop waiting on the readers instead of hanging the task.
+        if abandon_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            for reader in [out_reader.as_ref(), err_reader.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                reader.abort();
+            }
+            abandon_deadline = None;
+            abandoned = true;
+        }
+
+        // Right after the shell exits only the pipes are pending and they
+        // normally close within microseconds, so poll tighter for a moment
+        // instead of adding a full tick of latency to every command. A pipe
+        // held past that window belongs to a background child that may outlive
+        // the run by hours, so fall back to the slow tick rather than spin.
+        let poll_interval = match exited_at {
+            Some(t) if t.elapsed() < PIPE_DRAIN_FAST_WINDOW => PIPE_POLL,
+            _ => SHELL_POLL,
+        };
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -705,6 +762,54 @@ mod tests {
         assert!(capture.stderr.is_empty());
         assert_eq!(capture.total_bytes, 300);
         assert_eq!(capture.truncated_from, Some(300));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hard_abort_gives_up_on_pipes_held_outside_the_process_group() {
+        use std::time::Duration;
+
+        let root = tmpdir("escaped-pipe-holder");
+        // Publish readiness from inside the new session, after setsid has
+        // detached; the parent's $! can be visible before that happens.
+        let command = "setsid /bin/sh -c 'echo $$ > holder-pid; echo captured-out; exec sleep 30' & exit 0";
+        let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<Ctl>();
+        let mut stash = Vec::new();
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let interrupt = async {
+                while std::fs::read_to_string(root.join("holder-pid"))
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<i32>().ok())
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                ctl_tx.send(Ctl::HardAbort).unwrap();
+            };
+            let (run, ()) = tokio::join!(
+                run_shell(
+                    Some("/bin/sh"),
+                    &root,
+                    command,
+                    1024,
+                    &mut ctl_rx,
+                    &mut stash
+                ),
+                interrupt,
+            );
+            run
+        })
+        .await;
+        if let Ok(pid) = std::fs::read_to_string(root.join("holder-pid")) {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let run = result.expect("hard abort must not wait on a pipe holder it cannot kill");
+        assert!(!run.success);
+        assert_eq!(run.status_line, "terminated");
+        assert!(run.capture.stderr.contains("output capture abandoned"));
     }
 
     #[cfg(unix)]
