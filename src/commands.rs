@@ -22,6 +22,10 @@ pub const COMMANDS: &[CommandDef] = &[
         arg_kind: ArgKind::None,
     },
     CommandDef {
+        name: "goal",
+        arg_kind: ArgKind::None,
+    },
+    CommandDef {
         name: "model",
         arg_kind: ArgKind::Models,
     },

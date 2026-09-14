@@ -153,7 +153,7 @@ async fn run(continue_last: bool) -> anyhow::Result<()> {
 
     let history_path = paths.history_file();
 
-    let mut resume = None;
+    let mut resume: Option<(Option<few::session::SessionRef>, String, Option<String>)> = None;
     if continue_last {
         match few::session::load_latest(&paths.sessions_dir(), &root) {
             Ok(loaded) => {
@@ -161,7 +161,7 @@ async fn run(continue_last: bool) -> anyhow::Result<()> {
                 if let Some(warning) = skipped_sessions_warning(&loaded.skipped, found_usable) {
                     startup_warnings.push(warning);
                 }
-                let (r, note) = match loaded.session {
+                let (r, note, goal) = match loaded.session {
                     Some((r, sess)) => {
                         let n = sess.messages.len();
                         let saved_prompt_tokens = if sess.model == cfg.model {
@@ -170,14 +170,23 @@ async fn run(continue_last: bool) -> anyhow::Result<()> {
                             0
                         };
                         agent.restore_convo(sess.messages, saved_prompt_tokens);
-                        (Some(r), format!("resumed session · {n} messages restored"))
+                        let goal = sess.goal.clone();
+                        if let Some(ref g) = goal {
+                            agent.set_goal_layer(Some(g.clone()));
+                        }
+                        (
+                            Some(r),
+                            format!("resumed session · {n} messages restored"),
+                            goal,
+                        )
                     }
                     None => (
                         None,
                         "no previous session found for this project - starting fresh".into(),
+                        None,
                     ),
                 };
-                resume = Some((r, note));
+                resume = Some((r, note, goal));
             }
             Err(error) => startup_warnings.push(format!(
                 "could not load previous sessions; starting fresh: {error}"

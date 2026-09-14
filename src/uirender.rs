@@ -92,10 +92,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let input_rows = build_input_rows(app, width.max(4));
     let input_h = input_rows.rows.len().clamp(1, 6) as u16;
-    // two rows while busy: a leading blank separates the live thinking/working
-    // indicator from the transcript above, so the user prompt and the indicator
-    // are clearly spaced instead of crammed onto adjacent lines
-    let busy_rows: u16 = if app.running { 2 } else { 0 };
+    // two rows when we need to show the busy indicator or goal:
+    // - a leading blank separates them from the transcript above
+    // - the indicator/goal line itself
+    let show_busy_or_goal = app.running || app.goal.is_some();
+    let busy_rows: u16 = if show_busy_or_goal { 2 } else { 0 };
     let pal_items = palette_items(app);
     let pal_rows = pal_items
         .as_ref()
@@ -166,14 +167,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(lines), transcript);
 
     if busy_rows > 0 {
-        let mut text = if let Some(t) = app.thinking_since {
-            format!("thinking · {}s", t.elapsed().as_secs())
-        } else {
-            let secs = app.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-            format!("working · {secs}s")
-        };
-        if !app.input.is_empty() {
-            text += " · typed text queued";
+        let mut text = String::new();
+        if app.running {
+            text = if let Some(t) = app.thinking_since {
+                format!("thinking · {}s", t.elapsed().as_secs())
+            } else {
+                let secs = app.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                format!("working · {secs}s")
+            };
+            if !app.input.is_empty() {
+                text += " · typed text queued";
+            }
+        }
+        if let Some(goal) = &app.goal {
+            if !text.is_empty() {
+                text += " · ";
+            }
+            text += &format!("goal: {goal}");
         }
         // leading blank row separates this from the transcript above; the line
         // itself is dim so it reads as transient status, not a log entry

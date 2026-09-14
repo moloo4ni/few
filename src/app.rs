@@ -37,6 +37,7 @@ enum AppMsg {
 struct SessionSaveRequest {
     model: String,
     last_prompt_tokens: u64,
+    goal: Option<String>,
     messages: Vec<Msg>,
 }
 
@@ -87,6 +88,7 @@ pub struct App {
     /// action currently executing, shown in present tense until its final step arrives
     pub(crate) live_step: Option<(String, String)>,
     last_outcome: Option<TaskOutcome>,
+    pub(crate) goal: Option<String>,
     file_index: Arc<Mutex<Vec<String>>>,
     ctl_tx: Option<mpsc::UnboundedSender<Ctl>>,
     app_tx: mpsc::UnboundedSender<AppMsg>,
@@ -105,12 +107,13 @@ impl App {
         memory: Memory,
         history_path: PathBuf,
         sessions_dir: PathBuf,
-        resume: Option<(Option<crate::session::SessionRef>, String)>,
+        resume: Option<(Option<crate::session::SessionRef>, String, Option<String>)>,
         startup_warnings: Vec<String>,
     ) -> Self {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (app_tx, app_rx) = mpsc::unbounded_channel();
-        let initial_session = resume.as_ref().and_then(|(session, _)| session.clone());
+        let initial_session = resume.as_ref().and_then(|(session, _, _)| session.clone());
+        let goal = resume.as_ref().and_then(|(_, _, g)| g.clone());
         let (session_tx, session_worker) = spawn_session_saver(
             sessions_dir.clone(),
             cfg.project_root.clone(),
@@ -164,6 +167,7 @@ impl App {
             final_turn_had_post_prose: false,
             live_step: None,
             last_outcome: None,
+            goal,
             file_index: Arc::new(Mutex::new(Vec::new())),
             ctl_tx: None,
             app_tx,
@@ -172,7 +176,7 @@ impl App {
             ev_tx,
             ev_rx,
         };
-        if let Some((session, note)) = resume {
+        if let Some((session, note, _)) = resume {
             if session.is_some() {
                 app.blocks.push(Block::Resumed(ResumedSession {
                     label: note,
@@ -804,6 +808,23 @@ impl App {
                     );
                 }
             }
+            "/goal" => {
+                if rest.is_empty() {
+                    if let Some(g) = &self.goal {
+                        self.push_notice(format!("goal: {g}"));
+                    } else {
+                        self.push_notice("no goal set".into());
+                    }
+                } else if rest == "clear" {
+                    self.goal = None;
+                    self.agent.set_goal_layer(None);
+                    self.push_notice("goal cleared".into());
+                } else {
+                    self.goal = Some(rest.clone());
+                    self.agent.set_goal_layer(Some(rest.clone()));
+                    self.push_notice(format!("goal: {rest}"));
+                }
+            }
             other => {
                 self.push_notice_level(format!("unknown command: {other}"), NoticeLevel::Error);
             }
@@ -1238,6 +1259,7 @@ impl App {
             let _ = tx.send(SessionSaveRequest {
                 model: self.agent.provider.model_name(),
                 last_prompt_tokens: self.agent.context_tokens(),
+                goal: self.goal.clone(),
                 messages: convo,
             });
         }
@@ -1471,6 +1493,7 @@ fn session_saver_loop(
             &request.model,
             current.as_ref(),
             request.last_prompt_tokens,
+            request.goal,
             request.messages,
         ) {
             Ok(saved) => current = Some(saved),
@@ -1739,6 +1762,7 @@ mod history_escape_tests {
             .send(SessionSaveRequest {
                 model: "m".into(),
                 last_prompt_tokens: 1,
+                goal: None,
                 messages: vec![Msg::user("older")],
             })
             .unwrap();
@@ -1746,6 +1770,7 @@ mod history_escape_tests {
             .send(SessionSaveRequest {
                 model: "m".into(),
                 last_prompt_tokens: 2,
+                goal: None,
                 messages: vec![Msg::user("newer")],
             })
             .unwrap();

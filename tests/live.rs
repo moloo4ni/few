@@ -358,6 +358,7 @@ async fn live_session_resume_restores_provider_context() {
         &model,
         None,
         first.context_tokens(),
+        None,
         first.snapshot_convo(),
     )
     .unwrap();

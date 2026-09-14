@@ -162,6 +162,7 @@ pub struct Agent<P: Provider> {
     sys_env: String,
     sys_project: String,
     sys_memory: Mutex<String>,
+    sys_goal: Mutex<String>,
     sys_mode: Mutex<String>,
     /// actual prompt_tokens from the provider's last reply - the compaction trigger
     last_prompt_tokens: AtomicU64,
@@ -187,6 +188,7 @@ impl<P: Provider> Agent<P> {
             sys_env: env,
             sys_project: project,
             sys_memory: Mutex::new(mem),
+            sys_goal: Mutex::new(String::new()),
             sys_mode: Mutex::new(mode),
             last_prompt_tokens: AtomicU64::new(0),
         }
@@ -229,6 +231,13 @@ impl<P: Provider> Agent<P> {
 
     pub fn set_mode_directive(&self, directive: String) {
         *self.sys_mode.lock().unwrap() = directive;
+    }
+
+    pub fn set_goal_layer(&self, goal: Option<String>) {
+        *self.sys_goal.lock().unwrap() = match goal {
+            Some(text) => format!("## Current goal\n\n{text}"),
+            None => String::new(),
+        };
     }
 
     pub fn refresh_memory_layer(&self) -> Vec<String> {
@@ -277,6 +286,7 @@ impl<P: Provider> Agent<P> {
             self.sys_env.clone(),
             self.sys_project.clone(),
             self.sys_memory.lock().unwrap().clone(),
+            self.sys_goal.lock().unwrap().clone(),
             self.sys_mode.lock().unwrap().clone(),
         ]);
         let mut out = Vec::with_capacity(self.convo.lock().unwrap().len() + 1);

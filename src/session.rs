@@ -30,6 +30,10 @@ pub struct Session {
     /// Added compatibly to v1: older session files deserialize this as zero.
     #[serde(default)]
     pub last_prompt_tokens: u64,
+    /// Per-session goal: injected into system prompt as "Current goal" layer.
+    /// Added compatibly to v1: older session files deserialize this as None.
+    #[serde(default)]
+    pub goal: Option<String>,
     pub messages: Vec<Msg>,
 }
 
@@ -89,6 +93,7 @@ pub fn save(
     model: &str,
     prev: Option<&SessionRef>,
     last_prompt_tokens: u64,
+    goal: Option<String>,
     messages: Vec<Msg>,
 ) -> anyhow::Result<SessionRef> {
     crate::fsutil::ensure_private_dir(dir)?;
@@ -117,6 +122,7 @@ pub fn save(
         project_root: project_root.to_path_buf(),
         model: model.to_owned(),
         last_prompt_tokens,
+        goal,
         messages,
     };
     let path = dir.join(format!("{id}.json"));
@@ -247,13 +253,14 @@ mod tests {
         let root = dir.join("proj");
         std::fs::create_dir_all(&root).unwrap();
 
-        let first = save(&dir, &root, "m1", None, 120, vec![Msg::user("hi")]).unwrap();
+        let first = save(&dir, &root, "m1", None, 120, None, vec![Msg::user("hi")]).unwrap();
         let second = save(
             &dir,
             &root,
             "m1",
             Some(&first),
             240,
+            None,
             vec![Msg::user("hi"), Msg::assistant("hello")],
         )
         .unwrap();
@@ -271,7 +278,7 @@ mod tests {
         let root = dir.join("proj");
         std::fs::create_dir_all(&root).unwrap();
 
-        let r = save(&dir, &root, "qwen3:8b", None, 321, sample_convo()).unwrap();
+        let r = save(&dir, &root, "qwen3:8b", None, 321, None, sample_convo()).unwrap();
         let (_, loaded) = load_latest(&dir, &root).unwrap().session.unwrap();
         assert_eq!(loaded.messages.len(), 4);
         assert_eq!(loaded.model, "qwen3:8b");
@@ -294,7 +301,16 @@ mod tests {
         let root = dir.join("proj");
         let sessions = dir.join("sessions");
         std::fs::create_dir_all(&root).unwrap();
-        let saved = save(&sessions, &root, "m", None, 0, vec![Msg::user("private")]).unwrap();
+        let saved = save(
+            &sessions,
+            &root,
+            "m",
+            None,
+            0,
+            None,
+            vec![Msg::user("private")],
+        )
+        .unwrap();
         let path = sessions.join(format!("{}.json", saved.id));
 
         assert_eq!(
@@ -322,6 +338,7 @@ mod tests {
             project_root: root,
             model: "m".into(),
             last_prompt_tokens: 77,
+            goal: None,
             messages: vec![Msg::user("hello")],
         };
         let mut value = serde_json::to_value(session).unwrap();
@@ -342,9 +359,9 @@ mod tests {
         std::fs::create_dir_all(&root_a).unwrap();
         std::fs::create_dir_all(&root_b).unwrap();
 
-        save(&dir, &root_a, "m", None, 0, vec![Msg::user("in a")]).unwrap();
+        save(&dir, &root_a, "m", None, 0, None, vec![Msg::user("in a")]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        save(&dir, &root_b, "m", None, 0, vec![Msg::user("in b")]).unwrap();
+        save(&dir, &root_b, "m", None, 0, None, vec![Msg::user("in b")]).unwrap();
 
         let (_, la) = load_latest(&dir, &root_a).unwrap().session.unwrap();
         assert_eq!(la.messages[0].content, "in a");
@@ -376,7 +393,7 @@ mod tests {
         let dir = temp_dir("malformed");
         let root = dir.join("project");
         std::fs::create_dir_all(&root).unwrap();
-        save(&dir, &root, "m", None, 0, vec![Msg::user("usable")]).unwrap();
+        save(&dir, &root, "m", None, 0, None, vec![Msg::user("usable")]).unwrap();
         std::fs::write(dir.join("z-newer.json"), "not json").unwrap();
 
         let loaded = load_latest(&dir, &root).unwrap();
@@ -410,7 +427,16 @@ mod tests {
 
         for i in 0..(MAX_SESSIONS + 5) {
             std::thread::sleep(std::time::Duration::from_millis(2));
-            save(&dir, &root, "m", None, 0, vec![Msg::user(format!("t{i}"))]).unwrap();
+            save(
+                &dir,
+                &root,
+                "m",
+                None,
+                0,
+                None,
+                vec![Msg::user(format!("t{i}"))],
+            )
+            .unwrap();
         }
         let files = list_session_files(&dir).unwrap();
         assert_eq!(files.len(), MAX_SESSIONS);
