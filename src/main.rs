@@ -26,7 +26,7 @@ const HELP: &str = concat!(
     "Options:\n",
     "  -c, --continue  Resume the latest session for this project\n",
     "  -h, --help      Print help\n",
-    "  -V, --version   Print version\n",
+    "  -v, --version   Print version\n",
 );
 
 fn parse_startup(args: impl IntoIterator<Item = OsString>) -> Result<Startup, String> {
@@ -39,7 +39,7 @@ fn parse_startup(args: impl IntoIterator<Item = OsString>) -> Result<Startup, St
         match arg {
             "-c" | "--continue" => continue_last = true,
             "-h" | "--help" => set_terminal(&mut terminal, Startup::Help)?,
-            "-V" | "--version" => set_terminal(&mut terminal, Startup::Version)?,
+            "-v" | "-V" | "--version" => set_terminal(&mut terminal, Startup::Version)?,
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -246,6 +246,7 @@ mod tests {
         assert_eq!(parse(&["--help"]), Ok(Startup::Help));
         assert_eq!(parse(&["-h"]), Ok(Startup::Help));
         assert_eq!(parse(&["--version"]), Ok(Startup::Version));
+        assert_eq!(parse(&["-v"]), Ok(Startup::Version));
         assert_eq!(parse(&["-V"]), Ok(Startup::Version));
     }
 

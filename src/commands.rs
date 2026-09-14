@@ -14,6 +14,10 @@ pub struct CommandDef {
 
 pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
+        name: "continue",
+        arg_kind: ArgKind::None,
+    },
+    CommandDef {
         name: "exit",
         arg_kind: ArgKind::None,
     },

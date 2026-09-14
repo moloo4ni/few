@@ -86,6 +86,7 @@ pub struct App {
     final_turn_had_post_prose: bool,
     /// action currently executing, shown in present tense until its final step arrives
     pub(crate) live_step: Option<(String, String)>,
+    last_outcome: Option<TaskOutcome>,
     file_index: Arc<Mutex<Vec<String>>>,
     ctl_tx: Option<mpsc::UnboundedSender<Ctl>>,
     app_tx: mpsc::UnboundedSender<AppMsg>,
@@ -162,6 +163,7 @@ impl App {
             last_said: None,
             final_turn_had_post_prose: false,
             live_step: None,
+            last_outcome: None,
             file_index: Arc::new(Mutex::new(Vec::new())),
             ctl_tx: None,
             app_tx,
@@ -791,6 +793,17 @@ impl App {
                 "edit persistent" => self.memory_edit(MemLevel::Persistent),
                 _ => self.input.set_text("/memory "),
             },
+            "/continue" => {
+                if self.running {
+                    self.push_notice("a task is already running".into());
+                } else if matches!(self.last_outcome, Some(TaskOutcome::ProviderError(_))) {
+                    self.continue_task();
+                } else {
+                    self.push_notice(
+                        "nothing to continue — the last task completed normally".into(),
+                    );
+                }
+            }
             other => {
                 self.push_notice_level(format!("unknown command: {other}"), NoticeLevel::Error);
             }
@@ -1033,6 +1046,7 @@ impl App {
         self.promote_final_narration();
         self.finish_steps_group(&outcome);
 
+        self.last_outcome = Some(outcome.clone());
         self.last_said = None;
         self.final_turn_had_post_prose = false;
         self.thinking_since = None;
@@ -1192,7 +1206,25 @@ impl App {
         let agent = Arc::clone(&self.agent);
         let ev = self.ev_tx.clone();
         tokio::spawn(async move {
-            let outcome: TaskOutcome = agent.run(text, ev, ctl_rx).await;
+            let outcome: TaskOutcome = agent.run(Some(text), ev, ctl_rx).await;
+            let _ = outcome;
+        });
+    }
+
+    fn continue_task(&mut self) {
+        self.push_notice("continuing from provider error".into());
+        let gi = self.create_steps_group();
+        self.steps_group_idx = Some(gi);
+        self.running = true;
+        self.started_at = Some(Instant::now());
+        self.scroll_from_end = 0;
+
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        self.ctl_tx = Some(ctl_tx);
+        let agent = Arc::clone(&self.agent);
+        let ev = self.ev_tx.clone();
+        tokio::spawn(async move {
+            let outcome: TaskOutcome = agent.run(None, ev, ctl_rx).await;
             let _ = outcome;
         });
     }

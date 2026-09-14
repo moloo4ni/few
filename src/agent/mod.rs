@@ -508,7 +508,7 @@ impl<P: Provider> Agent<P> {
 
     pub async fn run(
         &self,
-        task_text: String,
+        task_text: Option<String>,
         ev: mpsc::UnboundedSender<AgentEvent>,
         ctl_rx: mpsc::UnboundedReceiver<Ctl>,
     ) -> TaskOutcome {
@@ -525,7 +525,9 @@ impl<P: Provider> Agent<P> {
             wrote_since_user: false,
         };
 
-        self.push_convo(Msg::user(task_text));
+        if let Some(text) = task_text {
+            self.push_convo(Msg::user(text));
+        }
 
         let verify_plan =
             verify::resolve_verify(self.cfg.verify_command.as_deref(), &self.cfg.project_root);
@@ -801,7 +803,7 @@ mod tests {
         );
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        let run = agent.run("stop while waiting".into(), event_tx, control_rx);
+        let run = agent.run(Some("stop while waiting".into()), event_tx, control_rx);
         tokio::pin!(run);
 
         tokio::select! {
@@ -846,7 +848,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            agent.run("stop before request".into(), event_tx, control_rx),
+            agent.run(Some("stop before request".into()), event_tx, control_rx),
         )
         .await
         .expect("queued hard abort must not wait for the provider");
@@ -881,7 +883,7 @@ mod tests {
         let agent = Agent::new(prov, test_cfg(&root), perms, mem, Default::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_ttx, trx) = mpsc::unbounded_channel();
-        let outcome = agent.run("show a.txt".into(), tx, trx).await;
+        let outcome = agent.run(Some("show a.txt".into()), tx, trx).await;
         assert_eq!(outcome, TaskOutcome::Done);
 
         let mut events = Vec::new();
@@ -948,8 +950,10 @@ mod tests {
                     wait_for_shell(&root).await;
                     control_tx.send(Ctl::HardAbort).unwrap();
                 };
-                let (outcome, ()) =
-                    tokio::join!(agent.run("run".into(), event_tx, control_rx), interrupt);
+                let (outcome, ()) = tokio::join!(
+                    agent.run(Some("run".into()), event_tx, control_rx),
+                    interrupt
+                );
                 outcome
             })
             .await;
@@ -1011,8 +1015,10 @@ mod tests {
                 control_tx.send(Ctl::SoftInterrupt { ack }).unwrap();
                 received.await.unwrap();
             };
-            let (outcome, ()) =
-                tokio::join!(agent.run("run".into(), event_tx, control_rx), interrupt);
+            let (outcome, ()) = tokio::join!(
+                agent.run(Some("run".into()), event_tx, control_rx),
+                interrupt
+            );
             outcome
         })
         .await;
@@ -1061,7 +1067,7 @@ mod tests {
                 received.await.unwrap();
             };
             let (outcome, ()) = tokio::join!(
-                agent.run("write and verify".into(), event_tx, control_rx),
+                agent.run(Some("write and verify".into()), event_tx, control_rx),
                 interrupt
             );
             outcome
@@ -1145,7 +1151,7 @@ mod tests {
         );
         let (tx, _rx) = mpsc::unbounded_channel();
         let (_ttx, trx) = mpsc::unbounded_channel();
-        let outcome = agent.run("make hello.txt".into(), tx, trx).await;
+        let outcome = agent.run(Some("make hello.txt".into()), tx, trx).await;
         assert_eq!(outcome, TaskOutcome::Done);
         assert_eq!(
             std::fs::read_to_string(root.join("hello.txt")).unwrap(),
@@ -1179,7 +1185,9 @@ mod tests {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel();
 
-        let outcome = agent.run("write both files".into(), ev_tx, ctl_rx).await;
+        let outcome = agent
+            .run(Some("write both files".into()), ev_tx, ctl_rx)
+            .await;
 
         assert_eq!(outcome, TaskOutcome::GaveUpSteps);
         assert!(root.join("first.txt").is_file());
@@ -1239,7 +1247,9 @@ mod tests {
             let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel();
 
             assert_eq!(
-                agent.run("write and verify".into(), ev_tx, ctl_rx).await,
+                agent
+                    .run(Some("write and verify".into()), ev_tx, ctl_rx)
+                    .await,
                 expected
             );
             assert_eq!(marker.exists(), verify_runs);
@@ -1271,7 +1281,7 @@ mod tests {
         let (_ttx, trx) = mpsc::unbounded_channel();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            agent.run("run the granted command".into(), tx, trx),
+            agent.run(Some("run the granted command".into()), tx, trx),
         )
         .await
         .expect("a persisted grant must avoid waiting for permission");
@@ -1305,7 +1315,7 @@ mod tests {
         let agent = Agent::new(prov, Arc::new(cfg), perms, mem, Default::default());
         let (tx, _rx) = mpsc::unbounded_channel();
         let (_ttx, trx) = mpsc::unbounded_channel();
-        let outcome = agent.run("do it".into(), tx, trx).await;
+        let outcome = agent.run(Some("do it".into()), tx, trx).await;
         assert_eq!(outcome, TaskOutcome::GaveUpRepeated);
         let notes = agent
             .snapshot_convo()
@@ -1345,7 +1355,7 @@ mod tests {
         let agent = Agent::new(prov, Arc::new(cfg), perms, mem, Default::default());
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-        let run = agent.run("do it".into(), ev_tx, ctl_rx);
+        let run = agent.run(Some("do it".into()), ev_tx, ctl_rx);
         tokio::pin!(run);
         let mut permission_prompts = 0;
         let outcome = loop {
@@ -1400,7 +1410,7 @@ mod tests {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         assert_eq!(
-            agent.run("do it".into(), ev_tx, ctl_rx).await,
+            agent.run(Some("do it".into()), ev_tx, ctl_rx).await,
             TaskOutcome::Done
         );
         assert!(marker.exists(), "granted verify command must execute");
@@ -1430,7 +1440,7 @@ mod tests {
         let agent = Agent::new(prov, test_cfg(&root), perms, mem, Default::default());
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-        let run = agent.run("do it".into(), ev_tx, ctl_rx);
+        let run = agent.run(Some("do it".into()), ev_tx, ctl_rx);
         tokio::pin!(run);
         let mut permission_prompts = 0;
         let outcome = loop {
@@ -1463,7 +1473,7 @@ mod tests {
         let agent = Agent::new(prov, test_cfg(&root), perms, mem, Default::default());
         let (tx, _rx) = mpsc::unbounded_channel();
         let (_ttx, trx) = mpsc::unbounded_channel();
-        let outcome = agent.run("fix".into(), tx, trx).await;
+        let outcome = agent.run(Some("fix".into()), tx, trx).await;
         assert_eq!(outcome, TaskOutcome::Done);
         assert!(agent
             .snapshot_convo()

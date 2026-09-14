@@ -182,7 +182,8 @@ async fn live_agent_completes_file_task() {
     let task = "In the project directory, create hello.txt containing exactly one line: \
                 hi from few. Verify by reading it back, then finish.";
     let runner = Arc::clone(&agent);
-    let handle = tokio::spawn(async move { runner.run(task.to_owned(), ev_tx, ctl_rx).await });
+    let handle =
+        tokio::spawn(async move { runner.run(Some(task.to_owned()), ev_tx, ctl_rx).await });
 
     let collector = tokio::spawn(drain_events(
         ev_rx,
@@ -258,12 +259,12 @@ async fn live_verify_gives_up_on_repeated_failure() {
     let runner = Arc::clone(&agent);
     let handle = tokio::spawn(async move {
         runner
-            .run(
+            .run(Some(
                 "Create note.txt containing the word ok. The configured verification command is \
                  intentionally guaranteed to fail. After each verification failure, overwrite \
                  note.txt with ok again and finish immediately; do not investigate the command \
                  or project. Few must stop the repeated failures at its retry threshold."
-                    .to_owned(),
+                    .to_owned()),
                 ev_tx,
                 ctl_rx,
             )
@@ -335,9 +336,9 @@ async fn live_session_resume_restores_provider_context() {
     let runner = Arc::clone(&first);
     let handle = tokio::spawn(async move {
         runner
-            .run(
+            .run(Some(
                 "Remember the exact code phrase cobalt-orchid for the next turn. Reply only: remembered."
-                    .into(),
+                    .into()),
                 ev_tx,
                 ctl_rx,
             )
@@ -378,16 +379,17 @@ async fn live_session_resume_restores_provider_context() {
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let runner = Arc::clone(&resumed);
-    let handle = tokio::spawn(async move {
-        runner
-            .run(
+    let handle =
+        tokio::spawn(async move {
+            runner
+            .run(Some(
                 "Without using tools, reply with the exact code phrase from the previous turn."
-                    .into(),
+                    .into()),
                 ev_tx,
                 ctl_rx,
             )
             .await
-    });
+        });
     let collector = tokio::spawn(drain_events(
         ev_rx,
         ctl_tx,
@@ -457,7 +459,7 @@ async fn live_context_compaction_continues_after_notice() {
     let handle = tokio::spawn(async move {
         runner
             .run(
-                "Read compact.txt with the read tool, then report its exact content.".into(),
+                Some("Read compact.txt with the read tool, then report its exact content.".into()),
                 ev_tx,
                 ctl_rx,
             )
