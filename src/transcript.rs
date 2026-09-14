@@ -79,11 +79,18 @@ pub const PERM_OPTIONS: [&str; 4] = [
 pub enum Block {
     User(String),
     Assistant(String),
-    Notice { text: String, level: NoticeLevel },
+    Notice {
+        text: String,
+        level: NoticeLevel,
+    },
     Steps(StepsGroup),
     Remembered(String),
     PermAsk(PermAskBlock),
-    MemoryView { label: String, text: String, expanded: bool },
+    MemoryView {
+        label: String,
+        text: String,
+        expanded: bool,
+    },
     Resumed(ResumedSession),
 }
 

@@ -217,7 +217,8 @@ fn render_status(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     );
     // Compute the budget for the model name from the actual rendered content
     // so there is no magic number that drifts when a label changes.
-    let fixed_width = "model: ".len() + 4 + "mode: ".len() + mode.len() + 4 + "ctx:".len() + ctx.len();
+    let fixed_width =
+        "model: ".len() + 4 + "mode: ".len() + mode.len() + 4 + "ctx:".len() + ctx.len();
     let budget = (area.width as usize).saturating_sub(fixed_width);
     let name = truncate_to(&app.model_name, budget);
     let spans = vec![
