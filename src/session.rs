@@ -134,6 +134,24 @@ pub fn save(
     Ok(SessionRef { id, created_at_ms })
 }
 
+/// Load all sessions from the directory, newest first.
+pub fn list_all_sessions(dir: &Path) -> anyhow::Result<Vec<Session>> {
+    let files = list_session_files(dir)?;
+    let mut sessions = Vec::new();
+    for path in files.iter().rev() {
+        if let Ok(session) = read_session(path) {
+            sessions.push(session);
+        }
+    }
+    Ok(sessions)
+}
+
+/// Load a session by its id.
+pub fn load_by_id(dir: &Path, id: &str) -> anyhow::Result<Session> {
+    let path = dir.join(format!("{id}.json"));
+    read_session(&path)
+}
+
 /// Load the most recent session belonging to `project_root`.
 pub fn load_latest(dir: &Path, project_root: &Path) -> anyhow::Result<LatestSession> {
     let mut files = list_session_files(dir)?;

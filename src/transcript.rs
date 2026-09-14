@@ -47,18 +47,6 @@ pub struct StepsGroup {
     pub outcome: Option<TaskOutcome>,
 }
 
-pub enum ResumedItem {
-    User(String),
-    Assistant(String),
-    Step(String),
-}
-
-pub struct ResumedSession {
-    pub label: String,
-    pub items: Vec<ResumedItem>,
-    pub expanded: bool,
-}
-
 pub struct PermAskBlock {
     pub id: u64,
     pub verb: String,
@@ -91,7 +79,6 @@ pub enum Block {
         text: String,
         expanded: bool,
     },
-    Resumed(ResumedSession),
 }
 
 impl StepBlock {

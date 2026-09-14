@@ -5,13 +5,12 @@ use crate::inputline::InputState;
 use crate::memory::{MemLevel, Memory};
 use crate::perms::{Grant, Mode, PermEngine};
 use crate::providers::openai::{ModelList, OpenAiProvider};
-use crate::providers::{Msg, Provider as _, Role, ToolCall};
+use crate::providers::{Msg, Provider as _};
 use crate::sysprompt;
 use crate::tools::Ctl;
 
 use crate::transcript::{
-    Block, Expand, Hit, PermAskBlock, ResumedItem, ResumedSession, StepBlock, StepItem, StepsGroup,
-    PERM_OPTIONS,
+    Block, Expand, Hit, PermAskBlock, StepBlock, StepItem, StepsGroup, PERM_OPTIONS,
 };
 use crate::ui_text::clean;
 use crate::uirender;
@@ -176,16 +175,8 @@ impl App {
             ev_tx,
             ev_rx,
         };
-        if let Some((session, note, _)) = resume {
-            if session.is_some() {
-                app.blocks.push(Block::Resumed(ResumedSession {
-                    label: note,
-                    items: resumed_items(&app.agent.snapshot_convo()),
-                    expanded: false,
-                }));
-            } else {
-                app.push_notice(note);
-            }
+        if let Some((_session, note, _)) = resume {
+            app.push_notice(note);
         }
         for warning in history_warning.into_iter().chain(startup_warnings) {
             app.push_notice_level(warning, NoticeLevel::Warn);
@@ -310,9 +301,6 @@ impl App {
                             None
                         }
                     }
-                    Hit::Block(bi) if matches!(self.blocks.get(bi), Some(Block::Resumed(_))) => {
-                        Some((bi, usize::MAX))
-                    }
                     _ => None,
                 });
             }
@@ -363,7 +351,6 @@ impl App {
             Hit::Block(bi) => {
                 self.focus = Some((bi, usize::MAX));
                 match self.blocks.get_mut(bi) {
-                    Some(Block::Resumed(resumed)) => resumed.expanded = !resumed.expanded,
                     Some(Block::MemoryView { expanded, .. }) => *expanded = !*expanded,
                     _ => {}
                 }
@@ -395,7 +382,7 @@ impl App {
                         }
                     }
                 }
-                Block::Resumed(_) | Block::MemoryView { .. } => out.push((bi, usize::MAX)),
+                Block::MemoryView { .. } => out.push((bi, usize::MAX)),
                 // Explicitly non-navigable; a new Block variant must make
                 // this decision here rather than inherit a wildcard default.
                 Block::User(_)
@@ -454,10 +441,6 @@ impl App {
                 }
                 None => false,
             },
-            Some(Block::Resumed(resumed)) if si == usize::MAX => {
-                resumed.expanded = !resumed.expanded;
-                true
-            }
             Some(Block::MemoryView { expanded, .. }) if si == usize::MAX => {
                 *expanded = !*expanded;
                 true
@@ -1293,49 +1276,6 @@ fn parse_mode(s: &str) -> Option<Mode> {
     }
 }
 
-fn resumed_items(messages: &[Msg]) -> Vec<ResumedItem> {
-    let mut items = Vec::new();
-    for msg in messages {
-        match msg.role {
-            Role::User if !msg.content.starts_with("[few ") => {
-                let text = clean(&msg.content);
-                if !text.trim().is_empty() {
-                    items.push(ResumedItem::User(text));
-                }
-            }
-            Role::Assistant => {
-                let text = clean(&msg.content);
-                if !text.trim().is_empty() {
-                    items.push(ResumedItem::Assistant(text));
-                }
-                for call in &msg.tool_calls {
-                    items.push(ResumedItem::Step(clean(&resumed_tool_label(call))));
-                }
-            }
-            Role::System | Role::Tool | Role::User => {}
-        }
-    }
-    items
-}
-
-fn resumed_tool_label(call: &ToolCall) -> String {
-    let arg = call.primary_arg();
-    let verb = match call.name.as_str() {
-        "read" => "read",
-        "write" if call.arguments.get("delete").and_then(|v| v.as_bool()) == Some(true) => {
-            "deleted"
-        }
-        "write" | "edit" => "wrote",
-        "shell" => "ran",
-        other => other,
-    };
-    if arg.is_empty() {
-        verb.to_owned()
-    } else {
-        format!("{verb} {arg}")
-    }
-}
-
 /// If a step mutates a known memory file, return the recorded `- fact`
 /// lines so they can be shown as `remembered:` entries instead of a generic
 /// write/edit step. Every added fact line is surfaced - the diff already
@@ -1681,40 +1621,6 @@ mod history_escape_tests {
         assert!(!operated.get());
         assert!(resumed.get());
         assert_eq!(error.to_string(), "suspend failed");
-    }
-
-    #[test]
-    fn resumed_history_keeps_dialogue_and_summarizes_tools() {
-        let messages = vec![
-            Msg::user("Create hello.py"),
-            Msg {
-                role: Role::Assistant,
-                tool_calls: vec![
-                    ToolCall::parse(
-                        "w1".into(),
-                        "write".into(),
-                        r#"{"path":"hello.py","content":"print('hi')"}"#.into(),
-                    ),
-                    ToolCall::parse(
-                        "s1".into(),
-                        "shell".into(),
-                        r#"{"command":"python3 hello.py"}"#.into(),
-                    ),
-                ],
-                ..Default::default()
-            },
-            Msg::tool_result("w1", "write", "large raw output is omitted"),
-            Msg::tool_result("s1", "shell", "hi"),
-            Msg::assistant("Done."),
-            Msg::user("[few verify] internal feedback"),
-        ];
-
-        let items = resumed_items(&messages);
-        assert_eq!(items.len(), 4);
-        assert!(matches!(&items[0], ResumedItem::User(s) if s == "Create hello.py"));
-        assert!(matches!(&items[1], ResumedItem::Step(s) if s == "wrote hello.py"));
-        assert!(matches!(&items[2], ResumedItem::Step(s) if s == "ran python3 hello.py"));
-        assert!(matches!(&items[3], ResumedItem::Assistant(s) if s == "Done."));
     }
 
     #[cfg(unix)]

@@ -3,10 +3,7 @@ use crate::app::{label_mode, App};
 use crate::commands::{arg_options, filter_commands, find_command};
 use crate::markdown::{self, MarkdownLine};
 use crate::theme;
-use crate::transcript::{
-    Block, Expand, Hit, PermAskBlock, ResumedItem, ResumedSession, StepItem, StepsGroup,
-    PERM_OPTIONS,
-};
+use crate::transcript::{Block, Expand, Hit, PermAskBlock, StepItem, StepsGroup, PERM_OPTIONS};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -512,13 +509,6 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
             Block::Assistant(text) => {
                 push_markdown_text(&mut rows, text, width, Hit::Nothing, 0);
             }
-            Block::Resumed(resumed) => render_resumed(
-                &mut rows,
-                resumed,
-                bi,
-                width,
-                app.focus == Some((bi, usize::MAX)),
-            ),
             Block::Steps(group) => render_steps(&mut rows, group, bi, width, cap, app.focus),
             Block::Notice { text, level } => {
                 let style = match level {
@@ -581,35 +571,6 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
     }
 
     rows
-}
-
-fn render_resumed(
-    rows: &mut Vec<(Vec<Seg>, Hit)>,
-    resumed: &ResumedSession,
-    block_idx: usize,
-    width: usize,
-    focused: bool,
-) {
-    let marker = if resumed.expanded { 'v' } else { '>' };
-    push_wrapped_text(
-        rows,
-        &format!("{marker} {}", resumed.label),
-        focus_style(theme::dim(), focused),
-        width,
-        Hit::Block(block_idx),
-    );
-    if !resumed.expanded {
-        return;
-    }
-    for item in &resumed.items {
-        match item {
-            ResumedItem::User(text) => {
-                push_nested_user_prompt(rows, text, theme::normal(), width, 2)
-            }
-            ResumedItem::Assistant(text) => push_markdown_text(rows, text, width, Hit::Nothing, 2),
-            ResumedItem::Step(text) => push_indented(rows, text, theme::dim(), width, 2),
-        }
-    }
 }
 
 fn render_steps(
@@ -963,25 +924,6 @@ fn push_user_prompt(rows: &mut Vec<(Vec<Seg>, Hit)>, text: &str, style: Style, w
     }
 }
 
-fn push_nested_user_prompt(
-    rows: &mut Vec<(Vec<Seg>, Hit)>,
-    text: &str,
-    style: Style,
-    width: usize,
-    indent: usize,
-) {
-    let prefix = indent + 2;
-    let inner = width.saturating_sub(prefix).max(1);
-    let wrapped = wrap_segments(&[(text.to_owned(), style)], inner);
-    for (i, segs) in wrapped.iter().enumerate() {
-        let mut row = vec![(
-            format!("{}{}", " ".repeat(indent), if i == 0 { "> " } else { "  " }),
-            style,
-        )];
-        row.extend(segs.iter().cloned());
-        rows.push((row, Hit::Nothing));
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -994,7 +936,7 @@ mod tests {
     use crate::perms::{Mode, PermEngine, Policy};
     use crate::providers::openai::OpenAiProvider;
     use crate::transcript::{
-        PermAskBlock, ResumedItem, ResumedSession, StepBlock, StepItem, StepsGroup,
+        PermAskBlock, StepBlock, StepItem, StepsGroup,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -1626,49 +1568,6 @@ mod tests {
             },
             _ => panic!("expected steps block"),
         }
-    }
-
-    #[test]
-    fn resumed_session_is_collapsed_then_reveals_history() {
-        let mut app = test_app("resume-block");
-        app.blocks.push(Block::Resumed(ResumedSession {
-            label: "resumed session · 4 messages restored".into(),
-            items: vec![
-                ResumedItem::User("Create hello.py".into()),
-                ResumedItem::Step("wrote hello.py".into()),
-                ResumedItem::Assistant("Done.".into()),
-            ],
-            expanded: false,
-        }));
-
-        let collapsed = build_rows(&app, 60)
-            .into_iter()
-            .map(|(row, _)| row.into_iter().map(|(s, _)| s).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(collapsed.contains("> resumed session · 4 messages restored"));
-        assert!(!collapsed.contains("Create hello.py"));
-
-        render(&mut app, 60, 14);
-        let row = app
-            .hitmap
-            .iter()
-            .position(|hit| *hit == Hit::Block(0))
-            .unwrap();
-        app.on_click(row as u16);
-        let expanded = build_rows(&app, 60)
-            .into_iter()
-            .map(|(row, _)| row.into_iter().map(|(s, _)| s).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(expanded.contains("v resumed session · 4 messages restored"));
-        assert!(expanded.contains("  > Create hello.py"));
-        assert!(expanded.contains("  wrote hello.py"));
-        assert!(expanded.contains("  Done."));
-        insta::assert_snapshot!(
-            "resumed_session_expanded",
-            render(&mut app, 60, 14).join("\n")
-        );
     }
 
     #[test]
