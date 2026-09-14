@@ -1,11 +1,9 @@
 # Few
 
-An autonomous terminal agent: analyzes the task, explores the project, runs tools,
-edits files, executes commands, verifies results, and carries the work to completion -
-without step-by-step hand-holding.
+An autonomous coding agent that runs in the terminal. Give it a task — it reads
+the project, edits files, runs commands, verifies results, and finishes the job.
 
-Not a shell or a customization of an existing tool - a standalone agent with its own
-architecture and interface.
+Rust, single binary, four tools, bring your own model.
 
 ## Status
 
@@ -174,13 +172,11 @@ zero; `compact_threshold` must be finite and in the range `(0..1)` (both
 bounds are exclusive). Invalid values stop startup with an explanatory error.
 
 On Unix, a hard abort terminates the task and sends `SIGKILL` to the shell's
-process group, including background children still in that group. Interruption
-remains available if the shell exits while those children hold output pipes open.
-If output pipes remain open two seconds after the forced kill (for example,
-because a descendant left the group), the run stops waiting on them, discards
-unfinished captures, and reports that output capture was abandoned.
-Interrupting the verify command leaves verification pending
-rather than reporting a failure the command never produced.
+process group, including background children still in that group. If the shell
+exits while background children hold the output pipes open, the run waits up to
+two seconds for them to close; after that it marks the capture as incomplete and
+preserves whatever was already captured. Interrupting the verify command leaves
+verification pending rather than reporting a failure the command never produced.
 
 State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
 `~/.local/state` where available) and never inside a project directory - except explicitly
@@ -204,8 +200,8 @@ Before considering a change complete, run:
 
 ```sh
 cargo fmt
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 git diff --check
 ```

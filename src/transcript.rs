@@ -83,7 +83,7 @@ pub enum Block {
     Steps(StepsGroup),
     Remembered(String),
     PermAsk(PermAskBlock),
-    MemoryView { text: String },
+    MemoryView { label: String, text: String, expanded: bool },
     Resumed(ResumedSession),
 }
 

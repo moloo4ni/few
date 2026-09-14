@@ -1,6 +1,7 @@
 use crate::diffgen::{self, DiffLine};
 use serde_json::json;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -83,12 +84,70 @@ pub struct OutputCapture {
     pub total_bytes: usize,
     pub truncated_from: Option<usize>,
     pub killed: bool,
+    /// The pipes stayed open after the run had nothing left to wait for, so
+    /// capture stopped early and this output may be incomplete.
+    pub abandoned: bool,
 }
 
 pub struct ShellRun {
-    pub success: bool,
-    pub status_line: String,
+    pub outcome: ShellOutcome,
     pub capture: OutputCapture,
+}
+
+/// How a shell run ended.
+///
+/// The single source for the run's verdict: `success`, `interrupted` and
+/// `status_line` all derive from it, so they cannot drift apart. Keeping them as
+/// separate fields is what let the two call sites disagree about which of them
+/// decides the step verb.
+pub enum ShellOutcome {
+    /// The shell reported its own exit status.
+    Exited(std::process::ExitStatus),
+    /// The user stopped the run. A stopped run keeps this outcome even if the
+    /// shell had already exited 0 before the signal landed. `hard` separates a
+    /// hard abort from a soft interrupt, which escalates SIGTERM -> SIGKILL on
+    /// its own and so is still "soft" once it reaches SIGKILL.
+    Stopped { hard: bool },
+    /// The run gave up before it ever saw an exit status. A shell that left its
+    /// own process group never receives the kill, so no status would arrive.
+    NoStatus,
+    /// The shell could not be started, or waiting on it failed. Unlike the
+    /// cases above this is a real failure and is reported to the model as one.
+    Broken(String),
+}
+
+impl ShellRun {
+    /// The command itself reported success.
+    pub fn success(&self) -> bool {
+        matches!(self.outcome, ShellOutcome::Exited(status) if status.success())
+    }
+
+    /// The run ended for a reason of its own rather than on the command's
+    /// verdict, so callers must not render it as "failed" or report it to the
+    /// model as a real failure.
+    pub fn interrupted(&self) -> bool {
+        matches!(
+            self.outcome,
+            ShellOutcome::Stopped { .. } | ShellOutcome::NoStatus
+        )
+    }
+
+    /// The user stopped the run with a soft interrupt rather than a hard abort.
+    /// A hard abort ends the whole task, so only the soft case needs the note
+    /// the agent carries to the next turn boundary.
+    pub fn stopped_softly(&self) -> bool {
+        matches!(self.outcome, ShellOutcome::Stopped { hard: false })
+    }
+
+    pub fn status_line(&self) -> String {
+        match &self.outcome {
+            ShellOutcome::Exited(status) => exit_status_line(*status),
+            ShellOutcome::Stopped { hard: true } => "terminated".to_owned(),
+            ShellOutcome::Stopped { hard: false } => "^C process killed".to_owned(),
+            ShellOutcome::NoStatus => "abandoned".to_owned(),
+            ShellOutcome::Broken(message) => message.clone(),
+        }
+    }
 }
 
 fn resolve(root: &std::path::Path, arg: &str) -> std::path::PathBuf {
@@ -304,11 +363,14 @@ const PIPE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 const PIPE_DRAIN_FAST_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
 /// How long a soft interrupt waits for SIGTERM before escalating to SIGKILL.
 const SOFT_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-/// How long a forced kill waits for inherited pipes to close before the run
-/// stops waiting on them.
+/// How long the run waits for inherited pipes to close once it has nothing left
+/// to wait for - the shell exited, or a forced kill failed to close them.
 const PIPE_ABANDON_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-const ABANDONED_NOTE: &str =
-    "(output capture abandoned: pipes remained open after forced termination; unfinished captures were discarded)\n";
+/// When the abandon grace expires, measured from the moment the run had nothing
+/// left to wait for.
+fn abandon_at() -> std::time::Instant {
+    std::time::Instant::now() + PIPE_ABANDON_GRACE
+}
 
 #[derive(Default)]
 struct PipeCapture {
@@ -316,15 +378,24 @@ struct PipeCapture {
     total_bytes: usize,
 }
 
-async fn drain(pipe: impl tokio::io::AsyncRead + Unpin, retain_limit: usize) -> PipeCapture {
+/// Read a pipe into a shared buffer until it closes.
+///
+/// The buffer is shared rather than returned so that aborting the reader (a
+/// descendant holding the pipe open, see `run_shell`) keeps everything captured
+/// so far instead of discarding the task's local accumulator with it.
+async fn drain(
+    pipe: impl tokio::io::AsyncRead + Unpin,
+    retain_limit: usize,
+    sink: Arc<Mutex<PipeCapture>>,
+) {
     use tokio::io::AsyncReadExt;
     let mut pipe = pipe;
     let mut chunk = [0u8; 8192];
-    let mut capture = PipeCapture::default();
     loop {
         match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                let mut capture = sink.lock().unwrap();
                 capture.total_bytes = capture.total_bytes.saturating_add(n);
                 if capture.bytes.len() < retain_limit {
                     let room = retain_limit - capture.bytes.len();
@@ -333,7 +404,6 @@ async fn drain(pipe: impl tokio::io::AsyncRead + Unpin, retain_limit: usize) -> 
             }
         }
     }
-    capture
 }
 
 pub async fn run_shell(
@@ -360,33 +430,23 @@ pub async fn run_shell(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            return ShellRun {
-                success: false,
-                status_line: format!("spawn failed: {e}"),
-                capture: OutputCapture {
-                    stdout: String::new(),
-                    stderr: e.to_string(),
-                    total_bytes: e.to_string().len(),
-                    truncated_from: None,
-                    killed: false,
-                },
-            };
-        }
+        Err(e) => return broken_run("spawn failed", &e),
     };
 
     // Keep the group ID after try_wait() reaps the shell: background children
     // may still hold the output pipes open at that point.
     let process_group = child.id();
     let retain_limit = byte_cap.min(HARD_CAPTURE_LIMIT);
+    let out_sink = Arc::new(Mutex::new(PipeCapture::default()));
+    let err_sink = Arc::new(Mutex::new(PipeCapture::default()));
     let out_reader = child
         .stdout
         .take()
-        .map(|stdout| tokio::spawn(drain(stdout, retain_limit)));
+        .map(|stdout| tokio::spawn(drain(stdout, retain_limit, Arc::clone(&out_sink))));
     let err_reader = child
         .stderr
         .take()
-        .map(|stderr| tokio::spawn(drain(stderr, retain_limit)));
+        .map(|stderr| tokio::spawn(drain(stderr, retain_limit, Arc::clone(&err_sink))));
 
     let mut killed = false;
     let mut kill_deadline: Option<std::time::Instant> = None;
@@ -398,69 +458,53 @@ pub async fn run_shell(
     loop {
         let exited = match child.try_wait() {
             Ok(status) => status,
-            Err(e) => {
-                return ShellRun {
-                    success: false,
-                    status_line: format!("wait failed: {e}"),
-                    capture: OutputCapture {
-                        stdout: String::new(),
-                        stderr: e.to_string(),
-                        total_bytes: e.to_string().len(),
-                        truncated_from: None,
-                        killed: false,
-                    },
-                };
-            }
+            Err(e) => return broken_run("wait failed", &e),
         };
         if exited.is_some() {
             exited_at.get_or_insert_with(std::time::Instant::now);
+            // Once the shell is reaped there is nothing left that will close the
+            // pipes on its own: whatever still holds them is a background child
+            // that may outlive the run by hours. Cap the wait here rather than
+            // only after a forced kill, otherwise an ordinary `npm run dev &`
+            // that exits 0 leaves this loop polling forever.
+            abandon_deadline.get_or_insert_with(abandon_at);
         }
-        // The shell can be reaped while background children still hold the
-        // output pipes open, so the run ends only once both readers are done -
-        // or once a forced kill failed to close them and they were abandoned.
-        let readers_done = abandoned
-            || (out_reader
+        let readers_finished = out_reader
+            .as_ref()
+            .is_none_or(|reader| reader.is_finished())
+            && err_reader
                 .as_ref()
-                .is_none_or(|reader| reader.is_finished())
-                && err_reader
-                    .as_ref()
-                    .is_none_or(|reader| reader.is_finished()));
-        if let (Some(status), true) = (exited, readers_done) {
-            let out = finish_reader(out_reader).await;
-            let err = finish_reader(err_reader).await;
+                .is_none_or(|reader| reader.is_finished());
+        // The shell can be reaped while background children still hold the
+        // output pipes open, so a run with a status ends only once the readers
+        // are done too. Abandoning them ends the run on its own: it happens when
+        // nothing left will close them, and a shell that escaped its own process
+        // group never receives the kill, so no exit status would ever arrive.
+        if abandoned || (exited.is_some() && readers_finished) {
+            let out = finish_reader(out_reader, &out_sink).await;
+            let err = finish_reader(err_reader, &err_sink).await;
 
-            let status_line = if hard_abort {
-                "terminated".to_owned()
-            } else if killed {
-                "^C process killed".to_owned()
-            } else if let Some(code) = status.code() {
-                format!("exit {code}")
+            // Giving up on the pipes says nothing about the command: a
+            // `docker compose up -d` that exits 0 and leaves a daemon holding
+            // them succeeded. An interrupt outranks a status the shell may have
+            // reported just before the signal landed; abandonment on its own is
+            // about capture completeness and is carried by the capture.
+            let outcome = if killed || hard_abort {
+                ShellOutcome::Stopped { hard: hard_abort }
             } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    match status.signal() {
-                        Some(sig) => format!("signal {sig}"),
-                        None => "exited".to_owned(),
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    "exited".to_owned()
+                match exited {
+                    Some(status) => ShellOutcome::Exited(status),
+                    None => ShellOutcome::NoStatus,
                 }
             };
 
-            let mut capture = finish_capture(out, err, byte_cap, HARD_CAPTURE_LIMIT, killed);
-            if abandoned {
-                if !capture.stderr.is_empty() && !capture.stderr.ends_with('\n') {
-                    capture.stderr.push('\n');
-                }
-                capture.stderr.push_str(ABANDONED_NOTE);
-            }
             return ShellRun {
-                success: status.success() && !killed && !hard_abort && !abandoned,
-                status_line,
-                capture,
+                outcome,
+                capture: OutputCapture {
+                    killed,
+                    abandoned,
+                    ..finish_capture(out, err, byte_cap, HARD_CAPTURE_LIMIT)
+                },
             };
         }
 
@@ -477,8 +521,7 @@ pub async fn run_shell(
                 terminate_shell(&mut child, process_group, true);
                 hard_abort = true;
                 kill_deadline = None;
-                abandon_deadline
-                    .get_or_insert_with(|| std::time::Instant::now() + PIPE_ABANDON_GRACE);
+                abandon_deadline.get_or_insert_with(abandon_at);
                 stash.push(Ctl::HardAbort);
             }
             Ok(other) => stash.push(other),
@@ -490,8 +533,7 @@ pub async fn run_shell(
             if std::time::Instant::now() >= deadline {
                 terminate_shell(&mut child, process_group, true);
                 kill_deadline = None;
-                abandon_deadline
-                    .get_or_insert_with(|| std::time::Instant::now() + PIPE_ABANDON_GRACE);
+                abandon_deadline.get_or_insert_with(abandon_at);
             }
         }
 
@@ -505,7 +547,8 @@ pub async fn run_shell(
             {
                 reader.abort();
             }
-            abandon_deadline = None;
+            // No need to disarm the deadline: `abandoned` ends the run on the
+            // next iteration, before this check is reached again.
             abandoned = true;
         }
 
@@ -522,19 +565,67 @@ pub async fn run_shell(
     }
 }
 
-async fn finish_reader(reader: Option<tokio::task::JoinHandle<PipeCapture>>) -> PipeCapture {
-    match reader {
-        Some(reader) => reader.await.unwrap_or_default(),
-        None => PipeCapture::default(),
+/// A run that never got off the ground: the shell could not be spawned, or
+/// waiting on it failed. The error text is the whole output there is.
+fn broken_run(what: &str, error: &std::io::Error) -> ShellRun {
+    let message = error.to_string();
+    ShellRun {
+        outcome: ShellOutcome::Broken(format!("{what}: {message}")),
+        capture: OutputCapture {
+            stdout: String::new(),
+            total_bytes: message.len(),
+            stderr: message,
+            truncated_from: None,
+            killed: false,
+            abandoned: false,
+        },
     }
 }
 
+fn exit_status_line(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        match status.signal() {
+            Some(sig) => format!("signal {sig}"),
+            None => "exited".to_owned(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        "exited".to_owned()
+    }
+}
+
+/// Wait for a pipe reader to settle and take what it captured.
+///
+/// The join result is deliberately ignored: an abandoned reader was aborted, so
+/// it resolves to `JoinError::Cancelled` while its bytes are already in the
+/// shared sink. `drain` never awaits while holding the lock, so cancellation
+/// cannot poison it.
+async fn finish_reader(
+    reader: Option<tokio::task::JoinHandle<()>>,
+    sink: &Mutex<PipeCapture>,
+) -> PipeCapture {
+    if let Some(reader) = reader {
+        let _ = reader.await;
+    }
+    std::mem::take(&mut *sink.lock().unwrap())
+}
+
+/// Render both pipes into the retained-output budget.
+///
+/// The `killed` and `abandoned` flags describe the run rather than the budget,
+/// so this leaves them clear and the caller fills them in with struct-update
+/// syntax.
 fn finish_capture(
     out: PipeCapture,
     err: PipeCapture,
     configured_limit: usize,
     safety_limit: usize,
-    killed: bool,
 ) -> OutputCapture {
     let limit = configured_limit.min(safety_limit);
     let total_bytes = out.total_bytes.saturating_add(err.total_bytes);
@@ -546,7 +637,8 @@ fn finish_capture(
         stderr: render_pipe(&err, err_limit),
         total_bytes,
         truncated_from: truncated.then_some(total_bytes),
-        killed,
+        killed: false,
+        abandoned: false,
     }
 }
 
@@ -749,13 +841,7 @@ mod tests {
 
     #[test]
     fn shell_capture_gives_an_idle_streams_budget_to_stdout() {
-        let capture = finish_capture(
-            pipe(b'o', 300, 300),
-            PipeCapture::default(),
-            200,
-            1000,
-            false,
-        );
+        let capture = finish_capture(pipe(b'o', 300, 300), PipeCapture::default(), 200, 1000);
 
         assert!(capture.stdout.starts_with(&"o".repeat(200)));
         assert!(capture.stdout.contains("300 bytes total"));
@@ -768,6 +854,13 @@ mod tests {
     #[tokio::test]
     async fn hard_abort_gives_up_on_pipes_held_outside_the_process_group() {
         use std::time::Duration;
+
+        // The escaped holder needs a new session, which only setsid can create
+        // here; without it the child stays in the process group and the kill
+        // reaches it, so the case under test never arises.
+        if !crate::envinfo::has_bin("setsid") {
+            return;
+        }
 
         let root = tmpdir("escaped-pipe-holder");
         // Publish readiness from inside the new session, after setsid has
@@ -808,9 +901,53 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         let run = result.expect("hard abort must not wait on a pipe holder it cannot kill");
-        assert!(!run.success);
-        assert_eq!(run.status_line, "terminated");
-        assert!(run.capture.stderr.contains("output capture abandoned"));
+        assert!(!run.success());
+        assert!(run.interrupted());
+        assert_eq!(run.status_line(), "terminated");
+        assert!(run.capture.abandoned);
+        // Aborting the readers must not discard what they already captured:
+        // the user watched this scroll past, so it belongs in the transcript.
+        assert!(run.capture.stdout.contains("captured-out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_exit_gives_up_on_pipes_a_background_child_still_holds() {
+        use std::time::Duration;
+
+        let root = tmpdir("background-pipe-holder");
+        // The common shape of this: a command that starts a daemon and exits 0
+        // while the daemon keeps the inherited stdout/stderr open. Nothing here
+        // is interrupted, so only the post-exit cap can end the run.
+        let command = "echo $$ > shell-pid; echo captured-out; sleep 30 & exit 0";
+        let (_ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<Ctl>();
+        let mut stash = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_shell(
+                Some("/bin/sh"),
+                &root,
+                command,
+                1024,
+                &mut ctl_rx,
+                &mut stash,
+            ),
+        )
+        .await;
+        if let Ok(pid) = std::fs::read_to_string(root.join("shell-pid")) {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                kill_group(pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let run = result.expect("a background pipe holder must not keep the run waiting");
+        // The shell's own exit status is the verdict: giving up on the pipes
+        // says the capture is incomplete, not that the command failed.
+        assert!(run.success());
+        assert!(!run.interrupted());
+        assert_eq!(run.status_line(), "exit 0");
+        assert!(run.capture.abandoned);
+        assert!(run.capture.stdout.contains("captured-out"));
     }
 
     #[cfg(unix)]
@@ -891,9 +1028,13 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         let result = result.expect("interrupt must not wait for background children");
-        assert!(!result.success);
+        assert!(!result.success());
+        assert!(result.interrupted());
+        // The two kinds of stop must stay distinguishable: only a soft interrupt
+        // arms the boundary note the agent shows at the next turn.
+        assert_eq!(result.stopped_softly(), !hard);
         assert_eq!(
-            result.status_line,
+            result.status_line(),
             if hard {
                 "terminated"
             } else {
@@ -907,13 +1048,7 @@ mod tests {
 
     #[test]
     fn shell_capture_gives_an_idle_streams_budget_to_stderr() {
-        let capture = finish_capture(
-            PipeCapture::default(),
-            pipe(b'e', 300, 300),
-            200,
-            1000,
-            false,
-        );
+        let capture = finish_capture(PipeCapture::default(), pipe(b'e', 300, 300), 200, 1000);
 
         assert!(capture.stdout.is_empty());
         assert!(capture.stderr.starts_with(&"e".repeat(200)));
@@ -924,7 +1059,7 @@ mod tests {
 
     #[test]
     fn shell_capture_redistributes_a_shared_mixed_budget() {
-        let capture = finish_capture(pipe(b'o', 250, 250), pipe(b'e', 20, 20), 100, 1000, false);
+        let capture = finish_capture(pipe(b'o', 250, 250), pipe(b'e', 20, 20), 100, 1000);
 
         assert!(capture.stdout.starts_with(&"o".repeat(80)));
         assert!(!capture.stdout.starts_with(&"o".repeat(81)));
@@ -935,7 +1070,7 @@ mod tests {
 
     #[test]
     fn shell_capture_keeps_complete_output_within_the_limit() {
-        let capture = finish_capture(pipe(b'o', 30, 30), pipe(b'e', 20, 20), 100, 1000, false);
+        let capture = finish_capture(pipe(b'o', 30, 30), pipe(b'e', 20, 20), 100, 1000);
 
         assert_eq!(capture.stdout, "o".repeat(30));
         assert_eq!(capture.stderr, "e".repeat(20));
@@ -951,7 +1086,6 @@ mod tests {
             PipeCapture::default(),
             20_000_000,
             64,
-            false,
         );
 
         assert!(capture.stdout.starts_with(&"o".repeat(64)));
@@ -968,9 +1102,11 @@ mod tests {
         let write = tokio::spawn(async move {
             writer.write_all(&vec![b'x'; 300]).await.unwrap();
         });
-        let capture = drain(reader, 10).await;
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::default()));
+        drain(reader, 10, std::sync::Arc::clone(&sink)).await;
         write.await.unwrap();
 
+        let capture = sink.lock().unwrap();
         assert_eq!(capture.bytes, vec![b'x'; 10]);
         assert_eq!(capture.total_bytes, 300);
     }
@@ -989,7 +1125,7 @@ mod tests {
         };
         let run = run_shell(prog, &root, command, 1000, &mut rx, &mut stash).await;
         if cfg!(unix) {
-            assert!(run.success);
+            assert!(run.success());
             assert!(run.capture.stdout.contains("hello"));
         }
         assert!(root.join("cwd-marker").exists());

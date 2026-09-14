@@ -17,9 +17,16 @@ pub(super) enum VerifyOutcome {
     Passed,
     Failed(String),
     Denied(String),
-    /// The user interrupted the command; its result is unknown, so it must not
-    /// be reported to the model as a failure or counted by the retry tracker.
-    Interrupted,
+    /// The command reported no verdict of its own, so it must not be reported to
+    /// the model as a failure or counted by the retry tracker. `stopped` means
+    /// the user stopped it; otherwise the run gave up before any exit status
+    /// arrived, and saying "interrupted" there would blame a user who did
+    /// nothing. Carries whatever output was captured first, so the next turn can
+    /// see errors already on screen instead of re-running blind.
+    Unfinished {
+        stopped: bool,
+        tail: String,
+    },
     Aborted,
 }
 
@@ -55,30 +62,25 @@ impl<P: Provider> Agent<P> {
             }
         }
 
-        // verify is surfaced as an ordinary `ran` step (emitted just below); a
-        // separate notice line would only duplicate it, so we skip it here
+        // verify is surfaced as an ordinary `ran` step, prefixed so the user can
+        // tell it apart from a model-initiated shell call of the same command
+        let verify_arg = format!("[verify] {}", plan.command);
         let _ = ctx.ev.send(AgentEvent::StepStarted(StepStartView {
             verb: Verb::Ran,
-            arg: plan.command.clone(),
+            arg: verify_arg.clone(),
         }));
         let run = ctx.run_shell(&plan.command).await;
 
         let tail = combine_output(&run.capture);
         let mut out = combine_output_pretty(&run.capture);
-        if run.success {
+        if run.success() {
             // "verify passed" is the outcome of the verify step itself, so it
             // lives in the step's result rather than as a standalone notice line
             out.push_str("\nverify passed");
         }
         let _ = ctx.ev.send(AgentEvent::Step(StepView {
-            // An interrupted command didn't fail on its own — the user
-            // cancelled it — so surface it as "ran" rather than "failed"
-            verb: if run.success || run.capture.killed {
-                Verb::Ran
-            } else {
-                Verb::Failed
-            },
-            arg: plan.command.clone(),
+            verb: run_verb(&run),
+            arg: verify_arg,
             detail: Some(Detail::Output {
                 text: out,
                 total_bytes: run.capture.total_bytes,
@@ -89,9 +91,12 @@ impl<P: Provider> Agent<P> {
         // an interrupted command that happened to exit 0 as passed
         if ctx.hard_abort {
             VerifyOutcome::Aborted
-        } else if run.capture.killed {
-            VerifyOutcome::Interrupted
-        } else if run.success {
+        } else if run.interrupted() {
+            VerifyOutcome::Unfinished {
+                stopped: matches!(run.outcome, tools::ShellOutcome::Stopped { .. }),
+                tail,
+            }
+        } else if run.success() {
             VerifyOutcome::Passed
         } else {
             VerifyOutcome::Failed(tail)
@@ -441,7 +446,7 @@ impl<P: Provider> Agent<P> {
 
         let run = ctx.run_shell(&command).await;
 
-        let renamed = if run.success {
+        let renamed = if run.success() {
             mv.and_then(|(from, to)| {
                 let old = pre_bytes?;
                 let new = std::fs::read(resolve_path(&ctx.cfg.project_root, &to)).ok()?;
@@ -471,7 +476,7 @@ impl<P: Provider> Agent<P> {
             }
         } else {
             StepView {
-                verb: if run.success { Verb::Ran } else { Verb::Failed },
+                verb: run_verb(&run),
                 arg: command.clone(),
                 detail: Some(Detail::Output {
                     text: combine_output_pretty(&run.capture),
@@ -482,7 +487,7 @@ impl<P: Provider> Agent<P> {
         };
         let _ = ctx.ev.send(AgentEvent::Step(step));
 
-        let mut model_text = format!("{}\n", run.status_line);
+        let mut model_text = format!("{}\n", run.status_line());
         model_text += &combine_output(&run.capture);
         self.push_convo(Msg::tool_result(
             &tc.id,
@@ -515,7 +520,7 @@ impl RunCtx<'_> {
         .await;
         // The shell acknowledges soft interrupts immediately; the agent still
         // needs the note at the next turn boundary.
-        self.soft |= run.capture.killed;
+        self.soft |= run.stopped_softly();
         for control in pending {
             self.absorb(control);
         }
@@ -538,8 +543,33 @@ fn resolve_path(root: &Path, p: &str) -> PathBuf {
     crate::paths::resolve_under(root, p)
 }
 
+/// The step verb for a finished shell run.
+///
+/// A run the user stopped - or one that gave up on pipes a forced kill could
+/// not close - did not fail on its own, so it is surfaced as "ran". Both the
+/// verify path and model-initiated `shell` calls go through here; deciding this
+/// per call site is how the two drifted apart before.
+fn run_verb(run: &tools::ShellRun) -> Verb {
+    if run.success() || run.interrupted() {
+        Verb::Ran
+    } else {
+        Verb::Failed
+    }
+}
+
+const ABANDONED_NOTE: &str = "(output capture abandoned: pipes were still held open by a \
+     background process; later output was not captured)";
+
 fn combine_output(c: &tools::OutputCapture) -> String {
     let mut out = String::new();
+    // This text is head-truncated by `cap_for_model`, so a note about the
+    // capture being incomplete has to lead: appended at the end it is the first
+    // thing a verbose command's output pushes out of the window, leaving the
+    // model a partial prefix that looks whole.
+    if c.abandoned {
+        out += ABANDONED_NOTE;
+        out.push('\n');
+    }
     if !c.stdout.trim().is_empty() {
         out += c.stdout.trim_end();
         out.push('\n');
@@ -572,6 +602,12 @@ fn combine_output_pretty(c: &tools::OutputCapture) -> String {
     }
     if c.killed {
         out += "\n^C process killed";
+    }
+    // The transcript is not truncated, so this reads better last - next to the
+    // kill note it pairs with, after the output it qualifies.
+    if c.abandoned {
+        out.push('\n');
+        out += ABANDONED_NOTE;
     }
     out
 }
@@ -672,6 +708,7 @@ mod exec_tests {
             total_bytes: stdout.len() + stderr.len(),
             truncated_from: None,
             killed,
+            abandoned: false,
         }
     }
 
@@ -705,5 +742,67 @@ mod exec_tests {
             combine_output_pretty(&capture("", "", true)),
             "(no output)\n^C process killed"
         );
+    }
+
+    #[test]
+    fn an_incomplete_capture_is_reported_as_such() {
+        let mut c = capture("out\n", "", false);
+        c.abandoned = true;
+        let model = combine_output(&c);
+        // The note has to lead the model-facing text: that text is head-truncated
+        // by `cap_for_model`, so a trailing note is the first thing a verbose
+        // command drops, leaving a partial prefix that looks complete. A budget
+        // just wide enough for the note stands in for that: it is what a command
+        // whose output overruns `tool_result_chars` effectively leaves.
+        assert!(model.starts_with(ABANDONED_NOTE));
+        let squeezed = tools::cap_for_model(&model, ABANDONED_NOTE.chars().count());
+        assert!(squeezed.contains("output capture abandoned"));
+        assert!(!squeezed.contains("out\n"));
+        // The captured output still survives when there is room for it.
+        assert!(model.contains("out"));
+        // The transcript is not truncated, so there the note trails the output.
+        let pretty = combine_output_pretty(&c);
+        assert!(pretty.starts_with("out"));
+        assert!(pretty.ends_with(ABANDONED_NOTE));
+    }
+
+    fn run(outcome: tools::ShellOutcome) -> tools::ShellRun {
+        let killed = matches!(outcome, tools::ShellOutcome::Stopped { hard: false });
+        tools::ShellRun {
+            outcome,
+            capture: capture("", "", killed),
+        }
+    }
+
+    #[test]
+    fn a_stopped_run_is_never_rendered_as_failed() {
+        use tools::ShellOutcome;
+        // A soft interrupt, a hard abort and giving up before any status arrived
+        // all reach this the same way: the command reported no verdict of its
+        // own, so none of them may be shown as a failure it caused.
+        assert!(matches!(
+            run_verb(&run(ShellOutcome::Stopped { hard: false })),
+            Verb::Ran
+        ));
+        assert!(matches!(
+            run_verb(&run(ShellOutcome::Stopped { hard: true })),
+            Verb::Ran
+        ));
+        assert!(matches!(run_verb(&run(ShellOutcome::NoStatus)), Verb::Ran));
+        // A shell that could not be started or waited on is a real failure.
+        assert!(matches!(
+            run_verb(&run(ShellOutcome::Broken("spawn failed".into()))),
+            Verb::Failed
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_status_decides_the_verb_when_nothing_stopped_the_run() {
+        use std::os::unix::process::ExitStatusExt;
+        let exited = |raw| run(tools::ShellOutcome::Exited(ExitStatusExt::from_raw(raw)));
+        assert!(matches!(run_verb(&exited(0)), Verb::Ran));
+        // raw 256 is wait(2)'s encoding of exit code 1
+        assert!(matches!(run_verb(&exited(256)), Verb::Failed));
     }
 }

@@ -356,8 +356,10 @@ impl App {
             }
             Hit::Block(bi) => {
                 self.focus = Some((bi, usize::MAX));
-                if let Some(Block::Resumed(resumed)) = self.blocks.get_mut(bi) {
-                    resumed.expanded = !resumed.expanded;
+                match self.blocks.get_mut(bi) {
+                    Some(Block::Resumed(resumed)) => resumed.expanded = !resumed.expanded,
+                    Some(Block::MemoryView { expanded, .. }) => *expanded = !*expanded,
+                    _ => {}
                 }
             }
         }
@@ -387,15 +389,14 @@ impl App {
                         }
                     }
                 }
-                Block::Resumed(_) => out.push((bi, usize::MAX)),
+                Block::Resumed(_) | Block::MemoryView { .. } => out.push((bi, usize::MAX)),
                 // Explicitly non-navigable; a new Block variant must make
                 // this decision here rather than inherit a wildcard default.
                 Block::User(_)
                 | Block::Assistant(_)
                 | Block::Notice { .. }
                 | Block::Remembered(_)
-                | Block::PermAsk(_)
-                | Block::MemoryView { .. } => {}
+                | Block::PermAsk(_) => {}
             }
         }
         out
@@ -449,6 +450,10 @@ impl App {
             },
             Some(Block::Resumed(resumed)) if si == usize::MAX => {
                 resumed.expanded = !resumed.expanded;
+                true
+            }
+            Some(Block::MemoryView { expanded, .. }) if si == usize::MAX => {
+                *expanded = !*expanded;
                 true
             }
             _ => false,
@@ -534,6 +539,12 @@ impl App {
             KeyCode::Delete => self.input.delete_forward(),
             KeyCode::Left => self.input.left(),
             KeyCode::Right => self.input.right(),
+            KeyCode::Home if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_from_end = self.scroll_total_seen;
+            }
+            KeyCode::End if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_from_end = 0;
+            }
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
             KeyCode::Up => self.input.history_prev(),
@@ -681,7 +692,10 @@ impl App {
                 self.resolve_ask(opt);
             }
             KeyCode::Enter => self.resolve_ask(selected),
-            KeyCode::Esc => self.resolve_ask(3),
+            // Esc is no-op: deny only through an explicit choice (key `4`
+            // or Enter on the selected deny option). An accidental Esc should
+            // not silently commit the most restrictive decision.
+            KeyCode::Esc => {}
             _ => {}
         }
     }
@@ -813,8 +827,10 @@ impl App {
                         NoticeLevel::Warn,
                     );
                 }
-                // Configured models always come first, in their configured order,
-                // whether the provider discovered them or not.
+                // Configured models come before discovered ones, in their
+                // configured order, whether the provider listed them or not.
+                // The active model is hoisted above all of them separately, in
+                // `absorb_models`.
                 ids.retain(|id| !self.cfg.models.contains(id));
                 ids.splice(0..0, self.cfg.models.iter().cloned());
                 self.absorb_models(ids);
@@ -852,16 +868,22 @@ impl App {
             MemLevel::Project => self.memory.display_project_path(),
             MemLevel::Persistent => self.memory.display_persistent_path(),
         };
-        let mut out = format!("{} · {}\n", level.label(), display);
+        let label = clean(&format!("{} · {display}", level.label()));
+        let mut body = String::new();
         if entries.is_empty() {
-            out += "  (empty)\n";
+            body += "  (empty)";
         } else {
-            for e in entries {
-                out += &format!("  - {e}\n");
+            for (i, e) in entries.iter().enumerate() {
+                if i > 0 {
+                    body.push('\n');
+                }
+                body += &format!("  - {e}");
             }
         }
         self.blocks.push(Block::MemoryView {
-            text: clean(out.trim_end()),
+            label,
+            text: clean(body.trim_end()),
+            expanded: true,
         });
     }
 
@@ -1987,6 +2009,35 @@ mod memory_step_tests {
             Block::Notice { text, level: NoticeLevel::Warn }
                 if text.contains("could not read project memory")
         )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn configured_models_keep_their_order_ahead_of_discovered_ones() {
+        let root = std::env::temp_dir().join(format!("few-model-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        // Every other test builds on `Config::default()`, where `models` is
+        // empty and the retain/splice below is a no-op - so the ordering only
+        // gets exercised with a config that actually names models.
+        let mut cfg = (*app.cfg).clone();
+        cfg.models = vec!["configured-b".into(), "configured-a".into()];
+        app.cfg = Arc::new(cfg);
+        // The active model is hoisted separately; keep it out of the way here.
+        app.model_name = String::new();
+
+        app.finish_model_fetch(Ok(ModelList {
+            // The provider lists one of the configured models and orders them
+            // differently, so a pass-through would be visible.
+            ids: vec!["discovered".into(), "configured-a".into()],
+            skipped: 0,
+        }));
+
+        assert_eq!(
+            app.models_cache,
+            vec!["configured-b", "configured-a", "discovered"]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -209,19 +209,38 @@ fn render_status(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     } else {
         0
     };
+    let mode = mode_label(app.mode);
+    let ctx = format!(
+        " {} / {} ({pct}%)",
+        human_tokens(app.ctx_used),
+        human_tokens(app.ctx_window)
+    );
+    // Compute the budget for the model name from the actual rendered content
+    // so there is no magic number that drifts when a label changes.
+    let fixed_width = "model: ".len() + 4 + "mode: ".len() + mode.len() + 4 + "ctx:".len() + ctx.len();
+    let budget = (area.width as usize).saturating_sub(fixed_width);
+    let name = truncate_to(&app.model_name, budget);
     let spans = vec![
         Span::styled("model:", theme::dim()),
-        Span::raw(format!(" {}    ", app.model_name)),
+        Span::raw(format!(" {name}    ")),
         Span::styled("mode:", theme::dim()),
-        Span::raw(format!(" {}    ", mode_label(app.mode))),
+        Span::raw(format!(" {mode}    ")),
         Span::styled("ctx:", theme::dim()),
-        Span::raw(format!(
-            " {} / {} ({pct}%)",
-            human_tokens(app.ctx_used),
-            human_tokens(app.ctx_window)
-        )),
+        Span::raw(ctx),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn truncate_to(s: &str, budget: usize) -> String {
+    let len = s.chars().count();
+    if len <= budget || budget == 0 {
+        s.to_owned()
+    } else if budget == 1 {
+        "…".to_owned()
+    } else {
+        let truncated: String = s.chars().take(budget - 1).collect();
+        format!("{truncated}…")
+    }
 }
 
 fn mode_label(m: crate::perms::Mode) -> &'static str {
@@ -507,14 +526,29 @@ fn build_rows(app: &App, width: usize) -> Vec<(Vec<Seg>, Hit)> {
                     Hit::Nothing,
                 );
             }
-            Block::MemoryView { text } => {
-                for l in text.lines() {
-                    let style = if l.starts_with(' ') {
-                        theme::dim()
-                    } else {
-                        theme::blue_dim()
-                    };
-                    push_wrapped_text(&mut rows, l, style, width, Hit::Nothing);
+            Block::MemoryView {
+                label,
+                text,
+                expanded,
+            } => {
+                let focused = app.focus == Some((bi, usize::MAX));
+                let marker = if *expanded { 'v' } else { '>' };
+                push_wrapped_text(
+                    &mut rows,
+                    &format!("{marker} {label}"),
+                    focus_style(theme::blue_dim(), focused),
+                    width,
+                    Hit::Block(bi),
+                );
+                if *expanded {
+                    for l in text.lines() {
+                        let style = if l.starts_with(' ') {
+                            theme::dim()
+                        } else {
+                            theme::blue_dim()
+                        };
+                        push_wrapped_text(&mut rows, l, style, width, Hit::Block(bi));
+                    }
                 }
             }
             Block::PermAsk(ask) => render_permission(&mut rows, ask, bi, width),

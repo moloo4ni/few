@@ -187,6 +187,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          sparse-checkout: RELEASE_NOTES.md
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: few-release-bundle
@@ -203,28 +207,6 @@ jobs:
           if [[ "${RELEASE_TAG}" == *-* ]]; then
             release_flags+=(--prerelease)
           fi
-          cat > release-notes.md <<'EOF'
-          Experimental Few release.
-
-          Highlights since v0.1.0-pre.3:
-
-          - hardens persistence and atomic writes, preserves Unix modes, and restores terminal state after failures;
-          - rejects incomplete provider streams, accounts for complete shell output, and enforces the configured step ceiling;
-          - simplifies the agent loop and TUI state transitions for contributors without changing Few's four-tool surface;
-          - updates the pinned Rust toolchain and MSRV to 1.98;
-          - adds native Linux ARM64 and FreeBSD 14.4 x86_64/ARM64 release artifacts and CI coverage.
-
-          Supported artifacts:
-
-          - `x86_64-unknown-linux-musl`: static Linux x86_64 binary
-          - `aarch64-unknown-linux-musl`: static Linux ARM64 binary
-          - `x86_64-unknown-freebsd`: FreeBSD 14.4+ x86_64 binary
-          - `aarch64-unknown-freebsd`: FreeBSD 14.4+ ARM64 binary
-          - `x86_64-apple-darwin`: macOS 11+ on Intel
-          - `aarch64-apple-darwin`: macOS 11+ on Apple Silicon
-
-          Download the archive for your target and verify it against `SHA256SUMS`.
-          EOF
           release_tag="${RELEASE_TAG}"
           if gh release view "${release_tag}" --repo "${GH_REPO}" >/dev/null 2>&1; then
             gh release upload "${release_tag}" dist/few-*.tar.gz dist/SHA256SUMS \
@@ -232,13 +214,13 @@ jobs:
             gh release edit "${release_tag}" \
               --repo "${GH_REPO}" \
               --title "Few ${release_tag}" \
-              --notes-file release-notes.md \
+              --notes-file RELEASE_NOTES.md \
               "${release_flags[@]}"
           else
             gh release create "${release_tag}" dist/few-*.tar.gz dist/SHA256SUMS \
               --repo "${GH_REPO}" \
               --verify-tag \
               --title "Few ${release_tag}" \
-              --notes-file release-notes.md \
+              --notes-file RELEASE_NOTES.md \
               "${release_flags[@]}"
           fi

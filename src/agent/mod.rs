@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 const SOFT_NOTE: &str = "[user pressed Ctrl+C: the current operation was stopped at a safe point]";
+/// How much of a verify command's output goes back to the model. Enough for a
+/// compiler's first errors, short enough to leave room for the turn itself.
+const VERIFY_TAIL_CHARS: usize = 4000;
 
 enum TurnError {
     Aborted,
@@ -418,9 +421,23 @@ impl<P: Provider> Agent<P> {
                 ctx.report_abort();
                 LoopAction::Finish(TaskOutcome::Aborted)
             }
-            exec::VerifyOutcome::Interrupted => {
+            exec::VerifyOutcome::Unfinished { stopped, tail } => {
+                // Pass on whatever it printed first: the output is often already
+                // conclusive (compile errors), and withholding it only makes the
+                // next turn re-run the same command blind.
+                let captured = tools::cap_for_model(&tail, VERIFY_TAIL_CHARS);
+                let seen = if captured.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\nWhat it printed before that:\n\n{captured}")
+                };
+                let how = if stopped {
+                    "was interrupted before it finished"
+                } else {
+                    "never reported a result"
+                };
                 self.push_convo(Msg::user(format!(
-                    "[few verify] `{}` was interrupted before it finished. Its result is unknown; do not claim it passed.",
+                    "[few verify] `{}` {how}. Its result is unknown; do not claim it passed.{seen}",
                     plan.command
                 )));
                 LoopAction::Continue
@@ -439,7 +456,7 @@ impl<P: Provider> Agent<P> {
                 self.push_convo(Msg::user(format!(
                     "[few verify] `{}` failed:\n\n{}\n\n{}",
                     plan.command,
-                    tools::cap_for_model(&tail, 4000),
+                    tools::cap_for_model(&tail, VERIFY_TAIL_CHARS),
                     if exhausted {
                         "The same failure repeated too many times. Stop and explain the situation."
                     } else {
