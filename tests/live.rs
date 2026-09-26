@@ -160,7 +160,7 @@ async fn live_agent_completes_file_task() {
         context_window: 128_000,
         probe_tools: false,
         project_root: root.clone(),
-        project_config_path: root.join(".few/config.toml"),
+        grants_path: root.join(".data/grants.toml"),
         project_detected: true,
         ..Default::default()
     });
@@ -244,7 +244,7 @@ async fn live_verify_gives_up_on_repeated_failure() {
         probe_tools: false,
         verify_command: Some(fail_cmd.to_owned()),
         project_root: root.clone(),
-        project_config_path: root.join(".few/config.toml"),
+        grants_path: root.join(".data/grants.toml"),
         project_detected: true,
         ..Default::default()
     });
@@ -319,7 +319,7 @@ async fn live_session_resume_restores_provider_context() {
         model: model.clone(),
         probe_tools: false,
         project_root: root.clone(),
-        project_config_path: root.join(".few/config.toml"),
+        grants_path: root.join(".data/grants.toml"),
         project_detected: true,
         ..Default::default()
     });
@@ -422,7 +422,7 @@ async fn live_context_compaction_continues_after_notice() {
         compact_threshold: 0.25,
         probe_tools: false,
         project_root: root.clone(),
-        project_config_path: root.join(".few/config.toml"),
+        grants_path: root.join(".data/grants.toml"),
         project_detected: true,
         ..Default::default()
     });

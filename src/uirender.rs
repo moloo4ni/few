@@ -126,7 +126,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     app.scroll_total_seen = total;
     let h = transcript.height as usize;
-    let offset = app.scroll_from_end.min(total.saturating_sub(h));
+    // Clamp the stored offset, not just a local copy: scrolling up past the
+    // top must not leave a phantom offset behind. A short transcript has no
+    // scrollback at all, so its max is zero and the view stays bottom-anchored.
+    app.scroll_from_end = app.scroll_from_end.min(total.saturating_sub(h));
+    let offset = app.scroll_from_end;
     let start = total
         .saturating_sub(offset + h)
         .min(total.saturating_sub(h));
@@ -482,7 +486,7 @@ fn merge_models(app: &App) -> Vec<String> {
 
 /// Human-readable session list for the `/resume` palette.
 ///
-/// Each entry is `"<id> · <age> · <first prompt> [· goal: <goal>]"`.
+/// Each entry is `"<id> · <age> · <first prompt>"`.
 /// `execute_command("/resume <entry>")` extracts the id from the start.
 fn session_items(app: &App) -> Vec<String> {
     app.session_list.clone()
@@ -955,7 +959,7 @@ mod tests {
             model: "test-model".into(),
             context_window: 200_000,
             project_root: root.clone(),
-            project_config_path: root.join(".few/config.toml"),
+            grants_path: root.join(".data/grants.toml"),
             project_detected: true,
             ..Default::default()
         });

@@ -139,22 +139,33 @@ pub fn save(
     Ok(SessionRef { id, created_at_ms })
 }
 
-/// Load all sessions from the directory, newest first.
-pub fn list_all_sessions(dir: &Path) -> anyhow::Result<Vec<Session>> {
+/// Load the sessions belonging to `project_root`, newest first. Sessions of
+/// other projects are left out: resuming one here would re-save it under this
+/// root and silently move it between projects.
+pub fn list_sessions(dir: &Path, project_root: &Path) -> anyhow::Result<Vec<Session>> {
     let files = list_session_files(dir)?;
     let mut sessions = Vec::new();
     for path in files.iter().rev() {
         if let Ok(session) = read_session(path) {
-            sessions.push(session);
+            if same_root(&session.project_root, project_root) {
+                sessions.push(session);
+            }
         }
     }
     Ok(sessions)
 }
 
-/// Load a session by its id.
-pub fn load_by_id(dir: &Path, id: &str) -> anyhow::Result<Session> {
-    let path = dir.join(format!("{id}.json"));
-    read_session(&path)
+/// Load a session of `project_root` by its id. The id is typed by the user,
+/// so it must be a bare `<ms>[-n]` file stem, never a path.
+pub fn load_by_id(dir: &Path, project_root: &Path, id: &str) -> anyhow::Result<Session> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        anyhow::bail!("invalid session id: {id}");
+    }
+    let session = read_session(&dir.join(format!("{id}.json")))?;
+    if !same_root(&session.project_root, project_root) {
+        anyhow::bail!("session {id} belongs to another project");
+    }
+    Ok(session)
 }
 
 /// Load the most recent session belonging to `project_root`.
@@ -187,6 +198,27 @@ pub fn load_latest(dir: &Path, project_root: &Path) -> anyhow::Result<LatestSess
         session: None,
         skipped,
     })
+}
+
+/// Re-home every session of `from` to `to` after the project moved, so `-c`
+/// and `/resume` find them at the new path. Returns how many were moved.
+pub fn relocate(dir: &Path, from: &Path, to: &Path) -> anyhow::Result<usize> {
+    let mut moved = 0;
+    for path in list_session_files(dir)? {
+        let Ok(mut session) = read_session(&path) else {
+            continue;
+        };
+        if !same_root(&session.project_root, from) {
+            continue;
+        }
+        session.project_root = to.to_path_buf();
+        crate::fsutil::atomic_replace_private(
+            &path,
+            serde_json::to_string_pretty(&session)?.as_bytes(),
+        )?;
+        moved += 1;
+    }
+    Ok(moved)
 }
 
 fn list_session_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -371,6 +403,32 @@ mod tests {
         let loaded = read_session(&path).unwrap();
         assert_eq!(loaded.last_prompt_tokens, 0);
         assert_eq!(loaded.messages[0].content, "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_lookup_stays_inside_the_project() {
+        let dir = temp_dir("resume-scope");
+        let root_a = dir.join("a");
+        let root_b = dir.join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+
+        let a = save(&dir, &root_a, "m", None, 0, None, vec![Msg::user("in a")]).unwrap();
+        let b = save(&dir, &root_b, "m", None, 0, None, vec![Msg::user("in b")]).unwrap();
+
+        let ids: Vec<String> = list_sessions(&dir, &root_a)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec![a.id.clone()]);
+        assert!(load_by_id(&dir, &root_a, &a.id).is_ok());
+        // another project's session is refused rather than adopted
+        assert!(load_by_id(&dir, &root_a, &b.id).is_err());
+        // a typed id is a file stem, never a path
+        assert!(load_by_id(&dir, &root_a, &format!("../{}", a.id)).is_err());
+        assert!(load_by_id(&dir, &root_a, "").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

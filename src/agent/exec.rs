@@ -187,14 +187,14 @@ impl<P: Provider> Agent<P> {
                         };
                         if let Some(value) = persist.0 {
                             if let Err(e) = crate::config::persist_grant(
-                                &ctx.cfg.project_config_path,
+                                &ctx.cfg.grants_path,
                                 &persist.1,
                                 &value,
                             ) {
                                 let _ = ctx.ev.send(AgentEvent::Notice {
                                     text: format!(
                                         "failed saving grant to {}: {e}",
-                                        ctx.cfg.project_config_path.display()
+                                        ctx.cfg.grants_path.display()
                                     ),
                                     level: NoticeLevel::Error,
                                 });

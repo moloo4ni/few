@@ -88,6 +88,10 @@ pub struct PermEngine {
     granted: BTreeMap<String, String>,
     session: HashSet<(Capability, String)>,
     implicit_reads: HashSet<String>,
+    /// Few's own memory files. They live in the user data directory, outside
+    /// the project, yet are the agent's to read and extend (`prompts/base.md`),
+    /// so exactly these paths count as in scope alongside the project root.
+    memory_files: Vec<PathBuf>,
     base_write: Policy,
     base_shell: Policy,
     project_detected: bool,
@@ -133,6 +137,7 @@ impl PermEngine {
             granted,
             session: HashSet::new(),
             implicit_reads: HashSet::new(),
+            memory_files: Vec::new(),
             base_write,
             base_shell,
             project_detected,
@@ -173,6 +178,22 @@ impl PermEngine {
 
     pub fn is_under_root(&self, path: &Path) -> bool {
         containment_path(path).starts_with(containment_path(&self.root))
+    }
+
+    pub fn set_memory_files(&mut self, files: Vec<PathBuf>) {
+        self.memory_files = files;
+    }
+
+    /// The project tree plus Few's memory files: everything a read or write
+    /// may target without being out of scope.
+    fn in_scope(&self, path: &Path) -> bool {
+        if self.is_under_root(path) {
+            return true;
+        }
+        let target = containment_path(path);
+        self.memory_files
+            .iter()
+            .any(|file| containment_path(file) == target)
     }
 
     pub fn is_sensitive(&self, path: &Path) -> bool {
@@ -265,7 +286,7 @@ impl PermEngine {
                 if self.implicit_reads.contains(&self.target_key(t)) {
                     return Check::Allowed;
                 }
-                if self.is_under_root(t) {
+                if self.in_scope(t) {
                     match self.read_policy {
                         Policy::Allow => Check::Allowed,
                         Policy::Ask => Check::Ask { sensitive: false },
@@ -281,7 +302,7 @@ impl PermEngine {
                 // resolves outside the root is denied outright (not even in
                 // auto-approve) with a message naming the root, so the agent
                 // self-corrects instead of hitting a confusing OS error.
-                if !t.as_os_str().is_empty() && !self.is_under_root(t) {
+                if !t.as_os_str().is_empty() && !self.in_scope(t) {
                     return Check::Denied(DenySource::OutOfProject);
                 }
                 // Plan is a hard no-write mode. A grant accepted in build
@@ -476,6 +497,40 @@ mod tests {
         assert_eq!(
             e.check(Capability::FsRead, Some(Path::new("/proj/../outside.txt"))),
             Check::Ask { sensitive: false }
+        );
+    }
+
+    #[test]
+    fn memory_files_are_in_scope_but_their_directory_is_not() {
+        let mut e = engine(vec![]);
+        let memory = Path::new("/data/few/projects/proj-0000/memory.md");
+        e.set_memory_files(vec![memory.to_path_buf()]);
+        // an ordinary write: governed by the mode, not refused as out of project
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(memory)),
+            Check::Ask { sensitive: false }
+        );
+        assert_eq!(e.check(Capability::FsRead, Some(memory)), Check::Allowed);
+        // only the exact file is carved out, not its neighbours
+        assert_eq!(
+            e.check(
+                Capability::FsWrite,
+                Some(Path::new("/data/few/projects/proj-0000/other.md"))
+            ),
+            Check::Denied(DenySource::OutOfProject)
+        );
+        assert_eq!(
+            e.check(
+                Capability::FsWrite,
+                Some(Path::new("/data/few/projects/proj-0000/../x/memory.md"))
+            ),
+            Check::Denied(DenySource::OutOfProject)
+        );
+        // plan stays a hard no-write mode for memory too
+        e.set_mode(Mode::Plan);
+        assert_eq!(
+            e.check(Capability::FsWrite, Some(memory)),
+            Check::Denied(DenySource::ModePolicy)
         );
     }
 

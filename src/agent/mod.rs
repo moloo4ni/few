@@ -242,11 +242,7 @@ impl<P: Provider> Agent<P> {
 
     pub fn refresh_memory_layer(&self) -> Vec<String> {
         let (rendered, warnings) = self.memory.render_for_prompt(self.cfg.project_detected);
-        *self.sys_memory.lock().unwrap() = if rendered.is_empty() {
-            String::new()
-        } else {
-            format!("## Memory\n\n{rendered}")
-        };
+        *self.sys_memory.lock().unwrap() = format!("## Memory\n\n{rendered}");
         warnings
     }
 
@@ -769,7 +765,7 @@ mod tests {
     fn test_cfg(root: &std::path::Path) -> Arc<Config> {
         Arc::new(Config {
             project_root: root.to_path_buf(),
-            project_config_path: root.join(".few/config.toml"),
+            grants_path: root.join(".data/grants.toml"),
             project_detected: true,
             retry_threshold: 2,
             ..Default::default()
@@ -1490,6 +1486,59 @@ mod tests {
             .iter()
             .any(|m| m.role == Role::Tool && m.content.contains("old_str matches 2 locations")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn model_can_append_to_memory_outside_the_project() {
+        let base = temp_root("memory-outside");
+        let root = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let mem = Memory::new(&root, &base.join("data"));
+        mem.ensure_startup_files(true).unwrap();
+        let perms = Arc::new(Mutex::new(PermEngine::new(
+            root.clone(),
+            vec![],
+            Default::default(),
+            Policy::Ask,
+            Policy::Ask,
+            true,
+        )));
+        {
+            let mut engine = PermEngine::lock(&perms);
+            engine.set_mode(Mode::Auto);
+            engine.set_memory_files(mem.files().map(|p| p.to_path_buf()).to_vec());
+        }
+        let args = serde_json::json!({
+            "path": mem.project_path,
+            "old_str": "Read at session start.\n",
+            "new_str": "Read at session start.\n- uses pnpm\n",
+        });
+        let prov = Scripted::new(vec![
+            reply_call("edit", &args.to_string()),
+            reply_text("remembered"),
+        ]);
+        let agent = Agent::new(
+            prov,
+            test_cfg(&root),
+            perms,
+            mem.clone(),
+            Default::default(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_ttx, trx) = mpsc::unbounded_channel();
+        let outcome = agent.run(Some("remember pnpm".into()), tx, trx).await;
+
+        assert_eq!(outcome, TaskOutcome::Done);
+        assert!(mem
+            .read_level(crate::memory::MemLevel::Project)
+            .unwrap()
+            .contains("- uses pnpm"));
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "remembering must not create anything inside the project"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

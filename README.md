@@ -21,7 +21,7 @@ and its contract evolves deliberately; the current canonical contract is in the
   the problem.
 - **Capability-based permissions**: reads inside the project are silent; writes and shell
   default to `ask`; a built-in non-removable sensitive-file list; `always allow` decisions
-  persist to that project's config. There is no separate network capability: a networked
+  persist per project in the user data dir (`projects/<name>-<hash>/grants.toml`). There is no separate network capability: a networked
   command is controlled by `shell`, while provider HTTP is outside the permission engine.
 - **Modes** - `plan` / `build` / `auto-approve` - presets of one permission matrix.
 - **Verify before done**: after file changes a verification command runs automatically
@@ -30,8 +30,12 @@ and its contract evolves deliberately; the current canonical contract is in the
   permission path; a denial is reported to the model and is not repeatedly requested.
 - **Native structured tool-calling only**: a model without it gets an explicit refusal at
   startup; prompt-based fallback is rejected on principle.
-- **Memory** - human-readable markdown files outside the working directory (XDG layout);
-  project memory lives in `.few/memory/project.md`.
+- **Memory** - human-readable markdown files outside the working directory (XDG layout):
+  `~/.local/share/few/memory.md` for cross-project facts and
+  `~/.local/share/few/projects/<name>-<hash>/memory.md` per project. Memory kept by older
+  releases in `<project>/.few/memory/project.md` is copied over once on first start.
+  A moved or renamed git repository is recognized by its root commits and keeps its memory
+  and sessions; for other folders run `few --adopt <old path>` once from the new location.
 - **TUI** (`ratatui` + `crossterm`): no panels or fills - text, indentation and two contrast
   levels only; signal colors are standard ANSI; Markdown-rendered assistant prose with
   lightweight syntax highlighting; collapsible step summaries, click-to-expand diffs,
@@ -52,6 +56,7 @@ Run **from inside the project directory** you want Few to work in:
 cd /path/to/your/project
 /path/to/few/target/release/few        # start a fresh session
 /path/to/few/target/release/few -c     # resume the last session for this project
+/path/to/few/target/release/few --adopt ../old-name  # project moved: take over its state
 /path/to/few/target/release/few --help # show all startup options
 ```
 
@@ -151,7 +156,7 @@ extra = ["*.secret"]                     # appended to the built-in list
 # default = "ask"                         # base shell policy in build mode
 
 [permissions.granted]
-# "Cargo.toml" = "write"                 # persistent per-project grant
+# "Cargo.toml" = "write"                 # hand-written grant; `always allow` saves to grants.toml
 ```
 
 Configuration is fail-closed: unknown or removed fields, invalid policy or grant values, and
@@ -179,8 +184,8 @@ preserves whatever was already captured. Interrupting the verify command leaves
 verification pending rather than reporting a failure the command never produced.
 
 State lives in standard user directories (`~/.config`, `~/.local/share`, `~/.cache`,
-`~/.local/state` where available) and never inside a project directory - except explicitly
-project-local things (`.few/`).
+`~/.local/state` where available). Few never creates anything inside a project directory;
+it only reads `<project>/.few/config.toml` if you create one yourself.
 
 ## Repository layout
 
@@ -191,6 +196,7 @@ src/
   tools.rs      read/write/edit/shell, output capture, model-side truncation
   perms.rs      permissions engine, sensitive matcher
   session.rs    session persistence / `--continue` resume
+  projects.rs   per-project state directory, recognizing a moved project
   app.rs        TUI event loop, commands, Ctrl+C ladder
   uirender.rs   transcript, status bar, input rendering
 prompts/base.md base layer of the system prompt (compiled into the binary)

@@ -10,6 +10,7 @@ mod markdown;
 pub mod memory;
 pub mod paths;
 pub mod perms;
+pub mod projects;
 pub mod providers;
 pub mod session;
 pub mod sysprompt;

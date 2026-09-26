@@ -186,7 +186,9 @@ pub struct Config {
     /// base default policy for shell execution
     pub perm_shell_default: Policy,
     pub project_root: PathBuf,
-    pub project_config_path: PathBuf,
+    /// Where "always allow" decisions are saved: the project's state
+    /// directory in user data, never the project tree.
+    pub grants_path: PathBuf,
     pub project_detected: bool,
 }
 
@@ -212,7 +214,7 @@ impl Default for Config {
             perm_write_default: Policy::Ask,
             perm_shell_default: Policy::Ask,
             project_root: PathBuf::new(),
-            project_config_path: PathBuf::new(),
+            grants_path: PathBuf::new(),
             project_detected: false,
         }
     }
@@ -248,7 +250,11 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
     // Authorization is deliberately per-project. Global defaults still merge
     // normally, but a global grant must never authorize the same relative path
     // or shell command in unrelated repositories.
-    let project_grants = project.permissions.granted.clone();
+    // Grants typed into `.few/config.toml` by hand keep working; the ones Few
+    // saves itself go to the per-project grants file.
+    let grants_path = crate::projects::project_dir(&paths.data_dir, root).join(GRANTS_FILE);
+    let mut project_grants = project.permissions.granted.clone();
+    project_grants.extend(read_grants(&grants_path)?);
     let merged = global.merge(project);
 
     let model = merged.provider.model.clone().ok_or_else(|| {
@@ -303,7 +309,7 @@ pub fn load(paths: &crate::paths::Paths, root: &Path) -> anyhow::Result<Config> 
             .and_then(parse_policy)
             .unwrap_or(Policy::Ask),
         project_root: root.to_path_buf(),
-        project_config_path: pcfg,
+        grants_path,
         project_detected: project_detected(root),
     })
 }
@@ -341,6 +347,44 @@ fn validate_numeric_config(config: &FileConfig, path: &Path) -> anyhow::Result<(
         }
     }
     Ok(())
+}
+
+const GRANTS_FILE: &str = "grants.toml";
+
+/// The grants file holds `[permissions.granted]` and nothing else; anything
+/// more is rejected rather than silently ignored.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct GrantsFile {
+    #[serde(default)]
+    permissions: GrantsSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct GrantsSection {
+    #[serde(default)]
+    granted: BTreeMap<String, String>,
+}
+
+fn read_grants(path: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => anyhow::bail!("reading {}: {e}", path.display()),
+    };
+    let file: GrantsFile = toml::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))?;
+    let granted = file.permissions.granted;
+    let as_config = FileConfig {
+        permissions: PermsCfg {
+            granted: granted.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    validate_permissions(&as_config, path)?;
+    Ok(granted)
 }
 
 fn read_toml(path: &Path) -> anyhow::Result<Option<FileConfig>> {
@@ -421,6 +465,9 @@ fn validate_permissions(config: &FileConfig, path: &Path) -> anyhow::Result<()> 
 }
 
 pub fn persist_grant(path: &Path, key: &str, cap: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::fsutil::ensure_private_dir(parent)?;
+    }
     let mut text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -628,6 +675,17 @@ mod tests {
             Some("write")
         );
         assert!(!cfg.granted.contains_key("global.txt"));
+
+        // Saved grants live in user data and are merged with hand-written ones.
+        assert!(cfg.grants_path.starts_with(&paths.data_dir));
+        persist_grant(&cfg.grants_path, "saved.txt", "write").unwrap();
+        let cfg = load(&paths, &root).unwrap();
+        assert_eq!(cfg.granted.len(), 2);
+        assert!(cfg.granted.contains_key("saved.txt"));
+        // Anything but grants in that file is refused, not ignored.
+        std::fs::write(&cfg.grants_path, "[provider]\nmodel = \"x\"\n").unwrap();
+        let error = load(&paths, &root).err().unwrap().to_string();
+        assert!(error.contains("grants.toml"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

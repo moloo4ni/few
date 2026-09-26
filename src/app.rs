@@ -187,7 +187,15 @@ impl App {
             ev_rx,
         };
         if let Some((_session, note, _)) = resume {
-            app.push_notice(note);
+            let convo = app.agent.snapshot_convo();
+            if convo.is_empty() {
+                // Nothing to restore (no previous session, or an empty one):
+                // the note is the only thing that explains why --continue
+                // produced an empty transcript.
+                app.push_notice(note);
+            } else {
+                app.render_restored_convo(&convo);
+            }
         }
         for warning in history_warning.into_iter().chain(startup_warnings) {
             app.push_notice_level(warning, NoticeLevel::Warn);
@@ -598,7 +606,16 @@ impl App {
                     self.palette_sel = (self.palette_sel + 1).min(len - 1);
                 }
             }
-            KeyCode::Enter => self.pick_palette().await,
+            KeyCode::Enter => {
+                // When the palette has items, pick the selected one. When it
+                // is empty (e.g. `/goal free text` or `/continue`), fall
+                // through to the normal submit path so the command executes.
+                if uirender::current_palette(self).is_some() {
+                    self.pick_palette().await;
+                } else {
+                    self.submit().await;
+                }
+            }
             KeyCode::Backspace => {
                 self.input.backspace();
                 self.palette_sel = 0;
@@ -737,7 +754,11 @@ impl App {
                 }
                 // "/model" starts discovery and opens the palette with the
                 // cached candidates while the provider request is pending.
-                Some(cmd) if cmd.arg_kind == ArgKind::Models => {
+                // "/resume" likewise has to run so it reads the session list
+                // off disk - its palette is empty until that happens.
+                Some(cmd)
+                    if cmd.arg_kind == ArgKind::Models || cmd.arg_kind == ArgKind::Sessions =>
+                {
                     self.execute_command(&item).await;
                     self.palette_sel = 0;
                     return;
@@ -968,6 +989,64 @@ impl App {
             outcome: None,
         }));
         self.blocks.len() - 1
+    }
+
+    /// Lay a restored conversation out as ordinary transcript blocks.
+    ///
+    /// The prose is what the user came back for, so user and assistant turns
+    /// become the same `User`/`Assistant` blocks a live turn produces rather
+    /// than one folded summary. Tool calls keep the usual steps group, which is
+    /// collapsed the way live steps are.
+    fn render_restored_convo(&mut self, msgs: &[Msg]) {
+        for msg in msgs {
+            match msg.role {
+                crate::providers::Role::User => {
+                    let text = clean(msg.content.trim());
+                    if !text.is_empty() {
+                        self.blocks.push(Block::User(text));
+                    }
+                    self.steps_group_idx = None;
+                }
+                crate::providers::Role::Assistant => {
+                    let text = clean(msg.content.trim());
+                    if !text.is_empty() {
+                        self.blocks.push(Block::Assistant(text));
+                        self.steps_group_idx = None;
+                    }
+                    for call in &msg.tool_calls {
+                        let view = StepView {
+                            verb: Verb::Ran,
+                            arg: restored_call_arg(call),
+                            detail: None,
+                        };
+                        let idx = match self.steps_group_idx {
+                            Some(idx) => idx,
+                            None => {
+                                let idx = self.create_steps_group();
+                                if let Some(Block::Steps(group)) = self.blocks.get_mut(idx) {
+                                    // Past steps are history, so they arrive
+                                    // collapsed rather than expanded the way a
+                                    // running task's group is.
+                                    group.expanded = false;
+                                }
+                                self.steps_group_idx = Some(idx);
+                                idx
+                            }
+                        };
+                        if let Some(Block::Steps(group)) = self.blocks.get_mut(idx) {
+                            group.steps.push(StepItem::Step(StepBlock {
+                                view,
+                                expand: Expand::Collapsed,
+                            }));
+                        }
+                    }
+                }
+                // Tool results are the output of the calls just rendered, and
+                // the model's own prose already summarizes them.
+                crate::providers::Role::Tool | crate::providers::Role::System => {}
+            }
+        }
+        self.steps_group_idx = None;
     }
 
     fn push_notice(&mut self, text: String) {
@@ -1257,16 +1336,17 @@ impl App {
     /// Rebuild the `/resume` palette entries from disk. Called when `/resume` is
     /// typed with no argument, so the list reflects sessions saved since start.
     fn refresh_session_list(&mut self) {
-        let sessions = match crate::session::list_all_sessions(&self.sessions_dir) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                self.push_notice_level(
-                    format!("could not list sessions: {error}"),
-                    NoticeLevel::Warn,
-                );
-                return;
-            }
-        };
+        let sessions =
+            match crate::session::list_sessions(&self.sessions_dir, &self.cfg.project_root) {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    self.push_notice_level(
+                        format!("could not list sessions: {error}"),
+                        NoticeLevel::Warn,
+                    );
+                    return;
+                }
+            };
         self.session_list = sessions
             .iter()
             .map(|s| {
@@ -1299,14 +1379,18 @@ impl App {
         // Save the current session before switching.
         self.save_session();
 
-        let sess = match crate::session::load_by_id(&self.sessions_dir, selection) {
-            Ok(sess) => sess,
-            Err(e) => {
-                self.push_notice_level(format!("could not load session: {e}"), NoticeLevel::Warn);
-                return;
-            }
-        };
-        let n = sess.messages.len();
+        let sess =
+            match crate::session::load_by_id(&self.sessions_dir, &self.cfg.project_root, selection)
+            {
+                Ok(sess) => sess,
+                Err(e) => {
+                    self.push_notice_level(
+                        format!("could not load session: {e}"),
+                        NoticeLevel::Warn,
+                    );
+                    return;
+                }
+            };
         let saved_prompt_tokens = if sess.model == self.model_name {
             sess.last_prompt_tokens
         } else {
@@ -1325,7 +1409,16 @@ impl App {
                 },
             ));
         }
-        self.push_notice(format!("resumed session · {n} messages"));
+        // The transcript on screen belongs to the session we just left, so it
+        // is replaced by the resumed one rather than appended to.
+        self.blocks.clear();
+        self.steps_group_idx = None;
+        self.active_ask = None;
+        self.focus = None;
+        self.scroll_from_end = 0;
+        self.scroll_total_seen = 0;
+        let convo = self.agent.snapshot_convo();
+        self.render_restored_convo(&convo);
     }
 
     fn save_session(&self) {
@@ -1359,6 +1452,22 @@ impl App {
                 }
             }
         });
+    }
+}
+
+/// Headline argument for a restored tool call: the target a live step would
+/// show. Falls back to the tool name when the arguments never parsed.
+fn restored_call_arg(call: &crate::providers::ToolCall) -> String {
+    let field = |key: &str| {
+        call.arguments
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    };
+    let target = field("path").or_else(|| field("command"));
+    match target {
+        Some(t) => clean(t.trim()),
+        None => call.name.clone(),
     }
 }
 
@@ -1793,6 +1902,69 @@ mod history_escape_tests {
         assert_eq!(saved.messages[0].content, "newer");
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// After `/resume`, later snapshots must land in the resumed session's file.
+    /// Without the identity switch the worker would keep updating the session
+    /// that was current at startup, overwriting it with the resumed history.
+    #[test]
+    fn session_saver_switches_identity_without_touching_the_previous_file() {
+        let root = std::env::temp_dir().join(format!("few-session-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let save = |messages: Vec<Msg>| {
+            crate::session::save(&sessions, &project, "m", None, 0, None, messages).unwrap()
+        };
+        let first = save(vec![Msg::user("first")]);
+        let second = save(vec![Msg::user("second")]);
+
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let worker_sessions = sessions.clone();
+        let worker_project = project.clone();
+        let current = Some(first.clone());
+        let worker = std::thread::spawn(move || {
+            session_saver_loop(
+                request_rx,
+                worker_sessions,
+                worker_project,
+                current,
+                event_tx,
+            );
+        });
+
+        let snapshot = |text: &str| {
+            SessionWorkerMsg::Save(SessionSaveRequest {
+                model: "m".into(),
+                last_prompt_tokens: 7,
+                goal: None,
+                messages: vec![Msg::user(text)],
+            })
+        };
+        request_tx.send(snapshot("first updated")).unwrap();
+        request_tx
+            .send(SessionWorkerMsg::SwitchIdentity(second.clone()))
+            .unwrap();
+        request_tx.send(snapshot("second updated")).unwrap();
+        drop(request_tx);
+        worker.join().unwrap();
+
+        let reload = |r: &crate::session::SessionRef| {
+            crate::session::load_by_id(&sessions, &project, &r.id).unwrap()
+        };
+        assert_eq!(reload(&first).messages[0].content, "first updated");
+        assert_eq!(reload(&second).messages[0].content, "second updated");
+        // The switch must reuse the resumed id rather than start a third file.
+        let ids: Vec<String> = crate::session::list_sessions(&sessions, &project)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids.len(), 2, "unexpected session files: {ids:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]
@@ -1822,7 +1994,7 @@ mod memory_step_tests {
             model: "m".into(),
             context_window: 1000,
             project_root: root.clone(),
-            project_config_path: root.join(".few/config.toml"),
+            grants_path: root.join(".data/grants.toml"),
             project_detected,
             ..Default::default()
         });
@@ -1855,6 +2027,64 @@ mod memory_step_tests {
             None,
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn restored_convo_renders_messages_as_ordinary_blocks() {
+        use crate::providers::{Role, ToolCall};
+        let root = std::env::temp_dir().join(format!("few-resume-render-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_with(root.clone());
+        let convo = vec![
+            Msg::user("make hello.txt"),
+            Msg {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall::parse(
+                    "t1".into(),
+                    "write".into(),
+                    r#"{"path":"hello.txt","content":"hi"}"#.into(),
+                )],
+                ..Default::default()
+            },
+            Msg::tool_result("t1", "write", "wrote hello.txt"),
+            Msg {
+                role: Role::Assistant,
+                content: "Created hello.txt.".into(),
+                ..Default::default()
+            },
+        ];
+
+        app.render_restored_convo(&convo);
+
+        // user prose, the tool call as a collapsed step group, assistant prose:
+        // the tool *result* is deliberately not a block of its own.
+        assert!(
+            matches!(&app.blocks[0], Block::User(t) if t == "make hello.txt"),
+            "first block should be the user prompt"
+        );
+        match &app.blocks[1] {
+            Block::Steps(group) => {
+                assert!(!group.expanded, "restored steps arrive collapsed");
+                assert_eq!(group.steps.len(), 1);
+                match &group.steps[0] {
+                    StepItem::Step(step) => assert_eq!(step.view.arg, "hello.txt"),
+                    _ => panic!("expected a step in the restored group"),
+                }
+            }
+            _ => panic!("expected a steps group for the restored tool call"),
+        }
+        assert!(
+            matches!(&app.blocks[2], Block::Assistant(t) if t == "Created hello.txt."),
+            "final assistant prose should be its own block"
+        );
+        assert_eq!(app.blocks.len(), 3, "no extra blocks for the tool result");
+        assert!(
+            app.steps_group_idx.is_none(),
+            "a restored group must not stay open for live steps"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2345,8 +2575,8 @@ mod memory_step_tests {
     #[test]
     fn memory_write_surfaces_fact_even_after_file_updated() {
         // Mirrors the real run: the agent writes the memory file (so it already
-        // contains the fact) and then reports the write via a relative arg + a
-        // diff. The memory-fact display must not read the now-updated file to
+        // contains the fact) and then reports the write via its absolute path,
+        // since memory lives outside the project, plus a diff. The memory-fact display must not read the now-updated file to
         // filter the addition out.
         let root = std::env::temp_dir().join(format!("few-mem-{}-{}", std::process::id(), "c"));
         let _ = std::fs::remove_dir_all(&root);
@@ -2362,7 +2592,7 @@ mod memory_step_tests {
 
         app.on_agent_event(AgentEvent::Step(StepView {
             verb: Verb::Wrote,
-            arg: ".few/memory/project.md".into(),
+            arg: mem_path.to_string_lossy().into_owned(),
             detail: Some(Detail::Diff {
                 lines: vec![crate::diffgen::DiffLine {
                     sign: '+',
@@ -2387,7 +2617,7 @@ mod memory_step_tests {
         assert!(
             !app.blocks.iter().any(|b| match b {
                 Block::Steps(g) => g.steps.iter().any(|s| {
-                    matches!(s, StepItem::Step(st) if matches!(st.view.verb, Verb::Wrote) && st.view.arg == ".few/memory/project.md")
+                    matches!(s, StepItem::Step(st) if matches!(st.view.verb, Verb::Wrote) && st.view.arg == mem_path.to_string_lossy())
                 }),
                 _ => false,
             }),
