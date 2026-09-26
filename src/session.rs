@@ -64,6 +64,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Human-readable age of a millisecond timestamp, for session listings.
+pub fn fmt_age_ms(ms: u64) -> String {
+    fmt_age(ms / 1000)
+}
+
 fn fmt_age(secs: u64) -> String {
     let now = secs_now();
     let d = now.saturating_sub(secs);

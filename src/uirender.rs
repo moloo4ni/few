@@ -447,6 +447,7 @@ fn palette_items(app: &App) -> Option<Vec<String>> {
         let after = text.split_once(' ').map(|x| x.1).unwrap_or("");
         let opts: Vec<String> = match cmd.arg_kind {
             crate::commands::ArgKind::Models => merge_models(app),
+            crate::commands::ArgKind::Sessions => session_items(app),
             kind => arg_options(kind, &[]),
         };
         let lowered = after.to_lowercase();
@@ -477,6 +478,14 @@ fn merge_models(app: &App) -> Vec<String> {
         }
     }
     out
+}
+
+/// Human-readable session list for the `/resume` palette.
+///
+/// Each entry is `"<id> · <age> · <first prompt> [· goal: <goal>]"`.
+/// `execute_command("/resume <entry>")` extracts the id from the start.
+fn session_items(app: &App) -> Vec<String> {
+    app.session_list.clone()
 }
 
 fn focus_style(style: Style, focused: bool) -> Style {
@@ -924,7 +933,6 @@ fn push_user_prompt(rows: &mut Vec<(Vec<Seg>, Hit)>, text: &str, style: Style, w
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,9 +943,7 @@ mod tests {
     use crate::memory::Memory;
     use crate::perms::{Mode, PermEngine, Policy};
     use crate::providers::openai::OpenAiProvider;
-    use crate::transcript::{
-        PermAskBlock, StepBlock, StepItem, StepsGroup,
-    };
+    use crate::transcript::{PermAskBlock, StepBlock, StepItem, StepsGroup};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 

@@ -40,6 +40,11 @@ struct SessionSaveRequest {
     messages: Vec<Msg>,
 }
 
+enum SessionWorkerMsg {
+    Save(SessionSaveRequest),
+    SwitchIdentity(crate::session::SessionRef),
+}
+
 pub struct App {
     pub(crate) blocks: Vec<Block>,
     pub(crate) steps_group_idx: Option<usize>,
@@ -73,7 +78,7 @@ pub struct App {
     history_error_reported: bool,
     /// Ordered background persistence. The worker owns the current session
     /// identity so an older snapshot can never overtake a newer one.
-    session_tx: Option<std::sync::mpsc::Sender<SessionSaveRequest>>,
+    session_tx: Option<std::sync::mpsc::Sender<SessionWorkerMsg>>,
     session_worker: Option<std::thread::JoinHandle<()>>,
     live_narration: String,
     live_thought: String,
@@ -88,6 +93,10 @@ pub struct App {
     pub(crate) live_step: Option<(String, String)>,
     last_outcome: Option<TaskOutcome>,
     pub(crate) goal: Option<String>,
+    sessions_dir: PathBuf,
+    /// `/resume` palette entries, refreshed when the command is typed.
+    /// Format: `"<id> · <age> · <first prompt>"`, newest first.
+    pub(crate) session_list: Vec<String>,
     file_index: Arc<Mutex<Vec<String>>>,
     ctl_tx: Option<mpsc::UnboundedSender<Ctl>>,
     app_tx: mpsc::UnboundedSender<AppMsg>,
@@ -167,6 +176,8 @@ impl App {
             live_step: None,
             last_outcome: None,
             goal,
+            sessions_dir,
+            session_list: Vec::new(),
             file_index: Arc::new(Mutex::new(Vec::new())),
             ctl_tx: None,
             app_tx,
@@ -350,9 +361,8 @@ impl App {
             }
             Hit::Block(bi) => {
                 self.focus = Some((bi, usize::MAX));
-                match self.blocks.get_mut(bi) {
-                    Some(Block::MemoryView { expanded, .. }) => *expanded = !*expanded,
-                    _ => {}
+                if let Some(Block::MemoryView { expanded, .. }) = self.blocks.get_mut(bi) {
+                    *expanded = !*expanded;
                 }
             }
         }
@@ -808,6 +818,17 @@ impl App {
                     self.push_notice(format!("goal: {rest}"));
                 }
             }
+            "/resume" => {
+                if rest.is_empty() {
+                    self.refresh_session_list();
+                    self.input.set_text("/resume ");
+                } else {
+                    // Palette entries are "<id> · <age> · <prompt>"; accept
+                    // either a whole entry or a bare id typed by hand.
+                    let id = rest.split(" · ").next().unwrap_or(&rest).trim().to_owned();
+                    self.resume_session(&id).await;
+                }
+            }
             other => {
                 self.push_notice_level(format!("unknown command: {other}"), NoticeLevel::Error);
             }
@@ -1233,18 +1254,92 @@ impl App {
         });
     }
 
+    /// Rebuild the `/resume` palette entries from disk. Called when `/resume` is
+    /// typed with no argument, so the list reflects sessions saved since start.
+    fn refresh_session_list(&mut self) {
+        let sessions = match crate::session::list_all_sessions(&self.sessions_dir) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.push_notice_level(
+                    format!("could not list sessions: {error}"),
+                    NoticeLevel::Warn,
+                );
+                return;
+            }
+        };
+        self.session_list = sessions
+            .iter()
+            .map(|s| {
+                let mut line =
+                    format!("{} · {}", s.id, crate::session::fmt_age_ms(s.updated_at_ms));
+                if let Some(first) = s
+                    .messages
+                    .iter()
+                    .find(|m| m.role == crate::providers::Role::User)
+                {
+                    let text = clean(first.content.trim());
+                    let short: String = text.chars().take(60).collect();
+                    if !short.is_empty() {
+                        line += &format!(" · {short}");
+                    }
+                }
+                line
+            })
+            .collect();
+        if self.session_list.is_empty() {
+            self.push_notice("no saved sessions".into());
+        }
+    }
+
+    async fn resume_session(&mut self, selection: &str) {
+        if self.running {
+            self.push_notice("a task is already running".into());
+            return;
+        }
+        // Save the current session before switching.
+        self.save_session();
+
+        let sess = match crate::session::load_by_id(&self.sessions_dir, selection) {
+            Ok(sess) => sess,
+            Err(e) => {
+                self.push_notice_level(format!("could not load session: {e}"), NoticeLevel::Warn);
+                return;
+            }
+        };
+        let n = sess.messages.len();
+        let saved_prompt_tokens = if sess.model == self.model_name {
+            sess.last_prompt_tokens
+        } else {
+            0
+        };
+        self.agent.restore_convo(sess.messages, saved_prompt_tokens);
+        self.goal = sess.goal.clone();
+        self.agent.set_goal_layer(sess.goal.clone());
+        self.ctx_used = self.agent.context_tokens();
+        // Switch session identity in the background saver.
+        if let Some(tx) = &self.session_tx {
+            let _ = tx.send(SessionWorkerMsg::SwitchIdentity(
+                crate::session::SessionRef {
+                    id: sess.id.clone(),
+                    created_at_ms: sess.created_at_ms,
+                },
+            ));
+        }
+        self.push_notice(format!("resumed session · {n} messages"));
+    }
+
     fn save_session(&self) {
         let convo = self.agent.snapshot_convo();
         if convo.is_empty() {
             return;
         }
         if let Some(tx) = &self.session_tx {
-            let _ = tx.send(SessionSaveRequest {
+            let _ = tx.send(SessionWorkerMsg::Save(SessionSaveRequest {
                 model: self.agent.provider.model_name(),
                 last_prompt_tokens: self.agent.context_tokens(),
                 goal: self.goal.clone(),
                 messages: convo,
-            });
+            }));
         }
     }
 
@@ -1400,7 +1495,7 @@ fn spawn_session_saver(
     current: Option<crate::session::SessionRef>,
     ev: mpsc::UnboundedSender<AgentEvent>,
 ) -> (
-    std::sync::mpsc::Sender<SessionSaveRequest>,
+    std::sync::mpsc::Sender<SessionWorkerMsg>,
     std::thread::JoinHandle<()>,
 ) {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1420,28 +1515,35 @@ impl Drop for App {
 }
 
 fn session_saver_loop(
-    rx: std::sync::mpsc::Receiver<SessionSaveRequest>,
+    rx: std::sync::mpsc::Receiver<SessionWorkerMsg>,
     dir: PathBuf,
     root: PathBuf,
     mut current: Option<crate::session::SessionRef>,
     ev: mpsc::UnboundedSender<AgentEvent>,
 ) {
-    for request in rx {
-        match crate::session::save(
-            &dir,
-            &root,
-            &request.model,
-            current.as_ref(),
-            request.last_prompt_tokens,
-            request.goal,
-            request.messages,
-        ) {
-            Ok(saved) => current = Some(saved),
-            Err(error) => {
-                let _ = ev.send(AgentEvent::Notice {
-                    text: format!("failed saving session: {error}"),
-                    level: NoticeLevel::Error,
-                });
+    for msg in rx {
+        match msg {
+            SessionWorkerMsg::SwitchIdentity(new_ref) => {
+                current = Some(new_ref);
+            }
+            SessionWorkerMsg::Save(request) => {
+                match crate::session::save(
+                    &dir,
+                    &root,
+                    &request.model,
+                    current.as_ref(),
+                    request.last_prompt_tokens,
+                    request.goal,
+                    request.messages,
+                ) {
+                    Ok(saved) => current = Some(saved),
+                    Err(error) => {
+                        let _ = ev.send(AgentEvent::Notice {
+                            text: format!("failed saving session: {error}"),
+                            level: NoticeLevel::Error,
+                        });
+                    }
+                }
             }
         }
     }
@@ -1665,20 +1767,20 @@ mod history_escape_tests {
         });
 
         request_tx
-            .send(SessionSaveRequest {
+            .send(SessionWorkerMsg::Save(SessionSaveRequest {
                 model: "m".into(),
                 last_prompt_tokens: 1,
                 goal: None,
                 messages: vec![Msg::user("older")],
-            })
+            }))
             .unwrap();
         request_tx
-            .send(SessionSaveRequest {
+            .send(SessionWorkerMsg::Save(SessionSaveRequest {
                 model: "m".into(),
                 last_prompt_tokens: 2,
                 goal: None,
                 messages: vec![Msg::user("newer")],
-            })
+            }))
             .unwrap();
         drop(request_tx);
         worker.join().unwrap();

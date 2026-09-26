@@ -4,6 +4,7 @@ pub enum ArgKind {
     Models,
     Modes,
     MemoryTargets,
+    Sessions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,10 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef {
         name: "memory",
         arg_kind: ArgKind::MemoryTargets,
+    },
+    CommandDef {
+        name: "resume",
+        arg_kind: ArgKind::Sessions,
     },
 ];
 
@@ -70,6 +75,9 @@ pub fn arg_options(kind: ArgKind, models: &[String]) -> Vec<String> {
         ArgKind::Models => models.to_vec(),
         ArgKind::Modes => MODES.iter().map(|s| s.to_string()).collect(),
         ArgKind::MemoryTargets => MEMORY_TARGETS.iter().map(|s| s.to_string()).collect(),
+        // Session entries are read from disk into app state, so the palette
+        // supplies them directly rather than through this static table.
+        ArgKind::Sessions => vec![],
     }
 }
 
